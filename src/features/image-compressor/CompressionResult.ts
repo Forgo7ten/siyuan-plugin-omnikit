@@ -3,6 +3,8 @@
  * and future consumers share a single contract without importing the action itself.
  */
 export interface CompressionProgress {
+  scanComplete: boolean;
+  scannedBlocks: number;
   total: number;
   completed: number;
   succeeded: number;
@@ -12,7 +14,11 @@ export interface CompressionProgress {
   cancelled: boolean;
   originalBytes: number;
   compressedBytes: number;
-  savedBytes: number;
+  referencesRewritten: number;
+  originalReferencedBytes: number;
+  newReferencedBytes: number;
+  logicalReductionBytes: number;
+  diskReclaimedBytes: number;
   currentFile?: string;
 }
 
@@ -26,4 +32,21 @@ export interface CompressionItemResult {
   state: CompressionItemState;
   originalBytes: number;
   compressedBytes: number;
+}
+
+/** Records one successfully rewritten reference and counts resource size once per source path. */
+export function recordRewrittenReference(
+  summary: Pick<CompressionBatchSummary, "referencesRewritten" | "succeeded" | "originalReferencedBytes" | "newReferencedBytes" | "logicalReductionBytes">,
+  path: string,
+  originalBytes: number,
+  newBytes: number,
+  countedPaths: Set<string>,
+): void {
+  summary.referencesRewritten++;
+  summary.succeeded++;
+  if (countedPaths.has(path)) return;
+  countedPaths.add(path);
+  summary.originalReferencedBytes += originalBytes;
+  summary.newReferencedBytes += newBytes;
+  summary.logicalReductionBytes += Math.max(0, originalBytes - newBytes);
 }

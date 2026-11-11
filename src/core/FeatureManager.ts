@@ -18,8 +18,16 @@ export class FeatureManager {
   private frozen = false;
   private readonly queues = new Map<string, Promise<boolean>>();
   private readonly startupErrors = new Map<string, unknown>();
+  private readonly statusListeners = new Set<(statuses: FeatureStatus[]) => void>();
 
   constructor(private readonly catalog: FeatureCatalog, private readonly context: FeatureContext) {}
+
+  subscribeStatus(listener: (statuses: FeatureStatus[]) => void): () => void {
+    this.statusListeners.add(listener);
+    try { listener(this.statuses()); }
+    catch (error) { this.context.logger.error("运行状态监听器失败", error); }
+    return () => this.statusListeners.delete(listener);
+  }
 
   /** Startup reads the desired state only; it never writes settings. */
   async initialize(): Promise<void> {
@@ -96,6 +104,10 @@ export class FeatureManager {
           return false;
         }
       }
+      if (!wasRunning && current.status === "error") {
+        this.startupErrors.delete(id);
+        await current.deactivate().catch(() => undefined);
+      }
       if (persist && savedDesired) {
         try { await this.context.settings.setFeatureEnabled(id, false); }
         catch (error) {
@@ -112,7 +124,10 @@ export class FeatureManager {
 
   isRunning(id: string): boolean { return this.catalog.get(id)?.enabled === true; }
 
-  getStartupError(id: string): unknown { return this.startupErrors.get(id) ?? this.catalog.get(id)?.error; }
+  getStartupError(id: string): unknown {
+    const feature = this.catalog.get(id);
+    return this.startupErrors.get(id) ?? (feature?.status === "error" ? feature.error : undefined);
+  }
 
   /** @invariant External configuration changes never write settings back. */
   async reconcileFromLoadedSettings(): Promise<void> {
@@ -124,7 +139,8 @@ export class FeatureManager {
         if (desired && !current.enabled) {
           try { await current.activate(this.context); this.startupErrors.delete(current.meta.id); }
           catch (error) { this.startupErrors.set(current.meta.id, error); this.context.logger.error(`启用功能失败：${current.meta.id}`, error); }
-        } else if (!desired && current.enabled) {
+        } else if (!desired && current.status !== "disabled") {
+          this.startupErrors.delete(current.meta.id);
           await current.deactivate().catch(error => this.context.logger.error(`停用功能失败：${current.meta.id}`, error));
         } else if (current.enabled) {
           await current.notifySettingsChanged().catch(error => this.context.logger.error(`更新功能设置失败：${current.meta.id}`, error));
@@ -175,10 +191,25 @@ export class FeatureManager {
     const feature = this.catalog.get(id);
     if (!feature) return Promise.resolve(false);
     const prior = this.queues.get(id) ?? Promise.resolve(true);
-    const current = prior.catch(() => false).then(() => operation(feature));
+    const current = prior.catch(() => false).then(async () => {
+      try {
+        const result = operation(feature);
+        this.notifyStatus();
+        return await result;
+      }
+      finally { this.notifyStatus(); }
+    });
     this.queues.set(id, current);
     void current.finally(() => { if (this.queues.get(id) === current) this.queues.delete(id); }).catch(() => undefined);
     return current;
+  }
+
+  private notifyStatus(): void {
+    const snapshot = this.statuses();
+    for (const listener of this.statusListeners) {
+      try { listener(snapshot); }
+      catch (error) { this.context.logger.error("运行状态监听器失败", error); }
+    }
   }
 }
 

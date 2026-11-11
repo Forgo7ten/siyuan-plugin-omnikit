@@ -11,6 +11,11 @@ export interface DebugLogger {
   warn: (message: string, data?: unknown) => void;
 }
 
+export type AutoUploadNotice = {
+  status: "prepared" | "success" | "partial" | "failed" | "canceled";
+  count: number;
+};
+
 /**
  * @compat before-upload-assets is available from SiYuan 3.8.4. Supports its file-array
  * response and the decision protocol without changing file ordering.
@@ -25,7 +30,7 @@ export function registerAutoUpload(
   compress: ImageCompressorService,
   settings: () => ImageSettings,
   logger: DebugLogger,
-  onCompressed?: (count: number) => void,
+  onNotice?: (notice: AutoUploadNotice) => void,
 ): void {
   if (!isSupported()) {
     logger.debug?.("思源版本不支持上传前事件，自动压缩未启用");
@@ -55,6 +60,8 @@ export function registerAutoUpload(
       logger.debug?.("忽略上传事件", { 原因: "缺少上传决策接口" });
       return;
     }
+    const requestId = detail.requestId;
+    const supportsCompletionCallback = typeof detail.onComplete === "function";
     // @compat Strictly follow the 3.8.4+ contract: only editor uploads carrying the
     // file-decision envelope are compressed. A missing target never authorizes work.
     if (detail.target !== "editor") {
@@ -110,22 +117,67 @@ export function registerAutoUpload(
       usesDecisionProtocol: decisionProtocol,
     });
 
+    // Register during the event's synchronous phase. Completion can race with the
+    // compression promise, so defer notification until both results are available.
+    let compressedCount: number | undefined;
+    let replacementFiles: Array<File | undefined> | undefined;
+    let completion: { status: "success" | "partial" | "failed" | "canceled"; requestId: unknown; input?: any } | undefined;
+    let notified = false;
+    const notifyWhenReady = () => {
+      if (notified || !scope.active || compressedCount === undefined || compressedCount === 0) return;
+      if (completionRegistered) {
+        if (!completion || typeof requestId !== "string" || requestId.length === 0 || completion.requestId !== requestId) return;
+        const finalFiles = completion.input?.kind === "files" && Array.isArray(completion.input.files)
+          ? completion.input.files
+          : Array.isArray(completion.input) ? completion.input : [];
+        const uploadedCompressedCount = replacementFiles?.reduce((count, file, index) =>
+          count + (file !== undefined && finalFiles[index] === file ? 1 : 0), 0) ?? 0;
+        notified = true;
+        if (uploadedCompressedCount === 0) return;
+        try { onNotice?.({ status: completion.status, count: uploadedCompressedCount }); }
+        catch (error) { logger.warn("无法显示自动压缩提示", error); }
+      } else if (respondWithAccepted) {
+        notified = true;
+        try { onNotice?.({ status: "prepared", count: compressedCount }); }
+        catch (error) { logger.warn("无法显示自动压缩提示", error); }
+      }
+    };
+    let respondWithAccepted = false;
+    let completionRegistered = false;
+    if (supportsCompletionCallback) {
+      try {
+        detail.onComplete((result: any) => {
+          const status = result?.status;
+          if (typeof requestId !== "string" || requestId.length === 0 || result?.requestId !== requestId ||
+            !["success", "partial", "failed", "canceled"].includes(status)) {
+            logger.debug?.("忽略上传完成结果", { requestId, resultRequestId: result?.requestId, status });
+            return;
+          }
+          completion = { requestId: result.requestId, status, input: result.input };
+          notifyWhenReady();
+        });
+        completionRegistered = true;
+      } catch (error) {
+        logger.warn("无法注册上传完成回调", { requestId, error });
+      }
+    }
+
     // @invariant Promise passed to respondWith is constructed and registered before returning.
     const response = compressFiles(files, rootId, detail.signal, scope, shouldCompress, compress, settings, logger)
       .then(output => {
         const replaced = output.filter((file, index) => file !== files[index]).length;
+        compressedCount = replaced;
+        replacementFiles = output.map((file, index) => file !== files[index] ? file : undefined);
         if (replaced > 0) {
           logger.debug?.("压缩完成，上传时将使用 WebP 文件替换原文件", { rootID: rootId, requestId: detail.requestId, replacedCount: replaced });
-          try {
-            onCompressed?.(replaced);
-          } catch (error) {
-            logger.warn("无法显示自动压缩提示", error);
-          }
+          notifyWhenReady();
         }
         return decisionProtocol ? { action: "replace" as const, input: { kind: "files" as const, files: output } } : output;
       });
     try {
       detail.respondWith(response);
+      respondWithAccepted = true;
+      notifyWhenReady();
     } catch (error) {
       logger.warn("无法注册自动压缩处理，将上传原文件", {
         requestId: detail.requestId,

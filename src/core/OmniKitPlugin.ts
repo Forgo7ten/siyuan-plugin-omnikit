@@ -32,6 +32,8 @@ export class OmniKitPlugin extends Plugin {
   private menuRegistry?: MenuRegistry;
   private disposeMenuRouter?: () => void;
   private refreshDock?: () => void;
+  private disposeCoreSubscription?: () => void;
+  private disposeStatusSubscription?: () => void;
   private settingsWindow?: ReturnType<typeof createSettingsWindow>;
   private unloading = false;
   private settingsInstance = false;
@@ -48,6 +50,14 @@ export class OmniKitPlugin extends Plugin {
     return this.ready;
   }
 
+  /** The host can call this before async initialization has created the settings window. */
+  override openSetting(): void {
+    void this.ready?.then(() => {
+      if (this.unloading) return;
+      this.settingsWindow?.open();
+    }).catch(error => this.logger.error("打开设置失败", error));
+  }
+
   private async initialize(): Promise<void> {
     setFrontendResolver(() => getFrontend());
     this.addIcons(OMNIKIT_ICONS);
@@ -55,7 +65,9 @@ export class OmniKitPlugin extends Plugin {
     await settings.load();
     if (this.unloading) return;
     this.settingsManager = settings;
-    this.logger.setDebugEnabled(settings.getGeneral().debugLog);
+    this.disposeCoreSubscription = settings.core.subscribe(core => {
+      this.logger.setDebugEnabled(core.general.debugLog);
+    });
 
     for (const registration of registrations) {
       this.catalog.register(registration.create(this, settings));
@@ -70,6 +82,7 @@ export class OmniKitPlugin extends Plugin {
       this.manager = new FeatureManager(this.catalog, {
         plugin: this, settings, menus, compatibility: this.compatibility, logger: this.logger,
       });
+      this.disposeStatusSubscription = this.manager.subscribeStatus(() => this.refreshDock?.());
     }
     this.settingsWindow = createSettingsWindow({
       registrations, settings, manager: this.manager, t: key => this.t(key),
@@ -88,7 +101,7 @@ export class OmniKitPlugin extends Plugin {
       mobile: isMobileFrontend(),
       statuses: () => this.manager?.statuses() ?? [],
       t: key => this.t(key),
-      openSettings: () => this.settingsWindow?.open(),
+      openSettings: () => this.openSetting(),
     });
     await this.manager!.initialize();
     this.refreshDock?.();
@@ -102,7 +115,7 @@ export class OmniKitPlugin extends Plugin {
       registerTopBar(this, {
         title: this.t("settings"),
         menus: this.menuRegistry,
-        openSettings: () => this.settingsWindow?.open(),
+        openSettings: () => this.openSetting(),
       });
     }).catch(error => this.logger.error("初始化顶部栏失败", error));
   }
@@ -111,7 +124,6 @@ export class OmniKitPlugin extends Plugin {
     if (this.unloading || !this.settingsManager) return;
     const changed = await this.settingsManager.reloadAfterExternalChange();
     if (this.unloading || changed.length === 0) return;
-    this.logger.setDebugEnabled(this.settingsManager.getGeneral().debugLog);
     if (!this.settingsInstance && this.manager) {
       if (changed.includes("core")) await this.manager.reconcileFromLoadedSettings();
       for (const id of changed) {
@@ -123,6 +135,8 @@ export class OmniKitPlugin extends Plugin {
 
   onunload(): void {
     this.unloading = true;
+    this.disposeCoreSubscription?.();
+    this.disposeStatusSubscription?.();
     this.manager?.freezeAll();
     this.disposeMenuRouter?.();
     this.settingsWindow?.close();

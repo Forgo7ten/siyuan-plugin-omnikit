@@ -6,10 +6,7 @@ export interface CompressionSettings {
   maxDimension: number;
   minSizeBytes: number;
   minSavingRatio: number;
-  skipWebP: boolean;
-  skipGIF: boolean;
-  skipSVG: boolean;
-  skipExcalidraw: boolean;
+  excludedExtensions: string;
   concurrencyDesktop: number;
   concurrencyMobile: number;
 }
@@ -19,10 +16,7 @@ export const compressionDefaults: CompressionSettings = {
   maxDimension: 4096,
   minSizeBytes: 100 * 1024,
   minSavingRatio: 0.05,
-  skipWebP: true,
-  skipGIF: true,
-  skipSVG: true,
-  skipExcalidraw: true,
+  excludedExtensions: "gif,svg,webp",
   concurrencyDesktop: 2,
   concurrencyMobile: 1,
 };

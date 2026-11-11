@@ -3,6 +3,7 @@
   import type { FeatureRegistration } from "../../core/FeatureRegistration.ts";
   import type { SettingsManager, CoreSettings } from "../../core/SettingsManager.ts";
   import type { FeatureManager } from "../../core/FeatureManager.ts";
+  import type { FeatureStatus } from "../../core/FeatureManager.ts";
 
   interface Props {
     registrations: readonly FeatureRegistration<any>[];
@@ -17,6 +18,7 @@
   let activeId = $state("general");
   let busy = $state(false);
   let error = $state("");
+  let runtimeStatuses = $state<FeatureStatus[]>(untrack(() => manager?.statuses() ?? []));
 
   onMount(() => {
     const disposeCore = settings.core.subscribe(value => {
@@ -27,7 +29,8 @@
       const store = settings.store(entry.id);
       return store.subscribe(() => { featureRecovery[entry.id] = store.needsRecovery; });
     });
-    return () => { disposeCore(); disposeFeatures.forEach(dispose => dispose()); };
+    const disposeStatus = manager?.subscribeStatus(statuses => { runtimeStatuses = statuses; });
+    return () => { disposeCore(); disposeFeatures.forEach(dispose => dispose()); disposeStatus?.(); };
   });
 
   async function changeDebugLog(enabled: boolean) {
@@ -62,6 +65,17 @@
         : (await settings.setFeatureEnabled(id, enabled), true);
       if (!ok) throw new Error(t("toggleFailed"));
       core = settings.core.snapshot();
+    } catch (cause) { error = String(cause); }
+    finally { busy = false; }
+  }
+
+  async function retry(id: string) {
+    if (busy || !manager) return;
+    busy = true;
+    error = "";
+    try {
+      const ok = await manager.setEnabled(id, true);
+      if (!ok) throw new Error(t("toggleFailed"));
     } catch (cause) { error = String(cause); }
     finally { busy = false; }
   }
@@ -101,8 +115,8 @@
         <!-- @invariant Bind display state to core store changes, not a non-reactive getter. -->
         <!-- @invariant Use the runtime's recovery-aware switch state when feature data is corrupt. -->
         {@const needsFeatureRecovery = featureRecovery[entry.id] ?? settings.store(entry.id).needsRecovery}
-        {@const enabled = !coreRecovery && !needsFeatureRecovery &&
-          (core.featureStates[entry.id]?.enabled ?? entry.defaultEnabled)}
+        {@const enabled = core.featureStates[entry.id]?.enabled ?? entry.defaultEnabled}
+        {@const runtime = runtimeStatuses.find(status => status.id === entry.id)}
         <header class="omnikit-feature-header fn__flex">
           <span class="fn__flex-1">
             <h2>{t(entry.titleKey)}</h2>
@@ -115,7 +129,18 @@
               onchange={e => toggle(entry.id, e.currentTarget.checked)} />
           </label>
         </header>
-        <View store={settings.store(entry.id)} disabled={!enabled || coreRecovery} {t} />
+        {#if manager}
+          <p>{t(`runtime.${runtime?.status ?? "disabled"}`)}</p>
+          {#if runtime?.status === "error" && runtime.error}
+            <p class="omnikit-error" role="alert">{runtime.error}</p>
+          {/if}
+          {#if enabled && (runtime?.status === "error" || runtime?.status === "disabled")}
+            <button class="b3-button" disabled={busy || coreRecovery || needsFeatureRecovery} onclick={() => retry(entry.id)}>{t("runtime.retry")}</button>
+          {/if}
+        {:else}
+          <p>{t("runtime.unavailable")}</p>
+        {/if}
+        <View store={settings.store(entry.id)} disabled={!enabled || coreRecovery || needsFeatureRecovery} {t} />
       {/each}
     {/if}
     {#if error}<p class="omnikit-error" role="alert">{error}</p>{/if}

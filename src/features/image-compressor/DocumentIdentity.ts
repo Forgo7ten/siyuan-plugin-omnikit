@@ -1,9 +1,4 @@
-/**
- * @compat `/api/block/getBlockInfo` returns SiYuan's `model.BlockInfo`, whose JSON payload
- * is `{id, rootID, name, refCount, subFileCount, refIDs, ial, icon, attrViews}`. It carries
- * neither `type` nor `box` on 3.8.x, so block type and notebook come from the local SQL
- * index and `getBlockInfo` is only a fallback.
- */
+/** SiYuan metadata reports rootID and box; the SQL index also reports block type. */
 
 export interface BlockIdentity {
   id?: string;

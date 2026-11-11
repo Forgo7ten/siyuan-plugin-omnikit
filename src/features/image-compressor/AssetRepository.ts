@@ -1,19 +1,16 @@
-import { fetchPost } from "siyuan";
+import { KernelClient } from "../../core/KernelClient.ts";
 import { isDocumentRootIdentity, isSafeBlockId, type BlockIdentity } from "./DocumentIdentity.ts";
 
 export interface KernelResponse<T> { code: number; data: T; msg: string; }
+const kernel = new KernelClient();
 function post<T>(path: string, body: any, signal?: AbortSignal): Promise<KernelResponse<T>> {
-  if (signal?.aborted) return Promise.reject(new DOMException("Operation cancelled", "AbortError"));
-  return new Promise((resolve, reject) => fetchPost(path, body, response => {
-    if (signal?.aborted) { reject(new DOMException("Operation cancelled", "AbortError")); return; }
-    const result = response as unknown as KernelResponse<T>;
-    if (result?.code !== 0) reject(new Error(result?.msg || `SiYuan API failed: ${path}`));
-    else resolve(result);
-  }));
+  return kernel.post<T>(path, body, { signal });
 }
 
 /** @safety Upload creates a new resource; this repository never overwrites or removes originals. */
 export class AssetRepository {
+  constructor(private readonly notebook?: string) {}
+
   async upload(blob: Blob, rootId: string, originalPath: string, signal?: AbortSignal): Promise<string> {
     if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
     const extension = originalPath.split(/[?#]/)[0].split(".").pop() || "image";
@@ -26,15 +23,17 @@ export class AssetRepository {
     return assetPath;
   }
 
-  async getBlockDOM(id: string): Promise<string> {
-    const response = await post<{ dom: string }>("/api/block/getBlockDOM", { id });
-    if (!response.data?.dom) throw new Error("SiYuan returned an empty block DOM");
+  async getBlockDOM(id: string, notebook?: string, signal?: AbortSignal): Promise<string> {
+    const box = notebook ?? this.notebook;
+    const response = await post<{ id: string; dom: string }>("/api/block/getBlockDOM", { id, ...(box ? { notebook: box } : {}) }, signal);
+    if (response.data?.id !== id) throw new Error("SiYuan returned DOM for a different block");
+    if (!response.data?.dom?.trim()) throw new Error("SiYuan returned an empty block DOM");
     return response.data.dom;
   }
 
-  /** @compat Read-only identity lookup used before any allowlist write; has no type/box. */
+  /** Read current block metadata from the kernel tree; encrypted notebooks need their ID. */
   async getBlockInfo(id: string): Promise<BlockIdentity | undefined> {
-    const response = await post<BlockIdentity>("/api/block/getBlockInfo", { id });
+    const response = await post<BlockIdentity>("/api/block/getBlockInfo", { id, ...(this.notebook ? { notebook: this.notebook } : {}) });
     return response.data;
   }
 
@@ -48,10 +47,7 @@ export class AssetRepository {
     return row ? { id: row.id, type: row.type, rootID: row.rootID, box: row.box } : undefined;
   }
 
-  /**
-   * @invariant The SQL index is authoritative; the metadata endpoint is a fallback for
-   * kernels where querying is unavailable. Both are read-only.
-   */
+  /** SQL supplies a block type when available; kernel tree metadata is the fallback. */
   async getBlockIdentity(id: string): Promise<BlockIdentity | undefined> {
     try {
       const indexed = await this.queryBlockIdentity(id);

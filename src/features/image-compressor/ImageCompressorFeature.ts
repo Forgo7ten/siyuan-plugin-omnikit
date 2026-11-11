@@ -12,12 +12,13 @@ import { ImageCompressorService } from "./ImageCompressorService.ts";
 import { TaskRegistry } from "./TaskRegistry.ts";
 import { IMAGE_FEATURE_ID, type ImageSettings } from "./settings.ts";
 import type { ImageFeatureConfig } from "./registration.ts";
-import { registerAutoUpload } from "./AutoUploadHandler.ts";
+import { registerAutoUpload, type AutoUploadNotice } from "./AutoUploadHandler.ts";
 import { shouldAutoCompress } from "./AutoPolicy.ts";
 import { imageMenuContributions } from "./menuContributions.ts";
 import { compressSelectedImage } from "./SingleImageAction.ts";
 import { compressDocumentImages } from "./DocumentBatchAction.ts";
 import { translate } from "../../i18n/translate.ts";
+import { BlockActionCoordinator } from "./BlockActionCoordinator.ts";
 
 /**
  * @invariant The feature owns all business registrations through FeatureScope.
@@ -30,6 +31,7 @@ export class ImageCompressorFeature extends BaseFeature {
   private readonly service = new ImageCompressorService();
   private readonly tasks = new TaskRegistry();
   private readonly assets = new AssetRepository();
+  private readonly blockActions = new BlockActionCoordinator();
 
   constructor(plugin: FeatureContext["plugin"], settings: SettingsManager) {
     super({
@@ -64,7 +66,7 @@ export class ImageCompressorFeature extends BaseFeature {
       t: (key, values) => this.t(ctx, key, values),
       icon: this.meta.icon,
       label: menu => this.pageLabel(menu, ctx),
-      compressImage: menu => compressSelectedImage(menu.detail, ctx, scope, this.settings(ctx), this.service),
+      compressImage: menu => compressSelectedImage(menu.detail, ctx, scope, this.settings(ctx), this.service, this.blockActions),
       toggleDocument: menu => this.toggleDocument(menu, ctx, scope),
       runBatch: menu => this.runBatch(menu, ctx, scope),
     })) {
@@ -96,7 +98,16 @@ export class ImageCompressorFeature extends BaseFeature {
         return allowed;
       },
       this.service, () => this.settings(ctx), ctx.logger,
-      count => showMessage(this.t(ctx, "image.autoUpload.compressed", { count }), 4000));
+      notice => this.showAutoUploadNotice(ctx, scope, notice));
+  }
+
+  private showAutoUploadNotice(ctx: FeatureContext, scope: FeatureScope, notice: AutoUploadNotice): void {
+    if (!scope.active) return;
+    const values = { count: notice.count };
+    const key = `image.autoUpload.${notice.status}`;
+    const message = this.t(ctx, key, values);
+    if (notice.status === "partial" || notice.status === "failed") showMessage(message, 5000, "error");
+    else showMessage(message, 4000);
   }
 
   protected onDisable(): void {
@@ -171,6 +182,7 @@ export class ImageCompressorFeature extends BaseFeature {
     progress.max = 1;
     const status = document.createElement("p");
     status.setAttribute("aria-live", "polite");
+    status.textContent = this.t(ctx, "image.batch.scanning");
     const cancel = document.createElement("button");
     cancel.className = "b3-button b3-button--outline";
     cancel.textContent = this.t(ctx, "batch.cancel");
@@ -184,6 +196,7 @@ export class ImageCompressorFeature extends BaseFeature {
       const result = await compressDocumentImages(menu.detail, ctx, scope,
         this.settings(ctx), this.service, {
           signal: controller.signal,
+          coordinator: this.blockActions,
           onProgress: update => {
             if (!scope.active) return;
             progress.max = Math.max(1, update.total);
@@ -192,8 +205,10 @@ export class ImageCompressorFeature extends BaseFeature {
           },
         });
       if (scope.active) {
-        heading.textContent = this.t(ctx, result.cancelled ? "batch.cancelled" : "batch.done");
-        status.textContent = `${result.succeeded} / ${result.total}`;
+        heading.textContent = this.t(ctx, result.cancelled ? "batch.cancelled" : result.scanComplete ? "batch.done" : "batch.failed");
+        status.textContent = result.scanComplete
+          ? `${this.t(ctx, "image.batch.scanned", { blocks: result.scannedBlocks })} · ${result.succeeded} / ${result.total}`
+          : result.cancelled ? this.t(ctx, "batch.cancelled") : this.t(ctx, "image.batch.scanFailed");
       }
     } catch (error) {
       ctx.logger.error("批量压缩文档图片失败", error);

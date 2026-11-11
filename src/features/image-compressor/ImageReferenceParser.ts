@@ -9,6 +9,7 @@ export interface ParsedImageReference {
   /** Stable syntax context used to reject a stale replacement. */
   signature: string;
   kind: "markdown" | "html";
+  attribute?: "src" | "data-src";
   observedCount: number;
 }
 
@@ -120,10 +121,13 @@ function scanHtmlImages(text: string, blockID: string, output: Omit<ParsedImageR
   const pattern = /<img\b(?:"[^"]*"|'[^']*'|[^'">])*?>/gi;
   for (const match of text.matchAll(pattern)) {
     const tag = match[0];
-    const attr = findHtmlAttribute(tag, "data-src") ?? findHtmlAttribute(tag, "src");
-    if (!attr) continue;
-    const start = match.index! + attr.start;
-    output.push({ blockID, url: decodeHtml(attr.value), alt: decodeHtml(findHtmlAttribute(tag, "alt")?.value ?? ""), title: decodeHtml(findHtmlAttribute(tag, "title")?.value ?? "") || undefined, urlStart: start, urlEnd: start + attr.value.length, signature: tag, kind: "html" });
+    const names = findHtmlAttribute(tag, "data-src") ? ["data-src"] as const : ["src"] as const;
+    for (const name of names) {
+      const attr = findHtmlAttribute(tag, name);
+      if (!attr) continue;
+      const start = match.index! + attr.start;
+      output.push({ blockID, url: decodeHtml(attr.value), alt: decodeHtml(findHtmlAttribute(tag, "alt")?.value ?? ""), title: decodeHtml(findHtmlAttribute(tag, "title")?.value ?? "") || undefined, urlStart: start, urlEnd: start + attr.value.length, signature: tag, kind: "html", attribute: name });
+    }
   }
 }
 
@@ -142,10 +146,12 @@ function replacementSpan(source: string, ref: ParsedImageReference, nextURL: str
   if (start < 0 || source.slice(start, start + ref.signature.length) !== ref.signature) return { start: ref.urlStart, end: ref.urlEnd, replacement: escapeDestination(nextURL, ref.kind) };
   const end = start + ref.signature.length;
   const tag = source.slice(start, end);
-  const attrPattern = /(\b(?:src|data-src)\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+  const attribute = ref.attribute ?? "src";
+  const attrPattern = new RegExp(`(\\b${attribute}\\s*=\\s*)(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "gi");
   const attrs = [...tag.matchAll(attrPattern)];
   const hasTarget = attrs.some(match => decodeHtml(match[2] ?? match[3] ?? match[4] ?? "") === ref.url);
-  const updated = hasTarget ? tag.replace(attrPattern, (_whole, prefix: string, double: string | undefined, single: string | undefined) => {
+  const updated = hasTarget ? tag.replace(attrPattern, (whole, prefix: string, double: string | undefined, single: string | undefined, unquoted: string | undefined) => {
+    if (decodeHtml(double ?? single ?? unquoted ?? "") !== ref.url) return whole;
     const escaped = escapeDestination(nextURL, "html");
     if (double !== undefined) return `${prefix}"${escaped}"`;
     if (single !== undefined) return `${prefix}'${escaped}'`;
@@ -155,7 +161,7 @@ function replacementSpan(source: string, ref: ParsedImageReference, nextURL: str
 }
 
 function maskCode(source: string): string {
-  const chars = [...source];
+  const chars = source.split("");
   const maskRange = (start: number, end: number) => { for (let i = start; i < end; i++) if (chars[i] !== "\n" && chars[i] !== "\r") chars[i] = " "; };
   const fence = /^\s{0,3}(```+|~~~+).*$/gm;
   let fenceStart = -1; let fenceChar = ""; let fenceLen = 0; let line: RegExpExecArray | null;

@@ -13,6 +13,7 @@ flowchart TD
     Manager[FeatureManager]
     Scope[BaseFeature / FeatureScope]
     Image[图片压缩 Feature]
+    Kernel[KernelClient / 思源块与资源 API]
     UI[Svelte 设置页 / Dock / TopBar]
     Menus[MenuRouter / MenuRegistry]
 
@@ -23,6 +24,7 @@ flowchart TD
     Entry --> Menus
     Image --> Settings
     Image --> Menus
+    Image --> Kernel --> Host
     UI --> Manager
     UI --> Settings
 ```
@@ -40,21 +42,21 @@ flowchart TD
 
 `OmniKitPlugin` 在 `src/core/OmniKitPlugin.ts` 中连接思源宿主、配置、Feature 管理器、菜单和界面。唯一入口加载各 Feature 的注册描述；Feature 的业务实现不在插件入口内展开。
 
-`FeatureRegistration<T>` 保存稳定元数据、默认启用状态、配置文件名与 codec、创建运行实例的工厂，以及归 Feature 所有的 Svelte 设置组件。`FeatureCatalog` 持有注册后的实例，`FeatureManager` 按 Feature 串行处理启停并暴露运行状态。通用设置界面根据注册描述展示各 Feature，不按具体 Feature ID 写分支。
+`FeatureRegistration<T>` 保存稳定元数据、默认启用状态、配置文件名与 codec、创建运行实例的工厂，以及归 Feature 所有的 Svelte 设置组件。`FeatureCatalog` 持有注册后的实例，`FeatureManager` 按 Feature 串行处理启停、记录启动错误，并通过订阅接口向设置页暴露运行状态。通用设置界面根据注册描述展示各 Feature，不按具体 Feature ID 写分支。
 
 每个 Feature 从 `BaseFeature` 派生，以 `FeatureScope` 持有运行期副作用。停用时先使 Scope 失效，再撤销该 Feature 的菜单贡献和事件监听并执行清理；失效的旧回调不能启动新业务。Scope 冻结不能跳过 `onDisable`。插件卸载时先冻结所有 Feature，再逐一清理；单个功能的清理失败不应阻止其他功能释放资源。启停操作按 Feature 串行，防止快速切换产生重复监听或并行初始化。
 
-菜单通过 `MenuRouter` 将思源菜单事件路由到 `MenuRegistry`。注册项关联所属 Feature，只有仍在运行的 Feature 才能贡献菜单；回调执行时再次检查运行状态，以防菜单已打开后 Feature 被关闭。Dock 与 TopBar 属于核心入口，即使所有 Feature 停用仍保持可用。设置面板通过 Svelte 5 `mount`/`unmount` 管理组件生命周期，并在关闭时释放订阅和 DOM 资源。
+菜单通过 `MenuRouter` 将思源菜单事件路由到 `MenuRegistry`。注册项关联所属 Feature，只有仍在运行的 Feature 才能贡献菜单；回调执行时再次检查运行状态，以防菜单已打开后 Feature 被关闭。Dock 与 TopBar 属于核心入口，即使所有 Feature 停用仍保持可用。思源原生 `openSetting()` 和插件菜单进入同一 Svelte 设置对话框；设置面板通过 Svelte 5 `mount`/`unmount` 管理组件生命周期，并在关闭时释放订阅和 DOM 资源。核心日志开关保存后立即更新 logger。
 
 ## 配置存储
 
-`SettingsManager` 将通用设置与 Feature 数据分开保存：核心文件 `omnikit-core.json` 仅包含通用选项和各 Feature 的启用状态，每个 Feature 使用自己的 `feature-*.json` 保存业务配置。增加 Feature 时提供自己的默认值、codec 和文件名，不把该 Feature 的字段加入核心 schema。
+`SettingsManager` 将通用设置与 Feature 数据分开保存：核心文件 `omnikit-core.json` 仅包含通用选项和各 Feature 的启用状态，每个 Feature 使用自己的 `feature-*.json` 保存业务配置。配置文件名由 Feature 注册项显式提供，`JsonStore` 限制文件名形态；不会从 Feature ID 自动推导文件名。增加 Feature 时提供自己的默认值、codec 和文件名，不把该 Feature 的字段加入核心 schema。
 
-`JsonStore` 负责解析、验证、订阅和写入。首次缺少配置时使用内存默认值，不因加载或打开设置页而创建文件；相同值更新不写盘，每个文件的更新串行执行。无效或损坏的 JSON 不得被默认值覆盖，恢复写入前需要通过备份流程保护原始内容。外部数据变更通过 `onDataChanged` 重新加载并通知运行时，不把重新加载的数据写回。
+`JsonStore` 负责解析、验证、订阅和写入。首次缺少配置时使用内存默认值，不因加载或打开设置页而创建文件；相同值更新不写盘，每个文件的更新串行执行。无效或损坏的 JSON 不得被默认值覆盖；显式恢复先备份原始内容，主文件保存确认后才更新内存状态。写入超时会标记结果不确定，阻止继续写入。外部数据变更通过 `onDataChanged` 重新加载并通知运行时，不把重新加载的数据写回。
 
 核心启用偏好与运行状态不是同一个值：启用失败会显示错误状态，但不擅自改写用户保存的偏好。运行状态切换与保存失败需要补偿，使运行资源与已保存偏好保持一致。
 
-当前配置只支持现行 schema，不迁移旧版 OmniKit 配置，也不主动删除旧配置文件。SiYuan 独立设置窗口能力目前未启用；未来若多个插件实例同时编辑同一 JSON 文件，`onDataChanged` 只负责刷新，不构成跨实例写锁，也不承诺解决并发写冲突。
+当前配置只支持现行 schema，不迁移旧版 OmniKit 配置，也不主动删除旧配置文件。图片 Feature 的 schema v1 codec 对旧的格式跳过布尔字段保留读取兼容，并严格检查数值、扩展名及白名单数据；添加白名单时还会向内核确认文档根块。SiYuan 独立设置窗口能力目前未启用；未来若多个插件实例同时编辑同一 JSON 文件，`onDataChanged` 只负责刷新，不构成跨实例写锁，也不承诺解决并发写冲突。
 
 ## 图片压缩规则
 
@@ -67,7 +69,7 @@ flowchart TD
 | 开启 | 关闭 | 是 | 处理 |
 | 开启 | 关闭 | 否 | 不处理 |
 
-自动上传只处理编辑器上传事件。`before-upload-assets` 能力按思源版本和事件形状检测；不支持或无法可靠识别目标时跳过。事件的 `respondWith` 必须在处理器的同步调用栈内注册，异步压缩完成后仍按原文件序列返回；宿主取消或处理失败时返回原始有序文件批次。
+自动上传只处理编辑器上传事件。`before-upload-assets` 能力按思源版本和事件形状检测；不支持或无法可靠识别目标时跳过。仅有本地文件路径而没有 `File` 字节的拖入事件无法预压缩。事件的 `respondWith` 必须在处理器的同步调用栈内注册，异步压缩完成后仍按原文件序列返回；宿主取消或处理失败时返回原始有序文件批次。有 `onComplete` 时按对应请求的最终上传结果提示；旧宿主只提示图片已准备好，不把压缩完成等同于上传成功。
 
 白名单以文档 `rootID` 标识，不因改名或移动而改变授权。全局开关和 Feature 总开关不清空白名单；Feature 停用时则停止该功能的监听和任务。文档树菜单只对单个文档提供操作，不对多选或笔记本节点猜测目标。
 
@@ -77,11 +79,12 @@ flowchart TD
 | --- | --- |
 | `ImageCompressorFeature` | 组合 Feature 生命周期：注册菜单、上传监听、任务和设置变更响应；通过 `FeatureScope` 管理运行期资源。 |
 | `AutoUploadHandler` / `AutoPolicy` | Handler 校验宿主上传事件并同步调用 `respondWith`，再异步处理有序文件批次；纯策略函数根据 Feature 开关、全局开关、白名单与宿主能力决定是否压缩。 |
-| `ImageCompressorService` / `ImageEligibility` | Service 使用本地 Worker 执行压缩；Eligibility 先按路径和 MIME 筛选，再验证文件签名、大小及替换收益。UI 和菜单不直接处理压缩算法。 |
+| `ImageCompressorService` / `ImageEligibility` / `ExcludedExtensions` | Service 使用本地 Worker 执行压缩；Eligibility 先按资源路径、扩展名黑名单和 MIME 筛选，再验证文件签名、大小及替换收益。UI 和菜单不直接处理压缩算法。 |
 | `PageAllowlist` | 以文档 `rootID` 读写 Feature 配置中的授权名单；菜单入口只提供文档身份，不复制另一份授权状态。 |
-| `SingleImageAction` / `DocumentBatchAction` | 单图动作只处理用户指向的图片引用；批量动作遍历当前编辑器内的图片并回报进度和结果，不扫描其他文档。两者调用 Service 获取新图片，并把引用修改委托给块更新层。 |
-| `AssetRepository` / `BlockImageRewriter` | Repository 通过思源 API 上传新资源和读取/更新块 DOM；Rewriter 重新读取、校验目标图片引用后至多更新一次，并报告冲突。新资源上传和块引用更新分开处理，Repository 不覆盖或删除原资源。 |
-| `TaskRegistry` | 为上传、单图和批量任务创建可取消控制器；Feature 停用或插件卸载时中止仍在运行的任务。 |
+| `SingleImageAction` / `DocumentBatchAction` | 单图动作只处理用户指向的图片引用；批量动作读取当前文档根块的完整内核 DOM，按图片所属块建立清单，扫描成功后才开始处理资源。两者读取原始 `assets/` 路径，调用 Service 压缩，并把引用修改委托给块更新层。 |
+| `DocumentImageScanner` / `CompressionQueue` / `CompressionResult` | Scanner 从完整文档 DOM 收集可处理图片，避免父子块重复归属；Queue 按资源内容去重并限制并发；Result 记录逐项进度和引用体积变化。 |
+| `AssetRepository` / `BlockImageRewriter` / `BlockActionCoordinator` | Repository 经 `KernelClient` 调用思源 API 上传资源和读取/更新块 DOM；Rewriter 重读并校验引用，检测冲突后停止更新；Coordinator 串行化同一块的插件内写入。Repository 不覆盖或删除原资源。 |
+| `TaskRegistry` | 为批量任务创建可取消控制器；单图和自动上传使用 Feature Scope 或宿主提供的取消信号。Feature 停用或插件卸载时中止仍在运行的任务。 |
 | `ImageSettingsPanel.svelte` | 展示并编辑 Feature 配置、全局自动压缩与白名单；通过传入的 `JsonStore` 和组件回调访问数据，不拥有业务执行或 Feature 生命周期。 |
 
 ## 笔记数据与资源安全
@@ -90,7 +93,7 @@ flowchart TD
 
 压缩 Worker 由 `browser-image-compression` 依赖提供，并作为本地资源打包，避免运行时依赖外网。支持的图片类型、尺寸和压缩参数由 Feature 配置与处理逻辑共同校验；不适合处理的格式按规则跳过。
 
-当前提供单图压缩和当前文档范围的批量处理入口；批量操作不扩展到整个工作区。WebP、GIF、SVG 和 Excalidraw 等不适合处理的图片按默认策略跳过。块更新前会重新读取并校验目标引用，但思源接口不提供 compare-and-swap（CAS）原子更新；检测到冲突时停止更新，不承诺消除读取与写入之间的并发窗口。
+当前提供单图压缩和当前文档范围的批量处理入口；批量操作不扩展到整个工作区。默认扩展名黑名单为 `gif,svg,webp`，用户可编辑；GIF、SVG 和 Excalidraw 仍受固定保护，当前只编码 JPEG、PNG、WebP。批量结果区分成功改写的引用体积减少与磁盘回收：原资源未删除，因此不会声称已经回收磁盘空间。块更新前会重新读取并校验目标引用，但思源接口不提供 compare-and-swap（CAS）原子更新；检测到冲突时停止更新，不承诺消除读取与写入之间的并发窗口。
 
 ## 新增 Feature
 

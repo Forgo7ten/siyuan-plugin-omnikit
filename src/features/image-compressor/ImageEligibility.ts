@@ -1,4 +1,5 @@
 import type { ImageSettings } from "./settings.ts";
+import { hasExcludedExtension } from "./ExcludedExtensions.ts";
 
 export interface EligibilityResult {
   accepted: boolean;
@@ -12,11 +13,10 @@ const drawingAsset = /(?:^|[\\/])(?:excalidraw|drawings?)(?:[\\/]|[-_.])/i;
 export function isEligibleImage(name: string, type = "", settings?: Partial<ImageSettings>): boolean {
   const path = name.toLowerCase();
   const mime = type.toLowerCase();
-  if (settings?.skipExcalidraw !== false && (/^excalidraw-/i.test(name) || drawingAsset.test(name))) return false;
-  if (settings?.skipWebP !== false && (/\.webp(?:$|[?#])/i.test(path) || mime === "image/webp")) return false;
-  // @compat GIF and SVG stay hard-protected in this release: re-encoding an animated GIF
-  // drops frames and rasterizing an SVG destroys vector content. Their switches are kept
-  // as forward-compatible settings and never weaken this safety gate.
+  if ((/^excalidraw-/i.test(name) || drawingAsset.test(name))) return false;
+  if (settings?.excludedExtensions && hasExcludedExtension(name, settings.excludedExtensions)) return false;
+  // GIF and SVG stay hard-protected: re-encoding animated GIF drops frames and
+  // rasterizing SVG destroys vector content, even if removed from the extra blacklist.
   if (/\.gif(?:$|[?#])/i.test(path) || mime === "image/gif") return false;
   if (/\.svg(?:$|[?#])/i.test(path) || mime === "image/svg+xml") return false;
   const png = /\.png(?:$|[?#])/i.test(path) || mime === "image/png";
@@ -28,8 +28,8 @@ export function isEligibleImage(name: string, type = "", settings?: Partial<Imag
 }
 
 /**
- * @safety MIME type and extension are hints only. Only verified JPEG/PNG byte signatures
- * reach the decoder; SVG, animated formats, WebP, and drawing assets remain untouched.
+ * @safety MIME type and extension are hints only. Only verified JPEG/PNG/WebP signatures
+ * reach the decoder; SVG, animated formats, and drawing assets remain untouched.
  */
 export async function checkEligibility(
   file: Blob & { name?: string },

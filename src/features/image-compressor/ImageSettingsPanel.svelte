@@ -5,6 +5,7 @@
   import type { ImageFeatureConfig } from "./registration.ts";
   import { AssetRepository } from "./AssetRepository.ts";
   import { isDocumentRootIdentity } from "./DocumentIdentity.ts";
+  import { parseExcludedExtensions } from "./ExcludedExtensions.ts";
 
   interface Props {
     store: JsonStore<ImageFeatureConfig>;
@@ -16,8 +17,12 @@
   let saving = $state(false);
   let error = $state("");
   let manualRootID = $state("");
+  let excludedExtensions = $state(untrack(() => store.snapshot().compression.excludedExtensions));
 
-  onMount(() => store.subscribe(value => { config = value as ImageFeatureConfig; }));
+  onMount(() => store.subscribe(value => {
+    config = value as ImageFeatureConfig;
+    excludedExtensions = config.compression.excludedExtensions;
+  }));
 
   async function change(mutator: (draft: ImageFeatureConfig) => void) {
     if (disabled || saving) return;
@@ -141,24 +146,17 @@
         void change(draft => { draft.compression.maxDimension = value; });
       }} />
   </label>
-  {#each [
-    { key: "skipWebP", label: t("skipWebP") },
-    { key: "skipGIF", label: t("skipGIF") },
-    { key: "skipSVG", label: t("skipSVG") },
-    { key: "skipExcalidraw", label: t("skipExcalidraw") },
-  ] as item (item.key)}
-    <label class="b3-label omnikit-control">
-      <span>{item.label}</span>
-      <input type="checkbox" class="b3-switch" disabled={disabled || saving}
-        checked={Boolean(config.compression[item.key as keyof typeof config.compression])}
-        onchange={e => {
-          const checked = e.currentTarget.checked;
-          void change(draft => {
-            (draft.compression as unknown as Record<string, unknown>)[item.key] = checked;
-          });
-        }} />
-    </label>
-  {/each}
+  <label class="b3-label omnikit-control">
+    <span>{t("excludedExtensions")}</span>
+    <input class="b3-text-field" bind:value={excludedExtensions} disabled={disabled || saving}
+      onblur={() => {
+        const parsed = parseExcludedExtensions(excludedExtensions);
+        if (!parsed.ok) { error = t("excludedExtensions.invalid").replace("{token}", parsed.token); return; }
+        excludedExtensions = parsed.value;
+        void change(draft => { draft.compression.excludedExtensions = parsed.value; });
+      }} />
+  </label>
+  <p class="ft__smaller">{t("excludedExtensions.description")}</p>
 
   {#if error}<p class="omnikit-error" role="alert">{error}</p>{/if}
 </section>
