@@ -1,0 +1,41 @@
+name: Release OmniKit
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.4.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Validate version and test
+        shell: bash
+        run: |
+          test "${GITHUB_REF_NAME#v}" = "$(node -p "require('./package.json').version")"
+          test "${GITHUB_REF_NAME#v}" = "$(node -p "require('./plugin.json').version")"
+          pnpm check
+          pnpm test
+      - name: Build archive
+        run: |
+          pnpm build:app
+          pnpm package:verify
+          unzip -t package.zip
+      - uses: ncipollo/release-action@v1
+        with:
+          artifacts: package.zip
+          allowUpdates: true
+          artifactErrorsFailBuild: true
+          token: ${{ secrets.GITHUB_TOKEN }}

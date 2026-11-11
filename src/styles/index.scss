@@ -1,0 +1,24 @@
+.omnikit-dock { padding: 12px; overflow: auto; }
+.omnikit-heading { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
+.omnikit-feature { border-top: 1px solid var(--b3-theme-surface-lighter); display: flex; flex-direction: column; gap: 8px; padding: 12px 0; }
+.omnikit-feature-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.omnikit-feature h3, .omnikit-feature h4 { margin: 4px 0; }
+.omnikit-feature p, .omnikit-dock p { margin: 0; color: var(--b3-theme-on-surface); }
+.omnikit-option { display: grid; grid-template-columns: minmax(0, 1fr) minmax(72px, auto); align-items: center; gap: 4px 8px; }
+.omnikit-option small { grid-column: 1 / -1; opacity: .75; }
+.omnikit-state { font-size: 12px; opacity: .8; }
+.omnikit-state--off { opacity: .6; }
+.omnikit-dock-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 6px 0; border-top: 1px solid var(--b3-theme-surface-lighter); }
+.omnikit-error { color: var(--b3-theme-error, #d44) !important; }
+.omnikit-allowlist-add { display: flex; flex-wrap: wrap; gap: 6px; }
+.omnikit-allowlist-add input { min-width: 100px; flex: 1; }
+.omnikit-allowlist { list-style: none; margin: 0; padding: 0; }
+.omnikit-allowlist li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; align-items: center; padding: 8px 0; border-top: 1px solid var(--b3-theme-surface-lighter); }
+.omnikit-allowlist li code, .omnikit-allowlist li small { grid-column: 1; overflow-wrap: anywhere; }
+.omnikit-allowlist li button { grid-column: 2; grid-row: 1 / span 3; }
+.omnikit-dialog { box-sizing: border-box; max-width: min(92vw, 480px); max-height: 85vh; width: 420px; padding: 16px; color: var(--b3-theme-on-background); background: var(--b3-theme-background); border: 1px solid var(--b3-theme-surface-lighter); border-radius: 8px; }
+.omnikit-dialog::backdrop { background: rgb(0 0 0 / 35%); }
+.omnikit-settings-content { max-height: 75vh; overflow: auto; }
+.omnikit-progress-dialog { display: flex; flex-direction: column; gap: 12px; }
+.omnikit-progress-dialog progress { width: 100%; }
+.omnikit-progress-dialog p { overflow-wrap: anywhere; }

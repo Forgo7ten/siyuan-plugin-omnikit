@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">OmniKit app icon</title>
+  <desc id="desc">A white K monogram inside a cyan-to-blue orbit ring, surrounded by a luminous orbital sweep and a mint sparkle on a deep navy rounded square.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#06152F"/><stop offset=".58" stop-color="#071B3C"/><stop offset="1" stop-color="#073B83"/></linearGradient>
+    <radialGradient id="bgGlow" cx="77%" cy="82%" r="70%"><stop offset="0" stop-color="#0759B8" stop-opacity=".34"/><stop offset="1" stop-color="#0759B8" stop-opacity="0"/></radialGradient>
+    <linearGradient id="ring" x1=".08" y1=".08" x2=".92" y2=".92"><stop offset="0" stop-color="#49F2D7"/><stop offset=".42" stop-color="#11CFF0"/><stop offset="1" stop-color="#2876FF"/></linearGradient>
+    <linearGradient id="ringHighlight" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#A7FFF0" stop-opacity=".95"/><stop offset=".42" stop-color="#2CE9F1" stop-opacity=".22"/><stop offset="1" stop-color="#3B8CFF" stop-opacity="0"/></linearGradient>
+    <linearGradient id="orbitFront" x1=".05" y1=".5" x2=".95" y2=".5"><stop offset="0" stop-color="#45F7E0"/><stop offset=".35" stop-color="#21DDF1"/><stop offset=".72" stop-color="#159FEF"/><stop offset="1" stop-color="#2578FF" stop-opacity=".08"/></linearGradient>
+    <linearGradient id="orbitBack" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#13D9F2" stop-opacity="0"/><stop offset=".45" stop-color="#10B8F4" stop-opacity=".82"/><stop offset="1" stop-color="#2A78FF" stop-opacity=".12"/></linearGradient>
+    <linearGradient id="spark" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#BFFFF2"/><stop offset=".48" stop-color="#66FFE2"/><stop offset="1" stop-color="#21D9E8"/></linearGradient>
+    <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="7" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <filter id="tightGlow" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="2.2" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect width="512" height="512" rx="120" fill="url(#bg)"/><rect width="512" height="512" rx="120" fill="url(#bgGlow)"/>
+  <path d="M105 246 C126 166 196 113 282 105 C309 102 332 104 351 110" fill="none" stroke="url(#orbitBack)" stroke-width="2.2" stroke-linecap="round" opacity=".9"/>
+  <path d="M397 330 C383 389 336 428 278 434" fill="none" stroke="#13BDEB" stroke-width="2" stroke-linecap="round" opacity=".52"/>
+  <g fill="#11D9ED" opacity=".9"><path d="M177 126 l7 -21 8 -4 -7 21z"/><path d="M194 119 l7 -21 8 -4 -7 21z"/><path d="M211 113 l7 -21 8 -4 -7 21z"/><path d="M370 403 l7 -21 8 -4 -7 21z" opacity=".88"/><path d="M387 397 l7 -21 8 -4 -7 21z" opacity=".72"/><path d="M404 390 l7 -21 8 -4 -7 21z" opacity=".58"/></g>
+  <path d="M104 310 C143 214 271 153 382 169 C414 174 434 190 431 211 C429 229 411 245 390 260" fill="none" stroke="url(#orbitBack)" stroke-width="3.2" stroke-linecap="round" opacity=".95"/>
+  <circle cx="256" cy="266" r="133" fill="none" stroke="#0A8BEA" stroke-width="37" opacity=".12" filter="url(#softGlow)"/><circle cx="256" cy="266" r="133" fill="none" stroke="url(#ring)" stroke-width="34"/>
+  <path d="M148 180 A133 133 0 0 1 278 133" fill="none" stroke="url(#ringHighlight)" stroke-width="3" stroke-linecap="round" opacity=".9"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="31" stroke-linecap="round" stroke-linejoin="round"><path d="M256 177 V355"/><path d="M256 266 L359 174"/><path d="M256 266 L357 361"/></g>
+  <path d="M103 309 C67 345 72 374 111 387 C166 406 264 376 340 335" fill="none" stroke="#18DFF0" stroke-width="11" stroke-linecap="round" opacity=".42" filter="url(#softGlow)"/><path d="M103 309 C67 345 72 374 111 387 C166 406 264 376 340 335" fill="none" stroke="url(#orbitFront)" stroke-width="4.2" stroke-linecap="round" filter="url(#tightGlow)"/><path d="M93 334 C83 357 98 373 128 380 C167 390 225 378 267 365" fill="none" stroke="#A5FFF0" stroke-width="1.4" stroke-linecap="round" opacity=".82"/>
+  <path d="M420 91 C427 130 436 139 475 147 C436 155 427 164 420 203 C413 164 404 155 365 147 C404 139 413 130 420 91Z" fill="url(#spark)" filter="url(#tightGlow)"/><path d="M420 119 C424 139 429 143 449 147 C429 151 424 156 420 176 C416 156 411 151 391 147 C411 143 416 139 420 119Z" fill="#E8FFFB" opacity=".72"/>
+</svg>

@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "strict": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
+  },
+  "include": [
+    "src/index.ts", "src/core/**/*.ts", "src/features/**/*.ts",
+    "src/ui/**/*.ts", "src/ui/**/*.svelte", "src/i18n/translate.ts",
+    "src/**/*.d.ts"
+  ]
+}

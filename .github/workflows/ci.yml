@@ -1,0 +1,34 @@
+name: Validate OmniKit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.4.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Type and Svelte checks
+        run: pnpm check
+      - name: Feature tests
+        run: pnpm test
+      - name: Production build and archive
+        run: |
+          pnpm build:app
+          pnpm package:verify
+          unzip -t package.zip

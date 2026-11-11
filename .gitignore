@@ -5,6 +5,8 @@ node_modules
 .dprint
 dist
 package.zip
+.generated
+/icon.png
 index.css
 index.js
 kernel.js
