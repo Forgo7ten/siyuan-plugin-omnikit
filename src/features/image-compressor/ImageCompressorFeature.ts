@@ -6,19 +6,23 @@ import type { MenuContext } from "../../core/MenuRegistry.ts";
 import type { SettingsManager } from "../../core/SettingsManager.ts";
 import type { Logger } from "../../core/Logger.ts";
 import { PageAllowlist } from "./PageAllowlist.ts";
-import { AssetRepository } from "./AssetRepository.ts";
 import { isDocumentRootIdentity, type BlockIdentity } from "./DocumentIdentity.ts";
-import { ImageCompressorService } from "./ImageCompressorService.ts";
+import { KernelClient } from "../../core/KernelClient.ts";
+import { NODE_ID } from "./parseImageConfig.ts";
 import { TaskRegistry } from "./TaskRegistry.ts";
-import { IMAGE_FEATURE_ID, type ImageSettings } from "./settings.ts";
+import { IMAGE_FEATURE_ID } from "./settings.ts";
 import type { ImageFeatureConfig } from "./registration.ts";
 import { registerAutoUpload, type AutoUploadNotice } from "./AutoUploadHandler.ts";
 import { shouldAutoCompress } from "./AutoPolicy.ts";
 import { imageMenuContributions } from "./menuContributions.ts";
-import { compressSelectedImage } from "./SingleImageAction.ts";
-import { compressDocumentImages } from "./DocumentBatchAction.ts";
+import { type SingleImageEditorContext } from "./SingleImageAction.ts";
+import { ImageController } from "./ImageController.ts";
 import { translate } from "../../i18n/translate.ts";
-import { BlockActionCoordinator } from "./BlockActionCoordinator.ts";
+import { createImageServices } from "./createImageServices.ts";
+import type { ImageProcessingServices } from "./ImageProcessingServices.ts";
+import { resolveSource } from "./source.ts";
+import { watchRemoteImages, type RemoteWatcherHandle } from "./RemoteImageWatcher.ts";
+import type { DocumentRow } from "./references.ts";
 
 /**
  * @invariant The feature owns all business registrations through FeatureScope.
@@ -28,10 +32,9 @@ import { BlockActionCoordinator } from "./BlockActionCoordinator.ts";
 export class ImageCompressorFeature extends BaseFeature {
   static readonly ID = IMAGE_FEATURE_ID;
   readonly pages: PageAllowlist;
-  private readonly service = new ImageCompressorService();
   private readonly tasks = new TaskRegistry();
-  private readonly assets = new AssetRepository();
-  private readonly blockActions = new BlockActionCoordinator();
+  private readonly kernel = new KernelClient();
+  private controller?: ImageController;
 
   constructor(plugin: FeatureContext["plugin"], settings: SettingsManager) {
     super({
@@ -54,21 +57,26 @@ export class ImageCompressorFeature extends BaseFeature {
     return ctx.settings.getFeature<ImageFeatureConfig>(this.meta.id);
   }
 
-  private settings(ctx: FeatureContext): ImageSettings {
-    return this.config(ctx).compression;
-  }
-
   protected onEnable(ctx: FeatureContext, scope: FeatureScope): void {
-    scope.own(() => this.tasks.cancelAll("Feature disabled"));
+    const services = createImageServices(ctx, scope);
+    const controller = new ImageController(ctx, scope, services, this.tasks);
+    this.controller = controller;
+
+    scope.own(() => {
+      this.tasks.cancelAll("Feature disabled");
+      this.controller = undefined;
+    });
+
     for (const contribution of imageMenuContributions({
       scope,
       context: ctx,
       t: (key, values) => this.t(ctx, key, values),
       icon: this.meta.icon,
       label: menu => this.pageLabel(menu, ctx),
-      compressImage: menu => compressSelectedImage(menu.detail, ctx, scope, this.settings(ctx), this.service, this.blockActions),
+      compressImage: menu => this.runSingle(menu, ctx, scope, services, controller),
+      compressFromFile: menu => this.runSingleFromFile(menu, ctx, scope, services, controller),
       toggleDocument: menu => this.toggleDocument(menu, ctx, scope),
-      runBatch: menu => this.runBatch(menu, ctx, scope),
+      runBatch: menu => this.runBatch(menu, controller),
     })) {
       ctx.menus.contribute(scope, this.meta.id, contribution.location, contribution.id, contribution.provider);
     }
@@ -79,26 +87,69 @@ export class ImageCompressorFeature extends BaseFeature {
         const config = this.config(ctx);
         const featureEnabled = scope.active && ctx.settings.getFeatureEnabled(this.meta.id, true);
         const hostSupportsUpload = ctx.compatibility.supportsBeforeUpload();
-        const allowlisted = Boolean(config.autoCompression.pageAllowlist[rootID]);
-        const allowed = shouldAutoCompress({
+        const allowlisted = Boolean(config.auto.pageAllowlist[rootID]);
+        const allowed = config.auto.uploads && shouldAutoCompress({
           featureEnabled,
           hostSupportsUpload,
           rootID,
-          globalEnabled: config.autoCompression.globalEnabled,
+          globalEnabled: config.auto.globalEnabled,
           allowlisted,
         });
         ctx.logger.debug("自动压缩策略检查完成", {
           rootID,
           featureEnabled,
           hostSupportsUpload,
-          globalEnabled: config.autoCompression.globalEnabled,
+          globalEnabled: config.auto.globalEnabled,
           allowlisted,
           allowed,
         });
         return allowed;
       },
-      this.service, () => this.settings(ctx), ctx.logger,
+      services, ctx.logger,
       notice => this.showAutoUploadNotice(ctx, scope, notice));
+    this.installRemoteWatchers(ctx, scope, services);
+  }
+
+  private installRemoteWatchers(ctx: FeatureContext, scope: FeatureScope, services: ImageProcessingServices): void {
+    type EditorEntry = { rootID: string; notebook: string; handle?: RemoteWatcherHandle };
+    const editors = new Map<HTMLElement, EditorEntry>();
+    let syncing = false;
+    const attach = (protyle: any) => {
+      const element = protyle?.element;
+      const rootID = protyle?.block?.rootID;
+      const notebook = protyle?.notebookId ?? protyle?.block?.box;
+      if (!(element instanceof HTMLElement) || typeof rootID !== "string" || typeof notebook !== "string" || protyle.disabled) return;
+      const prior = editors.get(element);
+      prior?.handle?.dispose();
+      const entry: EditorEntry = { rootID, notebook };
+      editors.set(element, entry);
+      const doc: DocumentRow = { id: rootID, root_id: rootID, box: notebook };
+      void watchRemoteImages(element, doc, scope, services, {
+        warn: (message, data) => ctx.logger.warn(message, data),
+      }).then(handle => {
+        if (!scope.active || editors.get(element) !== entry) handle.dispose();
+        else { entry.handle = handle; if (syncing) handle.pause(); }
+      }).catch(error => ctx.logger.warn("建立外链图片观察失败", error));
+    };
+    const onEditor = (event: CustomEvent<any>) => attach(event.detail?.protyle);
+    const onDestroyed = (event: CustomEvent<any>) => {
+      const element = event.detail?.protyle?.element;
+      if (element instanceof HTMLElement) {
+        editors.get(element)?.handle?.dispose();
+        editors.delete(element);
+      }
+    };
+    const onSyncStart = () => { syncing = true; for (const entry of editors.values()) entry.handle?.pause(); };
+    const onSyncEnd = () => { syncing = false; for (const entry of editors.values()) entry.handle?.resume(); };
+    for (const [name, handler] of [
+      ["loaded-protyle-static", onEditor], ["switch-protyle", onEditor],
+      ["destroy-protyle", onDestroyed], ["sync-start", onSyncStart],
+      ["sync-end", onSyncEnd], ["sync-fail", onSyncEnd],
+    ] as const) {
+      ctx.plugin.eventBus.on(name, handler);
+      scope.own(() => ctx.plugin.eventBus.off(name, handler));
+    }
+    scope.own(() => { for (const entry of editors.values()) entry.handle?.dispose(); editors.clear(); });
   }
 
   private showAutoUploadNotice(ctx: FeatureContext, scope: FeatureScope, notice: AutoUploadNotice): void {
@@ -119,7 +170,12 @@ export class ImageCompressorFeature extends BaseFeature {
     ok: boolean; notebookId?: string; identity?: BlockIdentity;
   }> {
     try {
-      const identity = await this.assets.getBlockIdentity(rootID);
+      if (!NODE_ID.test(rootID)) return { ok: false };
+      const rows = (await this.kernel.post<Array<{ id: string; type: string; box: string; rootID: string }>>("/api/query/sql", {
+        stmt: `SELECT id, type, box, root_id AS rootID FROM blocks WHERE id = '${rootID}' LIMIT 1`,
+        mode: "readonly",
+      })).data;
+      const identity = Array.isArray(rows) ? rows[0] : undefined;
       const ok = isDocumentRootIdentity(identity, rootID);
       logger?.debug("文档身份校验完成", { 文档根ID: rootID, 校验通过: ok });
       return { ok, identity, notebookId: typeof identity?.box === "string" ? identity.box : undefined };
@@ -142,9 +198,7 @@ export class ImageCompressorFeature extends BaseFeature {
         showMessage(this.t(ctx, "menu.notDocument"), 5000, "error");
         return;
       }
-      const enabled = await this.pages.toggle(menu.rootID, {
-        notebookIdSnapshot: verified.notebookId,
-      });
+      const enabled = await this.pages.toggle(menu.rootID);
       if (!scope.active) return;
       showMessage(this.t(ctx, enabled ? "menu.granted" : "menu.revoked"));
     } catch (error) {
@@ -156,7 +210,7 @@ export class ImageCompressorFeature extends BaseFeature {
   private pageLabel(menu: MenuContext, ctx: FeatureContext): string {
     if (!menu.rootID) return this.t(ctx, "menu.resolveFailed");
     const allowed = this.pages.hasCached(menu.rootID);
-    const global = this.config(ctx).autoCompression.globalEnabled;
+    const global = this.config(ctx).auto.globalEnabled;
     // @invariant Global ON cannot be overridden by removing a page from the allowlist.
     if (global) return allowed
       ? this.t(ctx, "auto.removeFallbackDocument")
@@ -166,60 +220,43 @@ export class ImageCompressorFeature extends BaseFeature {
       : this.t(ctx, "menu.enablePage");
   }
 
-  private async runBatch(menu: MenuContext, ctx: FeatureContext, scope: FeatureScope): Promise<void> {
-    // @safety Never guess the first editor on the page. Require the same explicit document.
+  private editor(menu: MenuContext): SingleImageEditorContext | undefined {
     const protyle = menu.detail?.protyle ?? menu.detail?.editor?.protyle;
-    if (!scope.active || !menu.rootID || protyle?.block?.rootID !== menu.rootID) {
-      showMessage(this.t(ctx, "image.batch.invalidDocument"), 5000, "error");
-      return;
-    }
-    const controller = this.tasks.create(scope.signal);
-    const dialog = document.createElement("dialog");
-    dialog.className = "omnikit-dialog omnikit-progress-dialog";
-    const heading = document.createElement("h3");
-    heading.textContent = this.t(ctx, "batch.running");
-    const progress = document.createElement("progress");
-    progress.max = 1;
-    const status = document.createElement("p");
-    status.setAttribute("aria-live", "polite");
-    status.textContent = this.t(ctx, "image.batch.scanning");
-    const cancel = document.createElement("button");
-    cancel.className = "b3-button b3-button--outline";
-    cancel.textContent = this.t(ctx, "batch.cancel");
-    cancel.onclick = () => controller.abort("User cancelled");
-    dialog.append(heading, progress, status, cancel);
-    scope.own(() => dialog.remove());
-    document.body.append(dialog);
-    if (typeof dialog.showModal === "function") dialog.showModal();
-    else dialog.setAttribute("open", "");
-    try {
-      const result = await compressDocumentImages(menu.detail, ctx, scope,
-        this.settings(ctx), this.service, {
-          signal: controller.signal,
-          coordinator: this.blockActions,
-          onProgress: update => {
-            if (!scope.active) return;
-            progress.max = Math.max(1, update.total);
-            progress.value = update.completed;
-            status.textContent = `${update.completed}/${update.total}`;
-          },
-        });
-      if (scope.active) {
-        heading.textContent = this.t(ctx, result.cancelled ? "batch.cancelled" : result.scanComplete ? "batch.done" : "batch.failed");
-        status.textContent = result.scanComplete
-          ? `${this.t(ctx, "image.batch.scanned", { blocks: result.scannedBlocks })} · ${result.succeeded} / ${result.total}`
-          : result.cancelled ? this.t(ctx, "batch.cancelled") : this.t(ctx, "image.batch.scanFailed");
-      }
-    } catch (error) {
-      ctx.logger.error("批量压缩文档图片失败", error);
-      if (scope.active) heading.textContent = this.t(ctx, "batch.failed");
-    } finally {
-      controller.abort("Batch complete");
-      this.tasks.release(controller);
-      if (scope.active) {
-        cancel.textContent = this.t(ctx, "batch.close");
-        cancel.onclick = () => dialog.close();
-      }
-    }
+    const rootID = protyle?.block?.rootID;
+    const notebook = protyle?.notebookId ?? protyle?.block?.box;
+    if (typeof rootID !== "string" || typeof notebook !== "string" || rootID !== menu.rootID) return undefined;
+    return { rootID, notebook, disabled: protyle?.disabled === true };
+  }
+
+  private async runSingle(
+    menu: MenuContext,
+    ctx: FeatureContext,
+    scope: FeatureScope,
+    services: ImageProcessingServices,
+    controller: ImageController,
+  ): Promise<void> {
+    const editor = this.editor(menu);
+    if (!editor) { showMessage(this.t(ctx, "image.single.invalidTarget"), 5000, "error"); return; }
+    await controller.compressSingle(menu.detail, editor);
+  }
+
+  private async runSingleFromFile(
+    menu: MenuContext,
+    ctx: FeatureContext,
+    scope: FeatureScope,
+    services: ImageProcessingServices,
+    controller: ImageController,
+  ): Promise<void> {
+    const editor = this.editor(menu);
+    if (!editor || !menu.imageURL) { showMessage(this.t(ctx, "image.single.invalidTarget"), 5000, "error"); return; }
+    let name = "image";
+    try { name = resolveSource(menu.imageURL, services.origin).name; } catch { /* choose explicitly */ }
+    const file = await services.ui.pickImage(name, scope.signal);
+    if (file) await controller.compressSingleFromFile(menu.detail, editor, file);
+  }
+
+  private async runBatch(menu: MenuContext, controller: ImageController): Promise<void> {
+    if (!menu.rootID) return;
+    await controller.compressDocument(menu.detail, menu.rootID);
   }
 }

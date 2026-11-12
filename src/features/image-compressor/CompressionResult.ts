@@ -19,6 +19,13 @@ export interface CompressionProgress {
   newReferencedBytes: number;
   logicalReductionBytes: number;
   diskReclaimedBytes: number;
+  uploaded?: number;
+  referenceResult?: {
+    backend: "native" | "sql";
+    state: "verified" | "partial" | "unknown";
+    referencesChanged: number | null;
+    storageRecordsChanged: number | null;
+  };
   currentFile?: string;
 }
 

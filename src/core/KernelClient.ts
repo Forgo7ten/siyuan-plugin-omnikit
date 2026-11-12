@@ -7,10 +7,12 @@ export interface KernelRequestOptions { signal?: AbortSignal; timeout?: number; 
 /** Thin adapter over SiYuan's callback API. A rejected write may already have reached the kernel. */
 export class KernelRequestError extends Error {
   readonly outcome: "not-sent" | "unknown";
-  constructor(message: string, outcome: "not-sent" | "unknown", name = "Error") {
+  readonly code?: number;
+  constructor(message: string, outcome: "not-sent" | "unknown", name = "Error", code?: number) {
     super(message);
     this.name = name;
     this.outcome = outcome;
+    this.code = code;
   }
 }
 
@@ -42,9 +44,9 @@ export class KernelClient {
       try {
         this.request(path, body, response => {
           const result = response as unknown as KernelResponse<T>;
-          if (result?.code !== 0) settle(() => reject(new KernelRequestError(result?.msg || `SiYuan API failed: ${path}`, "unknown")));
+          if (result?.code !== 0) settle(() => reject(new KernelRequestError(result?.msg || `SiYuan API failed: ${path}`, "unknown", "Error", result?.code)));
           else settle(() => resolve(result));
-        }, undefined, response => settle(() => reject(new KernelRequestError(response?.msg || `SiYuan request failed: ${path}`, "unknown"))), signal, timeout);
+        }, undefined, response => settle(() => reject(new KernelRequestError(response?.msg || `SiYuan request failed: ${path}`, "unknown", "Error", response?.code))), signal, timeout);
       } catch (error) {
         settle(() => reject(new KernelRequestError(error instanceof Error ? error.message : String(error), "unknown")));
       }

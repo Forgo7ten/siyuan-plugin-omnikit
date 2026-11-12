@@ -4,14 +4,14 @@
   "description": "Modular personal tools for SiYuan built with TypeScript, Vite and Svelte 5",
   "main": "index.js",
   "scripts": {
-    "dev": "npm run render:icons && cross-env NODE_ENV=development vite build --watch",
+    "dev": "pnpm render:icons && cross-env NODE_ENV=development vite build --watch",
     "check": "tsc --noEmit -p tsconfig.omnikit.json && svelte-check --tsconfig ./tsconfig.omnikit.json",
     "check:types": "tsc --noEmit -p tsconfig.omnikit.json",
     "check:svelte": "svelte-check --tsconfig ./tsconfig.omnikit.json",
     "test": "node --experimental-transform-types --test tests/omnikit-*.test.mjs",
-    "build": "npm run check && npm test && npm run build:app",
-    "build:app": "npm run render:icons && cross-env NODE_ENV=production vite build",
-    "build:fast": "npm run build:app",
+    "build": "pnpm check && pnpm test && pnpm build:app",
+    "build:app": "pnpm render:icons && cross-env NODE_ENV=production vite build",
+    "build:fast": "pnpm build:app",
     "render:icons": "node tools/render-icons.mjs",
     "install:workspace": "pnpm build && node tools/install-workspace.mjs",
     "package:verify": "node scripts/verify-package.mjs"

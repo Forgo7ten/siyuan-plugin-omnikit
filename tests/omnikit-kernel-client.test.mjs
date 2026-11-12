@@ -21,6 +21,11 @@ test("settles SDK failure callback", async () => {
   await assert.rejects(client.post("/write", {}), /offline/);
 });
 
+test("preserves the HTTP-derived API code when a native endpoint is missing", async () => {
+  const client = new KernelClient((_path, _body, ok) => ok({ code: -404, data: null, msg: "Not Found" }));
+  await assert.rejects(client.post("/api/asset/findAssetReferences", {}), error => error.code === -404);
+});
+
 test("settles cancellation even when SDK swallows AbortError and ignores callbacks", async () => {
   let forwardedSignal;
   const client = new KernelClient((_path, _body, _ok, _headers, _fail, signal) => { forwardedSignal = signal; });

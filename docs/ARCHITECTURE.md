@@ -13,8 +13,12 @@ flowchart TD
     Manager[FeatureManager]
     Scope[BaseFeature / FeatureScope]
     Image[图片压缩 Feature]
+    Controller[ImageController 业务门面]
+    Services[ImageProcessingServices 聚合服务]
+    Codec[ImageCodec 编解码抽象]
+    RefDrivers[ReferenceDriver 双驱动: Native / SQL]
     Kernel[KernelClient / 思源块与资源 API]
-    UI[Svelte 设置页 / Dock / TopBar]
+    UI[Svelte 设置页 iPad 联动导航 / Dock / TopBar]
     Menus[MenuRouter / MenuRegistry]
 
     Host --> Entry
@@ -22,9 +26,12 @@ flowchart TD
     Entry --> Catalog --> Manager --> Scope --> Image
     Entry --> UI
     Entry --> Menus
-    Image --> Settings
-    Image --> Menus
-    Image --> Kernel --> Host
+    Image --> Controller
+    Controller --> Services
+    Services --> Codec
+    Services --> RefDrivers
+    RefDrivers --> Kernel
+    Kernel --> Host
     UI --> Manager
     UI --> Settings
 ```
@@ -34,7 +41,7 @@ flowchart TD
 | `src/index.ts` | 插件打包入口，导出 `OmniKitPlugin` |
 | `src/core` | 插件宿主集成、Feature 注册与生命周期、设置存储、菜单路由、兼容性、平台判断和日志 |
 | `src/features` | 各功能的业务实现、专属配置、服务、动作及设置面板；当前包含 `image-compressor` |
-| `src/ui` | 通用 Svelte 设置外壳、Dock、TopBar 与 DOM 辅助代码；功能专属设置组件由 Feature 自己提供 |
+| `src/ui` | 通用 Svelte 设置外壳（iPad 风格双向联动单页滚动）、Dock、TopBar 与 DOM 辅助代码；功能专属设置组件由 Feature 自己提供 |
 | `src/i18n` | 英文与简体中文 JSON 翻译源文件，打包到 `dist/i18n` |
 | `src/styles` | 插件全局 SCSS，由插件入口依赖链导入 |
 
@@ -50,13 +57,13 @@ flowchart TD
 
 ## 配置存储
 
-`SettingsManager` 将通用设置与 Feature 数据分开保存：核心文件 `omnikit-core.json` 仅包含通用选项和各 Feature 的启用状态，每个 Feature 使用自己的 `feature-*.json` 保存业务配置。配置文件名由 Feature 注册项显式提供，`JsonStore` 限制文件名形态；不会从 Feature ID 自动推导文件名。增加 Feature 时提供自己的默认值、codec 和文件名，不把该 Feature 的字段加入核心 schema。
+`SettingsManager` 将通用设置与 Feature 数据分开保存：核心文件 `omnikit-core.json` 仅包含通用选项和各 Feature 的启用状态，每个 Feature 使用自己的 `feature-*.json` 保存业务配置。`featureConfigFile(id)` 根据 Feature ID 生成规范化文件名，并检查规范化后的冲突；注册项显式保存生成结果。增加 Feature 时提供自己的默认值和 codec，不把该 Feature 的字段加入核心 schema。
 
 `JsonStore` 负责解析、验证、订阅和写入。首次缺少配置时使用内存默认值，不因加载或打开设置页而创建文件；相同值更新不写盘，每个文件的更新串行执行。无效或损坏的 JSON 不得被默认值覆盖；显式恢复先备份原始内容，主文件保存确认后才更新内存状态。写入超时会标记结果不确定，阻止继续写入。外部数据变更通过 `onDataChanged` 重新加载并通知运行时，不把重新加载的数据写回。
 
 核心启用偏好与运行状态不是同一个值：启用失败会显示错误状态，但不擅自改写用户保存的偏好。运行状态切换与保存失败需要补偿，使运行资源与已保存偏好保持一致。
 
-当前配置只支持现行 schema，不迁移旧版 OmniKit 配置，也不主动删除旧配置文件。图片 Feature 的 schema v1 codec 对旧的格式跳过布尔字段保留读取兼容，并严格检查数值、扩展名及白名单数据；添加白名单时还会向内核确认文档根块。SiYuan 独立设置窗口能力目前未启用；未来若多个插件实例同时编辑同一 JSON 文件，`onDataChanged` 只负责刷新，不构成跨实例写锁，也不承诺解决并发写冲突。
+当前图片配置使用 schema v1 的分组结构：`auto`、`compression`、`sources`、`retention`、`references`。codec 只接受完整的现行结构，不迁移旧格式；它校验数值、扩展名、远程来源及文档名单，添加名单时还会向内核确认文档根块。设置页编辑草稿并显式保存，外部数据变更会提示重新载入。SiYuan 独立设置窗口能力目前未启用；未来若多个插件实例同时编辑同一 JSON 文件，`onDataChanged` 只负责刷新，不构成跨实例写锁。
 
 ## 图片压缩规则
 
@@ -69,7 +76,9 @@ flowchart TD
 | 开启 | 关闭 | 是 | 处理 |
 | 开启 | 关闭 | 否 | 不处理 |
 
-自动上传只处理编辑器上传事件。`before-upload-assets` 能力按思源版本和事件形状检测；不支持或无法可靠识别目标时跳过。仅有本地文件路径而没有 `File` 字节的拖入事件无法预压缩。事件的 `respondWith` 必须在处理器的同步调用栈内注册，异步压缩完成后仍按原文件序列返回；宿主取消或处理失败时返回原始有序文件批次。有 `onComplete` 时按对应请求的最终上传结果提示；旧宿主只提示图片已准备好，不把压缩完成等同于上传成功。
+自动上传只处理编辑器上传事件。`before-upload-assets` 能力按思源版本和事件形状检测；不支持或无法可靠识别目标时跳过。桌面端本地路径拖入会先把整批路径转成 `File`，任何一项读取失败就交回原始批次。事件的 `respondWith` 必须在处理器的同步调用栈内注册，异步压缩完成后仍按原文件序列返回；宿主取消或处理失败时返回原始有序文件批次。有 `onComplete` 时按对应请求的最终上传结果提示；旧宿主只提示图片已准备好，不把压缩完成等同于上传成功。
+
+已授权 HTTP(S) 来源的新插入外链图片由编辑器观察器处理：它先记录现有引用作为基线，只关注后续新增引用，并在思源同步期间暂停。观察器必须确认图片引用已经持久化，才能下载、压缩、上传和更新引用。
 
 白名单以文档 `rootID` 标识，不因改名或移动而改变授权。全局开关和 Feature 总开关不清空白名单；Feature 停用时则停止该功能的监听和任务。文档树菜单只对单个文档提供操作，不对多选或笔记本节点猜测目标。
 
@@ -77,23 +86,29 @@ flowchart TD
 
 | 模块 | 职责与调用边界 |
 | --- | --- |
-| `ImageCompressorFeature` | 组合 Feature 生命周期：注册菜单、上传监听、任务和设置变更响应；通过 `FeatureScope` 管理运行期资源。 |
-| `AutoUploadHandler` / `AutoPolicy` | Handler 校验宿主上传事件并同步调用 `respondWith`，再异步处理有序文件批次；纯策略函数根据 Feature 开关、全局开关、白名单与宿主能力决定是否压缩。 |
-| `ImageCompressorService` / `ImageEligibility` / `ExcludedExtensions` | Service 使用本地 Worker 执行压缩；Eligibility 先按资源路径、扩展名黑名单和 MIME 筛选，再验证文件签名、大小及替换收益。UI 和菜单不直接处理压缩算法。 |
-| `PageAllowlist` | 以文档 `rootID` 读写 Feature 配置中的授权名单；菜单入口只提供文档身份，不复制另一份授权状态。 |
-| `SingleImageAction` / `DocumentBatchAction` | 单图动作只处理用户指向的图片引用；批量动作读取当前文档根块的完整内核 DOM，按图片所属块建立清单，扫描成功后才开始处理资源。两者读取原始 `assets/` 路径，调用 Service 压缩，并把引用修改委托给块更新层。 |
-| `DocumentImageScanner` / `CompressionQueue` / `CompressionResult` | Scanner 从完整文档 DOM 收集可处理图片，避免父子块重复归属；Queue 按资源内容去重并限制并发；Result 记录逐项进度和引用体积变化。 |
-| `AssetRepository` / `BlockImageRewriter` / `BlockActionCoordinator` | Repository 经 `KernelClient` 调用思源 API 上传资源和读取/更新块 DOM；Rewriter 重读并校验引用，检测冲突后停止更新；Coordinator 串行化同一块的插件内写入。Repository 不覆盖或删除原资源。 |
-| `TaskRegistry` | 为批量任务创建可取消控制器；单图和自动上传使用 Feature Scope 或宿主提供的取消信号。Feature 停用或插件卸载时中止仍在运行的任务。 |
-| `ImageSettingsPanel.svelte` | 展示并编辑 Feature 配置、全局自动压缩与白名单；通过传入的 `JsonStore` 和组件回调访问数据，不拥有业务执行或 Feature 生命周期。 |
+| `ImageCompressorFeature` | 作为 Feature 容器，挂载生命周期、贡献菜单与注册外链观察器；通过 `FeatureScope` 管理运行期资源。 |
+| `ImageController` | 统一的业务编排门面；连接菜单交互、参数解析、安全前置检查、进度跟踪与任务生命周期。 |
+| `SingleImageAction` / `DocumentBatchAction` / `AutoUploadHandler` | 具体动作执行逻辑，分别处理选中图片、完整文档 DOM 和上传前有序批次。 |
+| `RemoteImageWatcher` / `AutoPolicy` | 观察新增外链图片并判断自动授权；上传策略根据 Feature 开关、全局开关、文档名单与宿主能力决定是否压缩。 |
+| `source` / `download` / `desktop` | 规范化工作区资源、HTTP(S) 外链与桌面文件路径；按来源权限、超时和字节上限安全读取图片。 |
+| `image` (`ImageCodec` / `BicEncoder`) | 校验图片容器与编码收益，通过 `ImageCodec` 标准接口解耦引擎，由本地 Worker 编码生成 WebP。 |
+| `assets` / `ImageProcessingServices` | 上传并校验资源，原图归档；单图原件清理由独立终结器守护。绝不向工作区写入临时任务日志垃圾。 |
+| `references` (`ReferenceDriver` / `Native` / `SQL`) | 抽象双驱动模型：新版宿主通过原生查引用与重链接 API，旧版宿主通过 SQL Keyset 结合 DOM Patch 乐观写；写租约（`withWriteLease`）保证进程内串行写入。 |
+| `scanDocumentImages` / `dom` / `asset-identity` | 扫描内核完整 DOM，确定图片所属块；预检引用并对工作区物理资源消歧。 |
+| `CompressionResult` / `TaskRegistry` / `ImageTaskUI` | 汇总资源与引用结果、取消批量任务、通过内存状态向 UI 发布流式进度。 |
+| `PageAllowlist` / `ImageSettingsPanel.svelte` | 以文档 `rootID` 保存授权名单；设置面板编辑 Feature 配置草稿，不拥有业务执行或生命周期。 |
 
 ## 笔记数据与资源安全
 
-图片处理失败、压缩结果不值得替换或引用无法精确确认时，保留原图并跳过替换。块更新只改动确认属于目标图片的引用，不进行模糊字符串替换；批量操作限定在当前文档范围，不自动扫描并重写整个工作区，也不自动删除原始资源。去重状态只用于当前任务。
+图片处理失败、压缩结果不值得替换或引用无法精确确认时，保留原图并跳过替换。单图和整篇任务按来源归并，先上传新资源，再预检所有相关引用；跨文档更新前向用户显示范围并确认。
+
+**任务日志零垃圾原则**：插件严禁向思源工作区（如 `data/storage`）写入持久化 job 事务日志文件，彻底避免污染用户的云端同步和全量备份。数据容灾完全依托思源原生强大的块历史版本（Block History）、文档历史与工作区快照，不在插件层堆叠脆弱的私有恢复逻辑。
+
+原生重链接 API 覆盖宿主可识别的资源引用；SQL 兼容路径只扫描已索引普通文档，并在更新块前重读、更新后复核。两种路径均不对块内容做模糊字符串替换。上传后的资源或引用写入结果不确定时，报告部分或未知状态，不重试不确定的写入。
 
 压缩 Worker 由 `browser-image-compression` 依赖提供，并作为本地资源打包，避免运行时依赖外网。支持的图片类型、尺寸和压缩参数由 Feature 配置与处理逻辑共同校验；不适合处理的格式按规则跳过。
 
-当前提供单图压缩和当前文档范围的批量处理入口；批量操作不扩展到整个工作区。默认扩展名黑名单为 `gif,svg,webp`，用户可编辑；GIF、SVG 和 Excalidraw 仍受固定保护，当前只编码 JPEG、PNG、WebP。批量结果区分成功改写的引用体积减少与磁盘回收：原资源未删除，因此不会声称已经回收磁盘空间。块更新前会重新读取并校验目标引用，但思源接口不提供 compare-and-swap（CAS）原子更新；检测到冲突时停止更新，不承诺消除读取与写入之间的并发窗口。
+当前提供单图、整篇、上传前自动压缩和新插入外链图片自动处理。默认扩展名黑名单为 `gif,svg,webp`，用户可编辑；GIF、SVG 和 Excalidraw 仍受固定保护。整篇任务始终保留原资源；仅手动单图在设置允许、宿主版本和原生引用复核均满足条件时，才尝试调用思源单资源清理 API。批量结果分别报告引用体积减少和磁盘回收；原资源未删除时磁盘回收为零。思源接口不提供 compare-and-swap（CAS）原子更新，冲突检测不能消除读取与写入之间的并发窗口。
 
 ## 新增 Feature
 

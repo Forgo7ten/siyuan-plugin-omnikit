@@ -22,14 +22,14 @@ export class PageAllowlist {
 
   hasCached(rootId: string): boolean {
     return Boolean(this.settings.getFeature<ImageFeatureConfig>(IMAGE_FEATURE_ID)
-      .autoCompression.pageAllowlist[rootId]);
+      .auto.pageAllowlist[rootId]);
   }
 
   async has(rootId: string): Promise<boolean> { return this.hasCached(rootId); }
 
   async list(): Promise<DocumentPermission[]> {
     const pages = this.settings.getFeature<ImageFeatureConfig>(IMAGE_FEATURE_ID)
-      .autoCompression.pageAllowlist;
+      .auto.pageAllowlist;
     return Object.entries(pages)
       .map(([rootId, value]) => ({ rootId, ...value }))
       .sort((a, b) => a.rootId.localeCompare(b.rootId));
@@ -38,13 +38,12 @@ export class PageAllowlist {
   async toggle(rootId: string, meta: Partial<Omit<DocumentPermission, "rootId" | "grantedAt">> = {}): Promise<boolean> {
     let added = false;
     await this.settings.updateFeature<ImageFeatureConfig>(IMAGE_FEATURE_ID, draft => {
-      const pages = draft.autoCompression.pageAllowlist;
+      const pages = draft.auto.pageAllowlist;
       if (pages[rootId]) { delete pages[rootId]; added = false; }
       else {
         pages[rootId] = {
           grantedAt: Date.now(),
-          ...(meta.titleSnapshot ? { titleSnapshot: meta.titleSnapshot } : {}),
-          ...(meta.notebookIdSnapshot ? { notebookIdSnapshot: meta.notebookIdSnapshot } : {}),
+          title: meta.title ?? "",
         };
         added = true;
       }
@@ -54,7 +53,7 @@ export class PageAllowlist {
 
   async remove(rootId: string): Promise<void> {
     await this.settings.updateFeature<ImageFeatureConfig>(IMAGE_FEATURE_ID, draft => {
-      delete draft.autoCompression.pageAllowlist[rootId];
+      delete draft.auto.pageAllowlist[rootId];
     });
   }
 }

@@ -2,9 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { FeatureScope } from "../src/core/FeatureScope.ts";
 import { registerAutoUpload } from "../src/features/image-compressor/AutoUploadHandler.ts";
-import { compressionDefaults } from "../src/features/image-compressor/settings.ts";
+import { defaultImageFeatureConfig } from "../src/features/image-compressor/parseImageConfig.ts";
 
-function setup(compress, onNotice = () => {}) {
+function setup({ encode, read, archive, config: suppliedConfig } = {}, onNotice = () => {}) {
   const listeners = new Map();
   const plugin = {
     eventBus: {
@@ -13,159 +13,156 @@ function setup(compress, onNotice = () => {}) {
     },
   };
   const scope = new FeatureScope();
-  registerAutoUpload(
-    plugin,
-    scope,
-    () => true,
-    async () => true,
-    { compress },
-    () => compressionDefaults,
-    { warn() {}, debug() {} },
-    onNotice,
-  );
-  return { listener: listeners.get("before-upload-assets"), scope };
+  const config = suppliedConfig ?? defaultImageFeatureConfig();
+  config.auto.uploads = true;
+  config.sources.desktopLocalFiles = true;
+  const services = {
+    origin: "https://siyuan.test",
+    config: () => config,
+    reader: { read: read ?? (async source => ({ blob: new Blob([source.fileURL]), name: source.name })) },
+    encoder: { encode: encode ?? (async file => ({
+      kind: "encoded",
+      value: { file: new File([`compressed:${file.name}`], file.name.replace(/\.[^.]+$/, ".webp"), { type: "image/webp" }) },
+    })) },
+    assets: { archive: archive ?? (async file => `/assets/${file.name}`) },
+  };
+  registerAutoUpload(plugin, scope, () => true, async () => true, services,
+    { warn() {}, debug() {} }, onNotice);
+  return { listener: listeners.get("before-upload-assets"), scope, services, config };
 }
 
-test("upload handler registers respondWith synchronously and preserves file ordering", async () => {
-  const { listener, scope } = setup(async file => {
-    await new Promise(resolve => setTimeout(resolve, file.name === "b.png" ? 8 : 1));
-    return { blob: new Blob([file.name], { type: "image/webp" }) };
-  });
-  const originals = ["a.png", "b.png", "c.png"].map(name => new File([name], name, { type: "image/png" }));
-  let response;
-  let calls = 0;
-  listener({ detail: {
+function uploadDetail(input, extra = {}) {
+  return {
+    requestId: "upload-1",
     target: "editor",
-    protyle: { block: { rootID: "root-1" } },
-    input: { kind: "files", files: originals },
-    respondWith(value) { calls++; response = value; },
-  } });
+    protyle: { block: { rootID: "20240101000000-abcdefg" } },
+    input,
+    ...extra,
+  };
+}
 
-  assert.equal(calls, 1);
-  assert.ok(response instanceof Promise, "respondWith is called before the event listener returns");
+test("respondWith and onComplete register synchronously; replacements preserve file order", async () => {
+  const notices = [];
+  const { listener, scope } = setup({ config: defaultImageFeatureConfig() }, notice => notices.push(notice));
+  const originals = ["a.png", "b.png", "notes.txt"].map(name => new File([name], name));
+  let response;
+  let complete;
+  let respondCalls = 0;
+  let completeCalls = 0;
+  listener({ detail: uploadDetail({ kind: "files", files: originals }, {
+    onComplete(callback) { completeCalls++; complete = callback; },
+    respondWith(value) { respondCalls++; response = value; },
+  }) });
+
+  assert.equal(respondCalls, 1);
+  assert.equal(completeCalls, 1);
+  assert.ok(response instanceof Promise);
   const decision = await response;
   assert.equal(decision.action, "replace");
-  assert.deepEqual(decision.input.files.map(file => file.name), ["a.webp", "b.webp", "c.webp"]);
+  assert.deepEqual(decision.input.files.map(file => file.name), ["a.webp", "b.webp", "notes.txt"]);
+  assert.deepEqual(notices, []);
+  complete({ requestId: "upload-1", status: "success", acceptedInput: decision.input,
+    input: decision.input, succFiles: [0, 1, 2].map(index => ({ index })) });
+  assert.deepEqual(notices, [{ status: "success", count: 2 }]);
   scope.dispose();
 });
 
-test("host cancellation returns the original ordered file batch", async () => {
-  const { listener, scope } = setup(async file => {
-    await new Promise(resolve => setTimeout(resolve, 15));
-    return { blob: new Blob([file.name], { type: "image/webp" }) };
-  });
-  const originals = ["first.png", "second.png"].map(name => new File([name], name, { type: "image/png" }));
-  const host = new AbortController();
-  let response;
-  listener({ detail: {
-    target: "editor",
-    protyle: { block: { rootID: "root-1" } },
-    signal: host.signal,
-    input: { kind: "files", files: originals },
-    respondWith(value) { response = value; },
+test("local-files are materialized as a whole in order, while non-images remain unchanged", async () => {
+  const reads = [];
+  const { listener, scope } = setup({ read: async source => {
+    reads.push(source.fileURL);
+    return { blob: new Blob([source.fileURL]), name: source.name };
   } });
-  setTimeout(() => host.abort("cancel upload"), 1);
+  const paths = ["/tmp/first.png", "/tmp/readme.txt", "/tmp/last.jpg"];
+  let response;
+  listener({ detail: uploadDetail({ kind: "local-files", files: paths.map(path => ({ path, size: 10 })) }, {
+    respondWith(value) { response = value; },
+  }) });
+  const decision = await response;
+  assert.deepEqual(reads.map(url => decodeURIComponent(new URL(url).pathname)), paths);
+  assert.equal(decision.input.kind, "files");
+  assert.deepEqual(decision.input.files.map(file => file.name), ["first.webp", "readme.txt", "last.webp"]);
+  scope.dispose();
+});
+
+test("one local read failure returns the complete original local-files input", async () => {
+  let encodeCalls = 0;
+  const { listener, scope } = setup({
+    read: async source => {
+      if (source.fileURL.includes("broken")) throw new Error("read denied");
+      return { blob: new Blob(["bytes"]), name: source.name };
+    },
+    encode: async () => { encodeCalls++; return { kind: "skipped" }; },
+  });
+  const input = { kind: "local-files", files: [
+    { path: "/tmp/first.png", size: 5 }, { path: "/tmp/broken.png", size: 5 }, { path: "/tmp/last.png", size: 5 },
+  ] };
+  let response;
+  listener({ detail: uploadDetail(input, { respondWith(value) { response = value; } }) });
+  const decision = await response;
+  assert.equal(decision.input, input);
+  assert.equal(encodeCalls, 0);
+  scope.dispose();
+});
+
+test("original retention follows total input count, including mixed non-image uploads", async () => {
+  const singleConfig = defaultImageFeatureConfig();
+  singleConfig.retention.deleteSingleOriginal = true;
+  const singleArchives = [];
+  const single = setup({ config: singleConfig, archive: async file => singleArchives.push(file.name) });
+  const original = new File(["one"], "one.png", { type: "image/png" });
+  let singleResponse;
+  single.listener({ detail: uploadDetail({ kind: "files", files: [original] }, { respondWith(value) { singleResponse = value; } }) });
+  await singleResponse;
+  assert.deepEqual(singleArchives, []);
+  single.scope.dispose();
+
+  const batchConfig = defaultImageFeatureConfig();
+  batchConfig.retention.deleteSingleOriginal = true;
+  const archived = [];
+  const batch = setup({ config: batchConfig, archive: async file => archived.push(file.name) });
+  const inputs = [new File(["image"], "only-image.png"), new File(["text"], "document.txt")];
+  let batchResponse;
+  batch.listener({ detail: uploadDetail({ kind: "files", files: inputs }, { respondWith(value) { batchResponse = value; } }) });
+  const decision = await batchResponse;
+  assert.deepEqual(archived, ["only-image.png"]);
+  assert.deepEqual(decision.input.files.map(file => file.name), ["only-image.webp", "document.txt"]);
+  batch.scope.dispose();
+});
+
+test("archive failure keeps that original file; legacy completion fallback reports prepared", async () => {
+  const notices = [];
+  const { listener, scope } = setup({ archive: async () => { throw new Error("archive denied"); } }, notice => notices.push(notice));
+  const originals = [new File(["one"], "one.png"), new File(["two"], "two.png")];
+  let response;
+  listener({ detail: uploadDetail({ kind: "files", files: originals }, { respondWith(value) { response = value; } }) });
   const decision = await response;
   assert.deepEqual(decision.input.files, originals);
-  scope.dispose();
-});
-
-test("completion callback is registered synchronously and reports final upload status once", async () => {
-  for (const status of ["success", "partial", "failed", "canceled"]) {
-    const notices = [];
-    const { listener, scope } = setup(async () => ({ blob: new Blob(["compressed"]) }), notice => notices.push(notice));
-    const originals = ["one.png", "two.png"].map(name => new File([name], name, { type: "image/png" }));
-    let response;
-    let complete;
-    let calls = 0;
-    listener({ detail: {
-      requestId: `request-${status}`,
-      target: "editor",
-      protyle: { block: { rootID: "root-1" } },
-      input: { kind: "files", files: originals },
-      onComplete(callback) { calls++; complete = callback; },
-      respondWith(value) { response = value; },
-    } });
-    assert.equal(calls, 1, "onComplete is registered in the event dispatch turn");
-    await response;
-    assert.equal(notices.length, 0, "compression alone does not report an uploaded result");
-    // Use the actual output identities returned through respondWith.
-    const uploaded = (await response).input.files;
-    complete({ requestId: `request-${status}`, status, input: { kind: "files", files: uploaded } });
-    complete({ requestId: `request-${status}`, status, input: { kind: "files", files: uploaded } });
-    assert.deepEqual(notices, [{ status, count: 2 }]);
-    scope.dispose();
-  }
-});
-
-test("legacy host without onComplete reports prepared once, only after respondWith succeeds", async () => {
-  const notices = [];
-  const { listener, scope } = setup(async () => ({ blob: new Blob(["compressed"]) }), notice => notices.push(notice));
-  const original = new File(["original"], "one.png", { type: "image/png" });
-  let response;
-  listener({ detail: {
-    target: "editor", protyle: { block: { rootID: "root-1" } },
-    input: { kind: "files", files: [original] }, respondWith(value) { response = value; },
-  } });
-  await response;
-  assert.deepEqual(notices, [{ status: "prepared", count: 1 }]);
-  scope.dispose();
-
-  const failedNotices = [];
-  const failed = setup(async () => ({ blob: new Blob(["compressed"]) }), notice => failedNotices.push(notice));
-  failed.listener({ detail: {
-    target: "editor", protyle: { block: { rootID: "root-1" } },
-    input: { kind: "files", files: [original] }, respondWith() { throw new Error("host rejected registration"); },
-  } });
-  await new Promise(resolve => setTimeout(resolve, 0));
-  assert.deepEqual(failedNotices, []);
-  failed.scope.dispose();
-});
-
-test("completion request mismatch and batches without replacements do not notify", async () => {
-  const notices = [];
-  const { listener, scope } = setup(async () => undefined, notice => notices.push(notice));
-  const original = new File(["original"], "one.png", { type: "image/png" });
-  let response;
-  let complete;
-  listener({ detail: {
-    requestId: "request-1", target: "editor", protyle: { block: { rootID: "root-1" } },
-    input: { kind: "files", files: [original] }, onComplete(callback) { complete = callback; },
-    respondWith(value) { response = value; },
-  } });
-  const output = await response;
-  complete({ requestId: "different", status: "success", input: output.input });
   assert.deepEqual(notices, []);
   scope.dispose();
-});
 
-test("falls back when completion registration fails and ignores compressed files replaced later", async () => {
-  const original = new File(["original"], "one.png", { type: "image/png" });
   const prepared = [];
-  const first = setup(async () => ({ blob: new Blob(["compressed"]) }), notice => prepared.push(notice));
-  let firstResponse;
-  first.listener({ detail: {
-    requestId: "request-1", target: "editor", protyle: { block: { rootID: "root-1" } },
-    input: { kind: "files", files: [original] },
-    onComplete() { throw new Error("registration failed"); },
-    respondWith(value) { firstResponse = value; },
-  } });
-  await firstResponse;
-  assert.deepEqual(prepared, [{ status: "prepared", count: 1 }]);
-  first.scope.dispose();
-
-  const notices = [];
-  const second = setup(async () => ({ blob: new Blob(["compressed"]) }), notice => notices.push(notice));
+  const second = setup({ config: (() => { const c = defaultImageFeatureConfig(); c.retention.deleteSingleOriginal = true; return c; })() },
+    notice => prepared.push(notice));
   let secondResponse;
-  let complete;
-  second.listener({ detail: {
-    requestId: "request-2", target: "editor", protyle: { block: { rootID: "root-1" } },
-    input: { kind: "files", files: [original] },
-    onComplete(callback) { complete = callback; },
-    respondWith(value) { secondResponse = value; },
-  } });
+  second.listener({ detail: uploadDetail({ kind: "files", files: [originals[0]] }, { respondWith(value) { secondResponse = value; } }) });
   await secondResponse;
-  complete({ requestId: "request-2", status: "success", input: { kind: "files", files: [original] } });
-  assert.deepEqual(notices, []);
+  assert.deepEqual(prepared, [{ status: "prepared", count: 1 }]);
   second.scope.dispose();
+});
+
+test("host cancellation returns the exact original input", async () => {
+  const { listener, scope } = setup({ encode: async (_file, _name, _config, signal) => {
+    await new Promise(resolve => setTimeout(resolve, 15));
+    if (signal.aborted) return { kind: "skipped" };
+    return { kind: "encoded", value: { file: new File(["compressed"], "one.webp", { type: "image/webp" }) } };
+  } });
+  const input = { kind: "files", files: [new File(["one"], "one.png")] };
+  const host = new AbortController();
+  let response;
+  listener({ detail: uploadDetail(input, { signal: host.signal, respondWith(value) { response = value; } }) });
+  setTimeout(() => host.abort("cancel upload"), 1);
+  const decision = await response;
+  assert.equal(decision.input, input);
+  scope.dispose();
 });

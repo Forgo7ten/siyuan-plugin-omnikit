@@ -1,12 +1,11 @@
 import type { ILocalFiles, Plugin } from "siyuan";
 import type { FeatureScope } from "../../core/FeatureScope.ts";
-import type { CompressionDiagnostic, ImageCompressorService } from "./ImageCompressorService.ts";
-import type { ImageSettings } from "./settings.ts";
-import { isMobileFrontend } from "../../core/Platform.ts";
+import type { ImageProcessingServices } from "./ImageProcessingServices.ts";
+import { retainOriginal, type ImageConfig } from "./parseImageConfig.ts";
+import { resolveSource } from "./source.ts";
 
 /** Minimal logging surface: debug decisions plus warnings that must always surface. */
 export interface DebugLogger {
-  /** Optional so a partial logger can never break the upload path. */
   debug?: (message: string, data?: unknown) => void;
   warn: (message: string, data?: unknown) => void;
 }
@@ -16,19 +15,27 @@ export type AutoUploadNotice = {
   count: number;
 };
 
+type UploadInput =
+  | { kind: "files"; files: File[] }
+  | { kind: "local-files"; files: ILocalFiles[] };
+type UploadResult = {
+  requestId: unknown;
+  status: "success" | "partial" | "failed" | "canceled";
+  input?: UploadInput;
+  acceptedInput?: UploadInput;
+  succFiles?: Array<{ index: number; name?: string; path?: string }>;
+};
+
 /**
- * @compat before-upload-assets is available from SiYuan 3.8.4. Supports its file-array
- * response and the decision protocol without changing file ordering.
- * @invariant respondWith is invoked synchronously and exactly once per accepted event.
- * @safety Compression errors, cancellation, and Feature shutdown all return original files.
+ * @invariant respondWith and onComplete registration happen in the event dispatch stack.
+ * @safety Conversion of local-files is all-or-nothing; failures and cancellation preserve input.
  */
 export function registerAutoUpload(
   plugin: Plugin,
   scope: FeatureScope,
   isSupported: () => boolean,
   shouldCompress: (rootId: string) => Promise<boolean>,
-  compress: ImageCompressorService,
-  settings: () => ImageSettings,
+  services: ImageProcessingServices,
   logger: DebugLogger,
   onNotice?: (notice: AutoUploadNotice) => void,
 ): void {
@@ -36,124 +43,60 @@ export function registerAutoUpload(
     logger.debug?.("思源版本不支持上传前事件，自动压缩未启用");
     return;
   }
+
   const listener = (event: CustomEvent<any>) => {
     const detail = event.detail;
-    const input = detail?.input;
-    const source = detail?.source;
-    const target = detail?.target;
+    const input = detail?.input as UploadInput | undefined;
+    const requestId = detail?.requestId;
+    const rootID = detail?.protyle?.block?.rootID;
     logger.debug?.("收到上传事件", {
-      功能启用: scope.active,
-      requestId: detail?.requestId,
-      source,
-      target,
-      inputKind: input?.kind ?? (Array.isArray(detail?.files) ? "legacy-files" : undefined),
-      fileCount: Array.isArray(input?.files) ? input.files.length :
-        Array.isArray(detail?.files) ? detail.files.length : undefined,
-      hasRespondWith: typeof detail?.respondWith === "function",
-      rootID: detail?.protyle?.block?.rootID,
+      requestId, target: detail?.target, inputKind: input?.kind,
+      fileCount: Array.isArray(input?.files) ? input.files.length : undefined,
+      rootID, hasRespondWith: typeof detail?.respondWith === "function",
     });
-    if (!scope.active) {
-      logger.debug?.("忽略上传事件", { 原因: "功能已停用", requestId: detail?.requestId });
-      return;
-    }
-    if (!detail || typeof detail.respondWith !== "function") {
-      logger.debug?.("忽略上传事件", { 原因: "缺少上传决策接口" });
-      return;
-    }
-    const requestId = detail.requestId;
-    const supportsCompletionCallback = typeof detail.onComplete === "function";
-    // @compat Strictly follow the 3.8.4+ contract: only editor uploads carrying the
-    // file-decision envelope are compressed. A missing target never authorizes work.
-    if (detail.target !== "editor") {
-      logger.debug?.("忽略上传事件", { 原因: "上传目标不是编辑器", target: detail.target });
-      return;
-    }
-    let files: File[];
-    if (input) {
-      if (input.kind === "local-files") {
-        logger.debug?.("忽略本地路径上传", {
-          原因: "思源只提供本地路径，没有图片字节数据，插件无法在上传前压缩",
-          requestId: detail.requestId,
-          fileCount: Array.isArray(input.files) ? input.files.length : undefined,
-          files: Array.isArray(input.files) ? (input.files as ILocalFiles[]).map(file => ({
-            extension: getExtension(file.path), size: file.size, isDir: file.isDir === true,
-          })) : undefined,
-        });
-        return;
-      }
-      if (input.kind !== "files" || !Array.isArray(input.files)) {
-        logger.debug?.("忽略上传事件", {
-          原因: "不支持的输入类型",
-          inputKind: String(input.kind),
-          requestId: detail.requestId,
-          hasFilesArray: Array.isArray(input.files),
-        });
-        return;
-      }
-      files = input.files;
-    } else {
-      // @compat Early 3.8.4 builds exposed `files` without the decision envelope.
-      if (!Array.isArray(detail.files)) {
-        logger.debug?.("忽略上传事件", { 原因: "旧版事件缺少文件列表" });
-        return;
-      }
-      files = detail.files;
-    }
-    const decisionProtocol = Boolean(input);
-    if (files.length === 0) {
-      logger.debug?.("忽略上传事件", { 原因: "文件列表为空", requestId: detail.requestId });
-      return;
-    }
-    const rootId = detail.protyle?.block?.rootID;
-    if (!rootId) {
-      logger.debug?.("忽略上传事件", { 原因: "缺少文档根ID", requestId: detail.requestId });
-      return;
-    }
-    logger.debug?.("开始处理上传文件", {
-      rootID: rootId,
-      requestId: detail.requestId,
-      source,
-      files: files.map(file => describeFile(file)),
-      usesDecisionProtocol: decisionProtocol,
-    });
+    if (!scope.active || detail?.target !== "editor" || typeof detail?.respondWith !== "function" ||
+      !input || (input.kind !== "files" && input.kind !== "local-files") || !Array.isArray(input.files)) return;
+    if (!rootID || input.files.length === 0 || input.files.length > 16 ||
+      detail.requiredFileCount !== undefined && detail.requiredFileCount !== input.files.length) return;
+    const config = services.config();
+    if (input.kind === "local-files" && (!config.sources.desktopLocalFiles ||
+      input.files.some(file => file.isDir === true) ||
+      Array.isArray(detail.allowedInputKinds) && !detail.allowedInputKinds.includes("files"))) return;
 
-    // Register during the event's synchronous phase. Completion can race with the
-    // compression promise, so defer notification until both results are available.
-    let compressedCount: number | undefined;
-    let replacementFiles: Array<File | undefined> | undefined;
-    let completion: { status: "success" | "partial" | "failed" | "canceled"; requestId: unknown; input?: any } | undefined;
+    let replacements: File[] = [];
+    let prepared = false;
+    let registrationAccepted = false;
+    let completionRegistered = false;
+    let completion: UploadResult | undefined;
     let notified = false;
     const notifyWhenReady = () => {
-      if (notified || !scope.active || compressedCount === undefined || compressedCount === 0) return;
-      if (completionRegistered) {
-        if (!completion || typeof requestId !== "string" || requestId.length === 0 || completion.requestId !== requestId) return;
-        const finalFiles = completion.input?.kind === "files" && Array.isArray(completion.input.files)
-          ? completion.input.files
-          : Array.isArray(completion.input) ? completion.input : [];
-        const uploadedCompressedCount = replacementFiles?.reduce((count, file, index) =>
-          count + (file !== undefined && finalFiles[index] === file ? 1 : 0), 0) ?? 0;
+      if (!scope.active || !prepared || notified || replacements.length === 0) return;
+      if (!completionRegistered) {
+        if (!registrationAccepted) return;
         notified = true;
-        if (uploadedCompressedCount === 0) return;
-        try { onNotice?.({ status: completion.status, count: uploadedCompressedCount }); }
+        try { onNotice?.({ status: "prepared", count: replacements.length }); }
         catch (error) { logger.warn("无法显示自动压缩提示", error); }
-      } else if (respondWithAccepted) {
-        notified = true;
-        try { onNotice?.({ status: "prepared", count: compressedCount }); }
-        catch (error) { logger.warn("无法显示自动压缩提示", error); }
+        return;
       }
+      if (!completion || completion.requestId !== requestId) return;
+      const accepted = completion.acceptedInput ?? completion.input;
+      if (accepted?.kind !== "files" || !Array.isArray(accepted.files) || !Array.isArray(completion.succFiles)) return;
+      const confirmed = completion.succFiles.reduce((count, row) => {
+        const replacement = replacements.find(file => accepted.files[row.index] === file);
+        return count + (replacement ? 1 : 0);
+      }, 0);
+      notified = true;
+      if (!confirmed) return;
+      try { onNotice?.({ status: completion.status, count: confirmed }); }
+      catch (error) { logger.warn("无法显示自动压缩提示", error); }
     };
-    let respondWithAccepted = false;
-    let completionRegistered = false;
-    if (supportsCompletionCallback) {
+
+    if (typeof detail.onComplete === "function") {
       try {
-        detail.onComplete((result: any) => {
-          const status = result?.status;
-          if (typeof requestId !== "string" || requestId.length === 0 || result?.requestId !== requestId ||
-            !["success", "partial", "failed", "canceled"].includes(status)) {
-            logger.debug?.("忽略上传完成结果", { requestId, resultRequestId: result?.requestId, status });
-            return;
-          }
-          completion = { requestId: result.requestId, status, input: result.input };
+        detail.onComplete((result: UploadResult) => {
+          if (typeof requestId !== "string" || !requestId || result?.requestId !== requestId ||
+            !["success", "partial", "failed", "canceled"].includes(result?.status)) return;
+          completion = result;
           notifyWhenReady();
         });
         completionRegistered = true;
@@ -162,188 +105,128 @@ export function registerAutoUpload(
       }
     }
 
-    // @invariant Promise passed to respondWith is constructed and registered before returning.
-    const response = compressFiles(files, rootId, detail.signal, scope, shouldCompress, compress, settings, logger)
-      .then(output => {
-        const replaced = output.filter((file, index) => file !== files[index]).length;
-        compressedCount = replaced;
-        replacementFiles = output.map((file, index) => file !== files[index] ? file : undefined);
-        if (replaced > 0) {
-          logger.debug?.("压缩完成，上传时将使用 WebP 文件替换原文件", { rootID: rootId, requestId: detail.requestId, replacedCount: replaced });
-          notifyWhenReady();
-        }
-        return decisionProtocol ? { action: "replace" as const, input: { kind: "files" as const, files: output } } : output;
+    const registrationAbort = new AbortController();
+    const response = processUpload(input, rootID, detail.signal, registrationAbort.signal, scope,
+      shouldCompress, services, config, logger)
+      .then(result => {
+        replacements = result.replacements;
+        prepared = true;
+        notifyWhenReady();
+        return { action: "replace" as const, input: result.input };
       });
     try {
+      // The Promise is passed during dispatch, before this listener returns.
       detail.respondWith(response);
-      respondWithAccepted = true;
+      registrationAccepted = true;
       notifyWhenReady();
     } catch (error) {
-      logger.warn("无法注册自动压缩处理，将上传原文件", {
-        requestId: detail.requestId,
-        rootID: rootId,
-        error,
-      });
+      registrationAbort.abort("Host rejected upload decision");
+      void response.catch(() => undefined);
+      logger.warn("无法注册自动压缩处理，将上传原文件", { requestId, rootID, error });
     }
   };
+
   plugin.eventBus.on("before-upload-assets", listener);
   scope.own(() => plugin.eventBus.off("before-upload-assets", listener));
 }
 
-async function compressFiles(
-  files: File[],
-  rootId: string,
+async function processUpload(
+  input: UploadInput,
+  rootID: string,
   hostSignal: AbortSignal | undefined,
+  registrationSignal: AbortSignal,
   scope: FeatureScope,
   shouldCompress: (rootId: string) => Promise<boolean>,
-  compressor: ImageCompressorService,
-  getSettings: () => ImageSettings,
+  services: ImageProcessingServices,
+  config: ImageConfig,
   logger: DebugLogger,
-): Promise<File[]> {
-  const originals = [...files];
+): Promise<{ input: UploadInput; replacements: File[] }> {
+  const original = input;
+  const signal = linkedSignal(scope.signal, hostSignal, registrationSignal);
+  const unchanged = () => ({ input: original, replacements: [] as File[] });
+  const canceled = () => !scope.active || signal.aborted;
   try {
-    if (!scope.active || hostSignal?.aborted) {
-      logger.debug?.("跳过自动压缩", {
-        文档根ID: rootId,
-        原因: !scope.active ? "功能已停用" : "上传已取消",
-      });
-      return originals;
-    }
-    const allowed = await shouldCompress(rootId);
-    if (!allowed || !scope.active || hostSignal?.aborted) {
-      logger.debug?.("跳过自动压缩", {
-        文档根ID: rootId,
-        原因: !allowed ? "全局开关和文档白名单均未授权" : !scope.active ? "功能已停用" : "上传已取消",
-      });
-      return originals;
-    }
-  } catch (error) {
-    logger.warn("自动压缩策略检查失败，将上传原文件", error);
-    return originals;
-  }
+    if (canceled() || !config.auto.uploads || !await shouldCompress(rootID) || canceled()) return unchanged();
 
-  const config = getSettings();
-  const concurrency = getConcurrency(config);
-  const output = [...files];
-  let nextIndex = 0;
-  const worker = async () => {
-    while (nextIndex < files.length) {
-      if (!scope.active || hostSignal?.aborted) return;
-      const index = nextIndex++;
-      const file = files[index];
-      const controller = new AbortController();
-      const abortFromScope = () => controller.abort(scope.signal.reason ?? "Feature disabled");
-      const abortFromHost = () => controller.abort(hostSignal?.reason ?? "Upload cancelled");
-      if (scope.signal.aborted) abortFromScope();
-      else scope.signal.addEventListener("abort", abortFromScope, { once: true });
-      if (hostSignal?.aborted) abortFromHost();
-      else hostSignal?.addEventListener("abort", abortFromHost, { once: true });
-      try {
-        const compressed = await compressor.compress(file, file.name, config, controller.signal, diagnostic => {
-          logger.debug?.("图片压缩检查", {
-            index: index + 1,
-            extension: getExtension(file.name),
-            size: file.size,
-            type: file.type,
-            ...describeCompressionDiagnostic(diagnostic),
-          });
+    let files: File[];
+    if (input.kind === "files") {
+      if (input.files.some(file => !(file instanceof File))) return unchanged();
+      files = [...input.files];
+    } else {
+      // Materialize the entire local batch before compression so any failed read keeps
+      // the host's original local-files input intact and in its original order.
+      files = [];
+      let totalBytes = 0;
+      for (const local of input.files) {
+        if (canceled() || local.isDir) return unchanged();
+        const source = resolveLocalFile(local.path, services.origin);
+        const read = await services.reader.read(source, {
+          maxBytes: config.compression.maxInputBytes,
+          timeoutMs: 30_000,
+          signal,
         });
-        if (!scope.active || hostSignal?.aborted || controller.signal.aborted) continue;
-        if (!compressed) {
-          logger.debug?.("图片保持原样上传", {
-            index: index + 1,
-            extension: getExtension(file.name),
-            size: file.size,
-            type: file.type,
-            原因: "格式或大小不符合条件，或压缩收益不足",
-          });
-          continue;
-        }
-        output[index] = new File([compressed.blob], replaceExtension(file.name, ".webp"), {
-          type: "image/webp",
-          lastModified: file.lastModified,
-        });
-        logger.debug?.("图片已压缩，将替换上传文件", {
-          index: index + 1,
-          originalExtension: getExtension(file.name),
-          originalBytes: compressed.originalBytes,
-          compressedBytes: compressed.compressedBytes,
-          savingRatio: Number((1 - compressed.compressedBytes / compressed.originalBytes).toFixed(4)),
-        });
-      } catch (error) {
-        if (!controller.signal.aborted) logger.warn("图片自动压缩失败，将上传原文件", {
-          index: index + 1,
-          extension: getExtension(file.name),
-          size: file.size,
-          type: file.type,
-          error,
-        });
-      } finally {
-        scope.signal.removeEventListener("abort", abortFromScope);
-        hostSignal?.removeEventListener("abort", abortFromHost);
+        totalBytes += read.blob.size;
+        if (totalBytes > 64 * 1024 * 1024) throw new Error("Local upload materialisation exceeds batch limit");
+        files.push(new File([read.blob], read.name, { type: read.blob.type }));
       }
     }
-  };
-  await Promise.all(Array.from({ length: Math.min(concurrency, files.length) }, () => worker()));
-  const replaced = output.filter((file, index) => file !== files[index]).length;
-  logger.debug?.("自动压缩处理完成", { 文档根ID: rootId, 文件数: files.length, 替换数: replaced, 并发数: concurrency });
-  return !scope.active || hostSignal?.aborted ? originals : output;
-}
 
-/** Avoid logging file names or paths while retaining enough metadata to diagnose routing. */
-function describeFile(file: File): Record<string, unknown> {
-  return { extension: getExtension(file.name), size: file.size, type: file.type };
-}
-
-function describeCompressionDiagnostic(diagnostic: CompressionDiagnostic): Record<string, unknown> {
-  if (diagnostic.stage === "eligibility") {
-    return {
-      stage: diagnostic.stage,
-      accepted: diagnostic.accepted,
-      reason: translateCompressionReason(diagnostic.reason),
-      format: diagnostic.format,
-    };
-  }
-  return {
-    stage: diagnostic.stage,
-    replaced: diagnostic.replaced,
-    reason: translateCompressionReason(diagnostic.reason),
-    originalBytes: diagnostic.originalBytes,
-    outputBytes: diagnostic.outputBytes,
-    minSavingRatio: diagnostic.minSavingRatio,
-  };
-}
-
-function translateCompressionReason(reason?: string): string | undefined {
-  switch (reason) {
-    case "Unsupported or protected image": return "不支持或受保护的图片格式";
-    case "Too small": return "文件小于最小压缩大小";
-    case "MIME and PNG signature disagree": return "MIME 类型与 PNG 文件签名不一致";
-    case "Extension and PNG signature disagree": return "文件扩展名与 PNG 文件签名不一致";
-    case "MIME and JPEG signature disagree": return "MIME 类型与 JPEG 文件签名不一致";
-    case "Extension and JPEG signature disagree": return "文件扩展名与 JPEG 文件签名不一致";
-    case "MIME and WebP signature disagree": return "MIME 类型与 WebP 文件签名不一致";
-    case "Extension and WebP signature disagree": return "文件扩展名与 WebP 文件签名不一致";
-    case "Unrecognized image signature": return "无法识别图片文件签名";
-    case "output-not-webp": return "压缩结果不是 WebP 格式";
-    case "below-minimum-savings": return "压缩收益低于设置阈值";
-    default: return reason;
+    const output = [...files];
+    const intent = { kind: "upload" as const, rootID, originalInputCount: input.files.length };
+    for (let index = 0; index < files.length; index++) {
+      if (canceled()) return unchanged();
+      const file = files[index];
+      if (!isImageCandidate(file)) continue;
+      try {
+        const result = await services.encoder.encode(file, file.name, config, signal);
+        if (result.kind === "skipped") continue;
+        if (retainOriginal(intent, config)) {
+          // Archive the exact original before making its replacement available to the host.
+          try { await services.assets.archive(file, rootID, signal); }
+          catch (error) {
+            if (signal.aborted) throw error;
+            logger.warn("原图归档失败，将上传原文件", { index: index + 1, error });
+            continue;
+          }
+        }
+        if (canceled()) return unchanged();
+        output[index] = result.value.file;
+      } catch (error) {
+        if (signal.aborted) return unchanged();
+        logger.warn("图片自动压缩失败，将上传原文件", { index: index + 1, error });
+      }
+    }
+    if (canceled()) return unchanged();
+    const replaced = output.some((file, index) => file !== files[index]);
+    if (!replaced) return unchanged();
+    return { input: { kind: "files", files: output }, replacements: output.filter((file, index) => file !== files[index]) };
+  } catch (error) {
+    logger.warn("自动上传处理失败，将上传原始输入", error);
+    return unchanged();
+  } finally {
+    signal.dispose();
   }
 }
 
-function getExtension(name: string): string {
-  const match = /\.([^.\\/]+)$/.exec(name);
-  return match ? `.${match[1].toLowerCase()}` : "(none)";
+function resolveLocalFile(path: string, origin: string) {
+  const source = resolveSource(path, origin);
+  if (source.kind !== "file") throw new Error("Invalid desktop upload path");
+  return source;
 }
 
-
-function getConcurrency(settings: ImageSettings): number {
-  const mobile = isMobileFrontend();
-  const requested = mobile ? settings.concurrencyMobile : settings.concurrencyDesktop;
-  const maximum = mobile ? 3 : 8;
-  return Math.max(1, Math.min(maximum, Math.floor(requested || 1)));
+function linkedSignal(...signals: Array<AbortSignal | undefined>): AbortSignal & { dispose(): void } {
+  const controller = new AbortController();
+  const relays = signals.filter((signal): signal is AbortSignal => Boolean(signal)).map(signal => {
+    const relay = () => controller.abort(signal.reason);
+    if (signal.aborted) relay();
+    else signal.addEventListener("abort", relay, { once: true });
+    return { signal, relay };
+  });
+  const result = controller.signal as AbortSignal & { dispose(): void };
+  result.dispose = () => relays.forEach(({ signal, relay }) => signal.removeEventListener("abort", relay));
+  return result;
 }
 
-function replaceExtension(name: string, extension: string): string {
-  return /\.[^./\\]+$/.test(name) ? name.replace(/\.[^./\\]+$/, extension) : `${name}${extension}`;
+function isImageCandidate(file: File): boolean {
+  return /\.(?:png|jpe?g|webp)$/i.test(file.name) || /^image\/(?:png|jpeg|webp)$/i.test(file.type);
 }

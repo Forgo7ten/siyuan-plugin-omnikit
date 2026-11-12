@@ -13,6 +13,7 @@ export interface ImageMenuDeps {
   icon: string;
   label: (ctx: MenuContext) => string;
   compressImage: (ctx: MenuContext) => Promise<void>;
+  compressFromFile: (ctx: MenuContext) => Promise<void>;
   toggleDocument: (ctx: MenuContext) => Promise<void>;
   runBatch: (ctx: MenuContext) => Promise<void>;
 }
@@ -45,6 +46,11 @@ export function imageMenuContributions(deps: ImageMenuDeps): ImageMenuContributi
         label: deps.t("menu.compressImage"),
         icon: deps.icon,
         run: () => deps.compressImage(ctx),
+      }, {
+        id: "compress-image-from-file",
+        label: deps.t("menu.compressFromFile"),
+        icon: deps.icon,
+        run: () => deps.compressFromFile(ctx),
       }],
     },
     { location: "doc-title", id: "toggle-document", provider: toggle },

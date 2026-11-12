@@ -9,9 +9,18 @@ export class FeatureScope {
   get signal(): AbortSignal { return this.controller.signal; }
 
   /** @invariant A late asynchronous registration cannot resurrect a frozen feature. */
-  own(disposer: Disposer): void {
-    if (!this.alive) { disposer(); return; }
-    this.disposers.push(disposer);
+  own(disposer: Disposer): Disposer {
+    let disposed = false;
+    const release = () => {
+      if (disposed) return;
+      disposed = true;
+      const index = this.disposers.indexOf(release);
+      if (index >= 0) this.disposers.splice(index, 1);
+      disposer();
+    };
+    if (!this.alive) release();
+    else this.disposers.push(release);
+    return release;
   }
 
   guard<T extends (...args: any[]) => unknown>(handler: T): T {

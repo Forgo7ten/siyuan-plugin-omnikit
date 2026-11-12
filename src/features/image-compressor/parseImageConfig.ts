@@ -1,90 +1,123 @@
-import { compressionDefaults, type CompressionSettings } from "./settings.ts";
-import { readExcludedExtensions } from "./ExcludedExtensions.ts";
+export const MiB = 1024 * 1024;
+export const NODE_ID = /^\d{14}-[a-z0-9]{7}$/;
 
-export interface PagePermission {
-  grantedAt: number;
-  titleSnapshot?: string;
-  notebookIdSnapshot?: string;
-}
-export interface ImageFeatureConfig {
+export interface ImageConfig {
   schemaVersion: 1;
-  autoCompression: {
+  auto: {
     globalEnabled: boolean;
-    pageAllowlist: Record<string, PagePermission>;
+    pageAllowlist: Record<string, { grantedAt: number; title: string }>;
+    uploads: boolean;
+    remoteImages: boolean;
   };
-  compression: CompressionSettings;
+  compression: {
+    initialQuality: number;
+    maxDimension: number;
+    minInputBytes: number;
+    minSavingBytes: number;
+    minSavingRatio: number;
+    maxInputBytes: number;
+    maxPixels: number;
+    maxEncodeMs: number;
+    concurrencyDesktop: number;
+    concurrencyMobile: number;
+    excludedExtensions: string[];
+  };
+  sources: { desktopLocalFiles: boolean };
+  retention: { deleteSingleOriginal: boolean };
+  references: { backend: "auto" | "sql"; maxDocuments: number };
 }
 
-export function defaultImageFeatureConfig(): ImageFeatureConfig {
+export type ImageFeatureConfig = ImageConfig;
+export interface PagePermission { grantedAt: number; title: string }
+export class UnsupportedConfigError extends Error {}
+
+export function defaultImageFeatureConfig(): ImageConfig {
   return {
     schemaVersion: 1,
-    autoCompression: { globalEnabled: false, pageAllowlist: {} },
-    compression: { ...compressionDefaults },
+    auto: { globalEnabled: false, pageAllowlist: {}, uploads: true, remoteImages: false },
+    compression: {
+      initialQuality: 0.8, maxDimension: 4096,
+      minInputBytes: 100 * 1024, minSavingBytes: 4096,
+      minSavingRatio: 0.05, maxInputBytes: 32 * MiB,
+      maxPixels: 32_000_000, maxEncodeMs: 45_000,
+      concurrencyDesktop: 2, concurrencyMobile: 1,
+      excludedExtensions: ["gif", "svg", "webp"],
+    },
+    sources: { desktopLocalFiles: true },
+    retention: { deleteSingleOriginal: false },
+    references: { backend: "auto", maxDocuments: 10_000 },
   };
 }
 
-export function parseImageConfig(raw: unknown): ImageFeatureConfig {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    throw new Error("Image config must be an object");
+function object(value: unknown, name: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name}: object required`);
+  return value as Record<string, unknown>;
+}
+function bool(value: unknown, name: string): boolean {
+  if (typeof value !== "boolean") throw new Error(`${name}: boolean required`);
+  return value;
+}
+function number(value: unknown, name: string, min: number, max: number, integer = false): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max || (integer && !Number.isSafeInteger(value))) {
+    throw new Error(`${name}: out of range`);
   }
-  const input = raw as Record<string, any>;
-  if (input.schemaVersion !== 1) throw new Error("Unknown image config schema");
-  if (!input.autoCompression || typeof input.autoCompression !== "object" || Array.isArray(input.autoCompression)) {
-    throw new Error("Invalid auto compression settings");
+  return value;
+}
+export function parseExtensions(raw: string): string[] {
+  const values = raw.split(/[,，]/).map(s => s.trim().replace(/^\./, "").toLowerCase()).filter(Boolean);
+  if (values.some(s => !/^[a-z0-9]+$/.test(s))) throw new Error("Invalid extension");
+  return [...new Set(values)];
+}
+
+/** Accept only complete image schema data; parsing never fills fields or writes files. */
+export function parseImageConfig(raw: unknown): ImageConfig {
+  const r = object(raw, "config");
+  if (r.schemaVersion !== 1) throw new UnsupportedConfigError("Only image config schemaVersion 1 is supported");
+  const a = object(r.auto, "auto"), c = object(r.compression, "compression");
+  const s = object(r.sources, "sources"), t = object(r.retention, "retention");
+  const refs = object(r.references, "references"), pages = object(a.pageAllowlist, "pageAllowlist");
+  const pageAllowlist: ImageConfig["auto"]["pageAllowlist"] = {};
+  for (const [id, value] of Object.entries(pages)) {
+    if (!NODE_ID.test(id)) throw new Error("Invalid document ID");
+    const p = object(value, "permission");
+    if (typeof p.title !== "string" || p.title.length > 512) throw new Error("Invalid title");
+    pageAllowlist[id] = { grantedAt: number(p.grantedAt, "grantedAt", 0, Number.MAX_SAFE_INTEGER, true), title: p.title };
   }
-  if (typeof input.autoCompression.globalEnabled !== "boolean") {
-    throw new Error("Invalid global compression switch");
+  if (!Array.isArray(c.excludedExtensions) || c.excludedExtensions.some(v => typeof v !== "string" || !/^[a-z0-9]+$/.test(v))) {
+    throw new Error("Invalid excludedExtensions");
   }
-  const pages = input.autoCompression.pageAllowlist;
-  if (!pages || typeof pages !== "object" || Array.isArray(pages)) {
-    throw new Error("Invalid page allowlist");
-  }
-  const safePages: ImageFeatureConfig["autoCompression"]["pageAllowlist"] = {};
-  for (const [id, meta] of Object.entries(pages)) {
-    if (!/^\d{14}-[0-9a-z]{7}$/.test(id)) throw new Error("Invalid page rootID");
-    if (!meta || typeof meta !== "object" || Array.isArray(meta)) throw new Error("Invalid page permission");
-    const row = meta as Record<string, unknown>;
-    if (typeof row.grantedAt !== "number" || !Number.isFinite(row.grantedAt) || row.grantedAt < 0) {
-      throw new Error("Invalid permission timestamp");
-    }
-    if (row.titleSnapshot !== undefined && typeof row.titleSnapshot !== "string") {
-      throw new Error("Invalid permission title snapshot");
-    }
-    if (row.notebookIdSnapshot !== undefined && typeof row.notebookIdSnapshot !== "string") {
-      throw new Error("Invalid permission notebook snapshot");
-    }
-    safePages[id] = {
-      grantedAt: row.grantedAt,
-      ...(row.titleSnapshot !== undefined ? { titleSnapshot: row.titleSnapshot } : {}),
-      ...(row.notebookIdSnapshot !== undefined ? { notebookIdSnapshot: row.notebookIdSnapshot } : {}),
-    };
-  }
-  const rawCompression = input.compression;
-  if (!rawCompression || typeof rawCompression !== "object" || Array.isArray(rawCompression)) throw new Error("Missing compression settings");
-  const defaults = compressionDefaults;
-  const compression = {} as CompressionSettings;
-  for (const [key, fallback] of Object.entries(defaults)) {
-    let value = rawCompression[key];
-    // schemaVersion 1 was shipped with four format booleans. Read them without
-    // treating existing settings as corrupt; never write during parsing.
-    if (key === "excludedExtensions") value = readExcludedExtensions(rawCompression);
-    if (typeof value !== typeof fallback) throw new Error(`Invalid compression field: ${key}`);
-    if (typeof value === "number" && !Number.isFinite(value)) {
-      throw new Error(`Non-finite compression field: ${key}`);
-    }
-    (compression as any)[key] = value;
-  }
-  if (compression.quality < 0.1 || compression.quality > 1 ||
-      !Number.isInteger(compression.maxDimension) || compression.maxDimension < 256 || compression.maxDimension > 8192 ||
-      !Number.isInteger(compression.minSizeBytes) || compression.minSizeBytes < 0 || compression.minSizeBytes > 100 * 1024 * 1024 ||
-      compression.minSavingRatio < 0 || compression.minSavingRatio > 1 ||
-      !Number.isInteger(compression.concurrencyDesktop) || compression.concurrencyDesktop < 1 || compression.concurrencyDesktop > 8 ||
-      !Number.isInteger(compression.concurrencyMobile) || compression.concurrencyMobile < 1 || compression.concurrencyMobile > 3) {
-    throw new Error("Compression options out of range");
-  }
+  if (refs.backend !== "auto" && refs.backend !== "sql") throw new Error("Invalid backend");
   return {
     schemaVersion: 1,
-    autoCompression: { globalEnabled: input.autoCompression.globalEnabled, pageAllowlist: safePages },
-    compression,
+    auto: { globalEnabled: bool(a.globalEnabled, "globalEnabled"), pageAllowlist,
+      uploads: bool(a.uploads, "uploads"), remoteImages: bool(a.remoteImages, "remoteImages") },
+    compression: {
+      initialQuality: number(c.initialQuality, "initialQuality", 0.1, 1),
+      maxDimension: number(c.maxDimension, "maxDimension", 256, 8192, true),
+      minInputBytes: number(c.minInputBytes, "minInputBytes", 0, 128 * MiB, true),
+      minSavingBytes: number(c.minSavingBytes, "minSavingBytes", 0, MiB, true),
+      minSavingRatio: number(c.minSavingRatio, "minSavingRatio", 0, 0.9),
+      maxInputBytes: number(c.maxInputBytes, "maxInputBytes", MiB, 128 * MiB, true),
+      maxPixels: number(c.maxPixels, "maxPixels", 1_000_000, 64_000_000, true),
+      maxEncodeMs: number(c.maxEncodeMs, "maxEncodeMs", 1000, 90_000, true),
+      concurrencyDesktop: number(c.concurrencyDesktop, "concurrencyDesktop", 1, 4, true),
+      concurrencyMobile: number(c.concurrencyMobile, "concurrencyMobile", 1, 2, true),
+      excludedExtensions: [...new Set(c.excludedExtensions as string[])],
+    },
+    sources: { desktopLocalFiles: bool(s.desktopLocalFiles, "desktopLocalFiles") },
+    retention: { deleteSingleOriginal: bool(t.deleteSingleOriginal, "deleteSingleOriginal") },
+    references: { backend: refs.backend, maxDocuments: number(refs.maxDocuments, "maxDocuments", 1, 100_000, true) },
   };
+}
+
+export function autoAllowed(config: ImageConfig, rootID: string): boolean {
+  return NODE_ID.test(rootID) && (config.auto.globalEnabled || Object.hasOwn(config.auto.pageAllowlist, rootID));
+}
+export type Intent = { kind: "document" | "manual-single"; rootID: string } |
+  { kind: "upload"; rootID: string; originalInputCount: number } |
+  { kind: "remote-auto"; rootID: string; blockID: string };
+export function retainOriginal(intent: Intent, config: ImageConfig): boolean {
+  if (intent.kind === "document" || intent.kind === "remote-auto") return true;
+  if (intent.kind === "upload" && intent.originalInputCount !== 1) return true;
+  return !config.retention.deleteSingleOriginal;
 }

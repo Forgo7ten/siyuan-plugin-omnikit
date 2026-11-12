@@ -1,92 +1,170 @@
-import { showMessage } from "siyuan";
 import type { FeatureContext } from "../../core/FeatureContext.ts";
 import type { FeatureScope } from "../../core/FeatureScope.ts";
-import { AssetRepository } from "./AssetRepository.ts";
-import { ImageCompressorService } from "./ImageCompressorService.ts";
-import type { ImageSettings } from "./settings.ts";
-import { imageReferenceParser } from "./ImageReferenceParser.ts";
 import { translate } from "../../i18n/translate.ts";
-import { BlockActionCoordinator } from "./BlockActionCoordinator.ts";
-import { originalAssetURL } from "./OriginalAssetURL.ts";
+import { prepareImage, type ImageProcessingServices } from "./ImageProcessingServices.ts";
+import { NODE_ID, type Intent } from "./parseImageConfig.ts";
+import { resolveSource, imageSourceAttribute } from "./source.ts";
+import { sqlLiteral, type DocumentRow, type ReferencePlan } from "./references.ts";
+import { scanDOM } from "./dom.ts";
+import { digest } from "./assets.ts";
 
-/** @safety Writes only the exact same-path image occurrence that was right-clicked. */
-export async function compressSelectedImage(detail: any, context: FeatureContext, scope: FeatureScope, settings: ImageSettings, service: ImageCompressorService, coordinator = new BlockActionCoordinator()): Promise<void> {
-  const targetImage = findTargetImage(detail);
-  const protyle = detail?.protyle ?? detail?.editor?.protyle;
-  const block = targetImage?.closest("[data-node-id]") as HTMLElement | null;
-  const blockId = block?.getAttribute("data-node-id");
-  const rootId = protyle?.block?.rootID;
-  const sourcePath = targetImage ? originalAssetURL(targetImage) : undefined;
-  if (!scope.active || !targetImage || !blockId || !rootId || protyle?.disabled || !sourcePath) {
-    context.logger.debug("拒绝压缩单张图片", {
-      功能启用: scope.active,
-      存在目标图片: Boolean(targetImage),
-      图片块ID: blockId,
-      文档根ID: rootId,
-      编辑器已禁用: protyle?.disabled,
-      属于本地资源: Boolean(sourcePath),
-      资源路径: sourcePath,
-    });
-    showMessage(translate(context.plugin.i18n, "image.single.invalidTarget"), 5000); return;
+export interface SingleImageEditorContext {
+  rootID: string;
+  notebook: string;
+  disabled?: boolean;
+}
+
+/** Compresses the source selected in this editor; document references are changed only after preflight. */
+export async function compressSelectedImage(
+  menuDetail: unknown,
+  context: FeatureContext,
+  scope: FeatureScope,
+  editor: SingleImageEditorContext,
+  services: ImageProcessingServices,
+  providedFile?: File,
+): Promise<void> {
+  const image = findTargetImage(menuDetail);
+  const blockID = image?.closest("[data-node-id]")?.getAttribute("data-node-id");
+  const config = services.config();
+  if (!scope.active || !image || !blockID || !NODE_ID.test(blockID) || !NODE_ID.test(editor.rootID)
+    || !NODE_ID.test(editor.notebook) || editor.disabled) {
+    services.ui.notify(translate(context.plugin.i18n, "image.single.invalidTarget"));
+    return;
   }
 
+  const raw = imageSourceAttribute(image);
+  if (!raw) {
+    services.ui.notify(translate(context.plugin.i18n, "image.single.invalidTarget"));
+    return;
+  }
   const signal = scope.signal;
   try {
-    const siblings = Array.from(block!.querySelectorAll("img"));
-    const occurrenceIndex = siblings.slice(0, siblings.indexOf(targetImage)).filter(image => originalAssetURL(image) === sourcePath).length;
-    const selectedElementPath = sourcePath;
-    const repository = new AssetRepository();
-    const initialDom = await repository.getBlockDOM(blockId);
-    const initialRefs = imageReferenceParser.scan(initialDom, blockId).filter(ref => ref.url === sourcePath);
-    const expectedCount = initialRefs.length;
-    const selectedRef = initialRefs[occurrenceIndex];
-    if (!selectedRef || expectedCount !== siblings.filter(image => originalAssetURL(image) === sourcePath).length) {
-      showMessage(translate(context.plugin.i18n, "image.single.unmappable"), 5000); return;
+    const source = resolveSource(raw, services.origin);
+    const doc = await resolveDocument(services, editor, signal);
+    const documentDOM = await blockDOM(services, doc.id, doc.box, signal);
+    if (!scanDOM(documentDOM, services.origin).some(ref => ref.blockID === blockID && ref.kind === "image" && ref.key === source.key)) {
+      services.ui.notify(translate(context.plugin.i18n, "image.single.unmappable"));
+      return;
+    }
+    const initialDOM = await blockDOM(services, blockID, doc.box, signal);
+    const persisted = scanDOM(initialDOM, services.origin).filter(ref => ref.blockID === blockID && ref.kind === "image" && ref.key === source.key);
+    const sameSourceImages = Array.from(image.closest("[data-node-id]")!.querySelectorAll("img"))
+      .filter(candidate => {
+        const value = imageSourceAttribute(candidate);
+        if (!value) return false;
+        try { return resolveSource(value, services.origin).key === source.key; } catch { return false; }
+      });
+    const imageIndex = sameSourceImages.indexOf(image);
+    if (imageIndex < 0 || persisted.length !== sameSourceImages.length) {
+      services.ui.notify(translate(context.plugin.i18n, "image.single.unmappable"));
+      return;
     }
 
-    const response = await fetch(sourcePath, { signal });
-    if (!response.ok) throw new Error(`读取原图片失败，HTTP ${response.status}`);
-    const sourceBlob = await response.blob();
-    const compressed = await service.compress(sourceBlob, sourcePath, settings, signal);
-    if (!compressed) { showMessage(translate(context.plugin.i18n, "image.single.noBenefit"), 4000); return; }
-    if (!scope.active) return;
+    const intent: Intent = { kind: "manual-single", rootID: doc.id };
+    let file = providedFile;
+    if (source.kind === "file" && !file && services.desktopFiles && !config.sources.desktopLocalFiles) throw new Error("本地文件处理已关闭");
+    if (source.kind === "file" && !file && !services.desktopFiles) {
+      const accepted = await services.ui.confirm(translate(context.plugin.i18n, "sources.pickOriginal"),
+        translate(context.plugin.i18n, "image.confirmOriginalFile", { name: source.name }), signal);
+      if (!accepted) return;
+      file = await services.ui.pickImage(source.name, signal);
+      if (!file) return;
+    }
 
-    const nextPath = await repository.upload(compressed.blob, rootId, sourcePath, signal);
+    const prepared = await prepareImage(services, source, doc.id, intent, config, signal, file);
+    if (!prepared) {
+      services.ui.notify(translate(context.plugin.i18n, "image.single.noBenefit"));
+      return;
+    }
     if (!scope.active || signal.aborted) return;
 
-    // @invariant Re-read just before write and reject any count or selected-tag change.
-    const written = await coordinator.run(blockId, async () => {
-      const latestDom = await repository.getBlockDOM(blockId);
-      if (!scope.active || signal.aborted) return false;
-      const rewritten = imageReferenceParser.replaceOne(latestDom, selectedRef, nextPath);
-      if (!rewritten.ok) return false;
-      await repository.updateBlockDOM(blockId, rewritten.markdown, signal);
-      return true;
-    });
-    if (!written) { showMessage(translate(context.plugin.i18n, "image.single.conflict"), 5000); return; }
-    if (targetImage.isConnected && originalAssetURL(targetImage) === selectedElementPath) {
-      targetImage.setAttribute(targetImage.getAttribute("data-src") === selectedElementPath ? "data-src" : "src", nextPath);
+    const mapping = { key: source.key, oldPath: source.kind === "asset" ? source.path : source.raw, newPath: prepared.path,
+      ...(file ? { selection: { blockID, expectedCount: persisted.length, imageIndices: [imageIndex] } } : {}) };
+    const seed: DocumentRow = doc;
+    const forceSQL = config.references.backend === "sql" || source.kind !== "asset" || Boolean(file) || Boolean(source.kind === "asset" && source.box);
+    const plan = await services.references.plan([mapping], seed, config.references.maxDocuments,
+      forceSQL,
+      file ? blockID : undefined, signal);
+    if (!await confirmPlan(services, context, plan, signal, Boolean(file))) return;
+    const latestTarget = await blockDOM(services, blockID, doc.box, signal);
+    const latestRefs = scanDOM(latestTarget, services.origin).filter(ref => ref.blockID === blockID && ref.kind === "image" && ref.key === source.key);
+    if (!latestRefs[imageIndex] || latestRefs.length !== persisted.length) {
+      services.ui.notify(translate(context.plugin.i18n, "image.single.conflict"));
+      return;
     }
-    showMessage(translate(context.plugin.i18n, "image.single.success", {
-      original: formatBytes(compressed.originalBytes),
-      compressed: formatBytes(compressed.compressedBytes),
-    }), 5000);
-    context.logger.debug("单张图片压缩完成", {
-      文档根ID: rootId,
-      图片块ID: blockId,
-      原资源路径: sourcePath,
-      新资源路径: nextPath,
-      原大小: compressed.originalBytes,
-      压缩后大小: compressed.compressedBytes,
-    });
+    const written = await services.references.commit(plan, signal);
+    if (written.state !== "verified") {
+      services.ui.notify(translate(context.plugin.i18n, "image.single.conflict"));
+      return;
+    }
+    if (image.isConnected && imageSourceAttribute(image) === raw) {
+      const attr = image.hasAttribute("data-src") ? "data-src" : "src";
+      image.setAttribute(attr, prepared.path);
+    }
+
+    if (!file && source.kind === "asset") {
+      try {
+        const cleanup = await services.finalizer.finish(intent, config, source, prepared.path, written,
+          async () => {
+            const current = await services.reader.read(source, { maxBytes: config.compression.maxInputBytes,
+              timeoutMs: 30_000, signal });
+            return await digest(current.blob) === prepared.originalHash;
+          }, signal);
+        if (cleanup.status !== "retained") services.ui.notify(cleanup.status === "unknown"
+          ? translate(context.plugin.i18n, "image.cleanupUnknown")
+          : translate(context.plugin.i18n, "image.cleanupDone"));
+      } catch (error) {
+        context.logger.warn("单图引用已更新，原图清理未完成", error);
+      }
+    }
+    services.ui.notify(translate(context.plugin.i18n, "image.single.success", {
+      original: formatBytes(prepared.originalBytes), compressed: formatBytes(prepared.compressedBytes),
+    }));
   } catch (error) {
-    if (!signal.aborted) { context.logger.warn("压缩所选图片失败", error); showMessage(translate(context.plugin.i18n, "image.single.failed"), 5000); }
+    if (!signal.aborted) {
+      context.logger.warn("压缩所选图片失败", error);
+      services.ui.notify(translate(context.plugin.i18n, "image.single.failed"));
+    }
   }
 }
 
-function findTargetImage(detail: any): HTMLImageElement | undefined {
-  const element = detail?.element as HTMLElement | undefined;
+/** Explicit menu action for replacing a source with a user-selected original file. */
+export function compressSelectedImageFromFile(
+  menuDetail: unknown,
+  file: File,
+  context: FeatureContext,
+  scope: FeatureScope,
+  editor: SingleImageEditorContext,
+  services: ImageProcessingServices,
+): Promise<void> {
+  return compressSelectedImage(menuDetail, context, scope, editor, services, file);
+}
+
+async function resolveDocument(services: ImageProcessingServices, editor: SingleImageEditorContext, signal: AbortSignal): Promise<DocumentRow> {
+  const rows = (await services.kernel.post<unknown>("/api/query/sql", {
+    stmt: `SELECT id, root_id, box FROM blocks WHERE type = 'd' AND id = ${sqlLiteral(editor.rootID)} LIMIT 1`, mode: "readonly",
+  }, { signal })).data;
+  if (!Array.isArray(rows) || rows.length !== 1 || rows[0]?.id !== editor.rootID
+    || rows[0]?.root_id !== editor.rootID || rows[0]?.box !== editor.notebook) throw new Error("无法确认当前编辑器对应的普通文档");
+  return rows[0] as DocumentRow;
+}
+
+async function blockDOM(services: ImageProcessingServices, id: string, notebook: string, signal: AbortSignal): Promise<string> {
+  const data = (await services.kernel.post<any>("/api/block/getBlockDOM", { id, notebook }, { signal })).data;
+  if (!data || data.id !== undefined && data.id !== id || typeof data.dom !== "string" || !data.dom.trim()) throw new Error("无法读取目标图片块");
+  return data.dom;
+}
+
+async function confirmPlan(services: ImageProcessingServices, context: FeatureContext, plan: ReferencePlan, signal: AbortSignal, selectedOccurrence: boolean): Promise<boolean> {
+  const key = selectedOccurrence ? "image.confirmSelectedReference"
+    : plan.backend === "native" ? "image.confirmNativeReferences" : "image.confirmSQLReferences";
+  return services.ui.confirm(translate(context.plugin.i18n, "common.confirm"), translate(context.plugin.i18n, key), signal);
+}
+
+function findTargetImage(detail: unknown): HTMLImageElement | undefined {
+  const element = (detail as any)?.element as HTMLElement | undefined;
   if (element instanceof HTMLImageElement) return element;
   return (element?.matches("img") ? element : element?.querySelector("img")) as HTMLImageElement | null ?? undefined;
 }
+
 function formatBytes(size: number): string { return size < 1024 ? `${size} B` : `${(size / 1024).toFixed(1)} KB`; }
