@@ -1,0 +1,154 @@
+import { Plugin, getFrontend, showMessage } from "siyuan";
+import { FeatureCatalog } from "./FeatureCatalog.ts";
+import { FeatureManager } from "./FeatureManager.ts";
+import type { FeatureContext } from "./FeatureContext.ts";
+import { SettingsManager } from "./SettingsManager.ts";
+import { MenuRegistry } from "./MenuRegistry.ts";
+import { installMenuRouter } from "./MenuRouter.ts";
+import { Logger } from "./Logger.ts";
+import { Compatibility } from "./Compatibility.ts";
+import { imageCompressorRegistration } from "../features/image-compressor/registration.ts";
+import { createSettingsWindow } from "../ui/settings/mountSettings.ts";
+import { registerTopBar } from "../ui/topbar/registerTopBar.ts";
+import { registerDock } from "../ui/dock/registerDock.ts";
+import { OMNIKIT_ICONS } from "../ui/icons.ts";
+import { translate } from "../i18n/translate.ts";
+import { setFrontendResolver } from "./Platform.ts";
+import "../styles/index.scss";
+
+/** @design Add one registration here; no changes to core schema or SettingsRoot.svelte. */
+const registrations = [imageCompressorRegistration];
+
+/**
+ * @migration-settings-window SiYuan 3.8.7+: a body--settings instance may mount stores
+ * and Svelte SettingsRoot only; never initialize host menus, Dock or auto-upload listeners.
+ * Settings changes synchronize through onDataChanged, not shared JS memory.
+ */
+export class OmniKitPlugin extends Plugin {
+  private readonly catalog = new FeatureCatalog();
+  private readonly logger = Logger.shared;
+  private readonly compatibility = new Compatibility();
+  private settingsManager?: SettingsManager;
+  private manager?: FeatureManager;
+  private menuRegistry?: MenuRegistry;
+  private disposeMenuRouter?: () => void;
+  private refreshDock?: () => void;
+  private disposeCoreSubscription?: () => void;
+  private disposeStatusSubscription?: () => void;
+  private settingsWindow?: ReturnType<typeof createSettingsWindow>;
+  private unloading = false;
+  private settingsInstance = false;
+  private ready?: Promise<void>;
+
+  private t(key: string, values?: Record<string, string | number>): string {
+    return translate(this.i18n as Record<string, unknown>, key, values);
+  }
+
+  onload(): Promise<void> {
+    this.unloading = false;
+    this.settingsInstance = document.body.classList.contains("body--settings");
+    this.ready = this.initialize();
+    return this.ready;
+  }
+
+  /** The host can call this before async initialization has created the settings window. */
+  override openSetting(): void {
+    void this.ready?.then(() => {
+      if (this.unloading) return;
+      this.settingsWindow?.open();
+    }).catch(error => this.logger.error("打开设置失败", error));
+  }
+
+  private async initialize(): Promise<void> {
+    setFrontendResolver(() => getFrontend());
+    this.addIcons(OMNIKIT_ICONS);
+    const settings = new SettingsManager(this, registrations);
+    await settings.load();
+    if (this.unloading) return;
+    this.settingsManager = settings;
+    this.disposeCoreSubscription = settings.core.subscribe(core => {
+      this.logger.setDebugEnabled(core.general.debugLog);
+    });
+
+    for (const registration of registrations) {
+      this.catalog.register(registration.create(this, settings));
+    }
+    let featureContext: FeatureContext | undefined;
+    if (!this.settingsInstance) {
+      const menus = new MenuRegistry(
+        id => this.manager?.isRunning(id) === true,
+        error => this.logger.error("菜单操作失败", error),
+        this.logger,
+        () => showMessage(this.t("menu.featureInactive"), 3000),
+      );
+      this.menuRegistry = menus;
+      featureContext = {
+        plugin: this, settings, menus, compatibility: this.compatibility, logger: this.logger,
+      };
+      this.manager = new FeatureManager(this.catalog, featureContext);
+      this.disposeStatusSubscription = this.manager.subscribeStatus(() => this.refreshDock?.());
+    }
+    this.settingsWindow = createSettingsWindow({
+      registrations, settings, manager: this.manager, t: key => this.t(key),
+    });
+
+    if (this.settingsInstance) {
+      this.settingsWindow.open();
+      return;
+    }
+    if (this.unloading) return;
+    this.disposeMenuRouter = installMenuRouter(this, this.menuRegistry!, this.logger);
+    this.refreshDock = registerDock(this, {
+      type: "omnikit-dock",
+      icon: "iconOmnikitMenu",
+      title: "OmniKit",
+      context: featureContext!,
+      views: () => registrations.flatMap(registration =>
+        registration.dockView && this.manager?.isRunning(registration.id)
+          ? [{ id: registration.id, title: this.t(registration.titleKey), component: registration.dockView }]
+          : []),
+      t: (key, values) => this.t(key, values),
+      openSettings: () => this.openSetting(),
+    });
+    await this.manager!.initialize();
+    this.refreshDock?.();
+  }
+
+  onLayoutReady(): void {
+    // @safety onLayoutReady may fire before async onload finishes.
+    void this.ready?.then(() => {
+      if (this.unloading || this.settingsInstance || !this.menuRegistry) return;
+      // Core UI remains available even if every Feature is disabled.
+      registerTopBar(this, {
+        title: this.t("settings"),
+        menus: this.menuRegistry,
+        openSettings: () => this.openSetting(),
+      });
+    }).catch(error => this.logger.error("初始化顶部栏失败", error));
+  }
+
+  async onDataChanged(): Promise<void> {
+    if (this.unloading || !this.settingsManager) return;
+    const changed = await this.settingsManager.reloadAfterExternalChange();
+    if (this.unloading || changed.length === 0) return;
+    if (!this.settingsInstance && this.manager) {
+      if (changed.includes("core")) await this.manager.reconcileFromLoadedSettings();
+      for (const id of changed) {
+        if (id !== "core") await this.manager.notifySettingsChanged(id);
+      }
+      this.refreshDock?.();
+    }
+  }
+
+  onunload(): void {
+    this.unloading = true;
+    this.disposeCoreSubscription?.();
+    this.disposeStatusSubscription?.();
+    this.manager?.freezeAll();
+    this.disposeMenuRouter?.();
+    this.settingsWindow?.close();
+    void this.manager?.disposeAll().catch(error => {
+      this.logger.error("清理功能失败", error);
+    });
+  }
+}
