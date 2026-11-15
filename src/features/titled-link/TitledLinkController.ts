@@ -10,6 +10,7 @@ import {
   captureLinkTarget,
   commitLinkTitle,
   commitLinkTitles,
+  resolveTitledLinkProtyle,
 } from "./services/safe-writer.ts";
 import type { GroupedLinkTitleUpdate } from "./services/safe-writer.ts";
 import type { LinkOccurrenceTarget, TitleFetchResult, TitledLinkConfig } from "./types.ts";
@@ -113,6 +114,11 @@ export class TitledLinkController {
 
   /** Menu close/removeCB settles before the snapshot is taken. */
   async runManual(link: HTMLElement, protyle: any): Promise<LinkActionResult> {
+    this.context.logger?.debug?.("手动触发提取链接标题", {
+      href: link?.getAttribute?.("data-href"),
+      text: link?.textContent,
+      isConnected: link?.isConnected,
+    });
     await new Promise<void>(resolve => setTimeout(resolve, 0));
     if (!this.scope.active) return "aborted";
     return this.runLink(link, protyle, "manual");
@@ -120,9 +126,14 @@ export class TitledLinkController {
 
   async runBatch(blocks: readonly HTMLElement[], protyle: any): Promise<void> {
     if (!this.scope.active) return;
+    this.context.logger?.debug?.("开始批量提取链接标题", { blockCount: blocks.length });
     const links = [...new Set(blocks.flatMap(block => [...block.querySelectorAll<HTMLElement>('span[data-type~="a"]')]))]
       .filter(link => isHttpUrl(link.getAttribute("data-href") ?? ""));
-    if (links.length === 0) return;
+    if (links.length === 0) {
+      this.context.logger?.debug?.("批量提取链接标题：未找到有效 HTTP(S) 链接");
+      return;
+    }
+    this.context.logger?.debug?.("批量提取链接标题：找到候选链接", { count: links.length });
     const outcomes = await mapWithConcurrency(links, 3, link => this.prepareBatch(link, protyle));
     if (!this.scope.active) return;
     const results = outcomes.map(outcome => outcome.result);
@@ -143,6 +154,10 @@ export class TitledLinkController {
     for (const group of groups.values()) {
       if (!this.scope.active) return;
       const updates = group.map(({ candidate }) => ({ target: candidate.target, title: candidate.title }));
+      this.context.logger?.debug?.("开始批量提交块内链接标题写入", {
+        blockID: group[0]?.candidate?.target?.blockID,
+        count: updates.length,
+      });
       let writes;
       try {
         writes = await commitLinkTitles(updates, {
@@ -151,8 +166,12 @@ export class TitledLinkController {
           kernel: this.kernel,
           isComposing: this.options.isComposing,
         });
+        this.context.logger?.debug?.("批量提交块内链接标题写入完成", {
+          blockID: group[0]?.candidate?.target?.blockID,
+          writes,
+        });
       } catch (error) {
-        this.context.logger.warn("链接标题批量写入失败", error);
+        this.context.logger?.warn?.("链接标题批量写入失败", error);
         for (const { index } of group) results[index] = this.scope.active ? "failed" : "aborted";
         continue;
       }
@@ -166,6 +185,7 @@ export class TitledLinkController {
     }
 
     const updated = results.filter(result => result === "updated").length;
+    this.context.logger?.debug?.("批量提取链接标题结束", { total: links.length, updated, skipped: links.length - updated });
     this.notify(this.t("titledLink.batchSummary", { total: links.length, updated, skipped: links.length - updated }));
   }
 
@@ -177,9 +197,44 @@ export class TitledLinkController {
 
   private async runLink(link: HTMLElement, protyle: any, mode: "auto" | "manual" | "batch"): Promise<LinkActionResult> {
     if (!this.scope.active) return "aborted";
+    const href = link?.getAttribute?.("data-href");
+    const text = link?.textContent;
+    this.context.logger?.debug?.("开始处理链接标题", { href, text, mode });
     const target = captureLinkTarget(link, protyle);
-    if (!target || !isHttpUrl(target.originalHref)) return "failed";
-    if (mode === "auto" && !isAutomaticLinkCandidate(target.originalText, target.originalHref)) return "failed";
+    if (!target) {
+      const block = link?.closest<HTMLElement>("[data-node-id]");
+      const runner = resolveTitledLinkProtyle(protyle);
+      this.context.logger?.warn?.("无法捕获链接目标信息（target 为空）", {
+        href,
+        text,
+        isConnected: link?.isConnected,
+        hasBlock: Boolean(block),
+        blockID: block?.getAttribute?.("data-node-id") ?? undefined,
+        rootID: protyle?.block?.rootID ?? protyle?.protyle?.block?.rootID,
+        notebook: protyle?.notebookId ?? protyle?.block?.box ?? protyle?.protyle?.notebookId ?? protyle?.protyle?.block?.box,
+        hasUpdateTransaction: typeof runner?.updateTransactionElement === "function",
+        protyleType: typeof protyle,
+        hasGetInstance: typeof protyle?.getInstance === "function",
+      });
+      if (mode === "manual") this.notify(this.t("titledLink.failed"));
+      return "failed";
+    }
+    if (!isHttpUrl(target.originalHref)) {
+      this.context.logger?.debug?.("跳除非 HTTP(S) 链接", {
+        href: target.originalHref,
+        text: target.originalText,
+        mode,
+      });
+      if (mode === "manual") this.notify(this.t("titledLink.failed"));
+      return "failed";
+    }
+    if (mode === "auto" && !isAutomaticLinkCandidate(target.originalText, target.originalHref)) {
+      this.context.logger?.debug?.("自动模式跳过已有标题的链接", {
+        href: target.originalHref,
+        text: target.originalText,
+      });
+      return "failed";
+    }
     const token = (this.tokens.get(link) ?? 0) + 1;
     this.tokens.set(link, token);
     let loadingTimer: ReturnType<typeof setTimeout> | undefined;
@@ -187,17 +242,38 @@ export class TitledLinkController {
       if (this.current(target, token)) this.notify(this.t("titledLink.loading"));
     }, 1_000);
     try {
+      this.context.logger?.debug?.("开始抓取链接标题", {
+        href: target.originalHref,
+        mode,
+        token,
+      });
       const fetched = await this.titleFor(target, mode);
+      this.context.logger?.debug?.("链接标题抓取完成", {
+        href: target.originalHref,
+        status: fetched.status,
+        title: fetched.status === "success" ? fetched.title : undefined,
+        reason: fetched.status === "failure" ? fetched.reason : undefined,
+      });
       if (!this.current(target, token)) return this.scope.active ? "superseded" : "aborted";
       if (fetched.status === "failure") {
         if (mode === "manual") this.notify(this.t("titledLink.failed"));
         return "failed";
       }
+      this.context.logger?.debug?.("开始提交链接标题写入", {
+        href: target.originalHref,
+        title: fetched.title,
+        blockID: target.blockID,
+      });
       const result = await commitLinkTitle(target, fetched.title, {
         replaceTitle: this.config().replaceTitle,
         signal: this.scope.signal,
         kernel: this.kernel,
         isComposing: this.options.isComposing,
+      });
+      this.context.logger?.debug?.("链接标题写入完成", {
+        href: target.originalHref,
+        result,
+        title: fetched.title,
       });
       if (!this.current(target, token)) return this.scope.active ? "superseded" : "aborted";
       if (mode === "manual" && (result === "updated" || result === "unchanged")) {
@@ -210,7 +286,7 @@ export class TitledLinkController {
       return result;
     } catch (error) {
       if (!this.current(target, token)) return this.scope.active ? "superseded" : "aborted";
-      this.context.logger.warn("链接标题提取失败", error);
+      this.context.logger?.warn?.("链接标题提取失败", error);
       if (mode === "manual") this.notify(this.t("titledLink.failed"));
       return "failed";
     } finally {
@@ -220,12 +296,35 @@ export class TitledLinkController {
 
   private async prepareBatch(link: HTMLElement, protyle: any): Promise<BatchOutcome> {
     if (!this.scope.active) return { result: "aborted" };
+    const href = link?.getAttribute?.("data-href");
+    const text = link?.textContent;
+    this.context.logger?.debug?.("批量准备链接", { href, text });
     const target = captureLinkTarget(link, protyle);
-    if (!target || !isHttpUrl(target.originalHref)) return { result: "failed" };
+    if (!target) {
+      const runner = resolveTitledLinkProtyle(protyle);
+      const block = link?.closest<HTMLElement>("[data-node-id]");
+      this.context.logger?.warn?.("批量准备链接失败：无法捕获链接目标", {
+        href,
+        text,
+        hasBlock: Boolean(block),
+        blockID: block?.getAttribute?.("data-node-id") ?? undefined,
+        hasUpdateTransaction: typeof runner?.updateTransactionElement === "function",
+      });
+      return { result: "failed" };
+    }
+    if (!isHttpUrl(target.originalHref)) {
+      this.context.logger?.debug?.("批量准备链接跳过：非 HTTP(S) 链接", { href: target.originalHref });
+      return { result: "failed" };
+    }
     const token = (this.tokens.get(link) ?? 0) + 1;
     this.tokens.set(link, token);
     try {
+      this.context.logger?.debug?.("批量抓取链接标题", { href: target.originalHref, token });
       const fetched = await this.titleFor(target, "batch");
+      this.context.logger?.debug?.("批量抓取链接标题完成", {
+        href: target.originalHref,
+        status: fetched.status,
+      });
       if (!this.current(target, token)) {
         return { result: this.scope.active ? "superseded" : "aborted" };
       }
@@ -236,7 +335,7 @@ export class TitledLinkController {
       };
     } catch (error) {
       if (!this.current(target, token)) return { result: this.scope.active ? "superseded" : "aborted" };
-      this.context.logger.warn("链接标题提取失败", error);
+      this.context.logger?.warn?.("链接标题提取失败", error);
       return { result: "failed" };
     }
   }

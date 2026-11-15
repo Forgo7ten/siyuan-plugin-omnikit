@@ -66,12 +66,26 @@ export class TitledLinkFeature extends BaseFeature {
       const link = detail?.element as HTMLElement | undefined;
       const protyle = detail?.protyle;
       this.attachCompositionTracking(protyle?.element, scope);
-      if (!link || link.getAttribute("data-type")?.split(" ").includes("a") !== true || !protyle) return [];
+      const isLink = link?.getAttribute?.("data-type")?.split(" ").includes("a") === true;
+      if (!link || !isLink || !protyle) {
+        context.logger?.debug("链接菜单跳过生成提取标题项", {
+          hasLink: Boolean(link),
+          isLink,
+          hasProtyle: Boolean(protyle),
+        });
+        return [];
+      }
+      const href = link.getAttribute?.("data-href");
+      const text = link.textContent;
+      context.logger?.debug("生成链接菜单项：提取链接标题", { href, text });
       return [{
         id: "extract-link-title",
         label: t("titledLink.menuSingle"),
         icon: "iconLink",
-        run: async () => { await controller.runManual(link, protyle); },
+        run: async () => {
+          context.logger?.debug("触发链接菜单项：提取链接标题", { href, text });
+          await controller.runManual(link, protyle);
+        },
       }];
     };
     context.menus.contribute(scope, this.meta.id, "link", "extract-link-title", onLinkMenu);
@@ -84,12 +98,23 @@ export class TitledLinkFeature extends BaseFeature {
       const count = new Set(blocks.flatMap(block =>
         [...block.querySelectorAll<HTMLElement>('span[data-type~="a"]')])
         .filter(link => isHttpUrl(link.getAttribute("data-href") ?? ""))).size;
-      if (!count || !protyle) return [];
+      if (!count || !protyle) {
+        context.logger?.debug("块菜单跳过生成批量提取链接标题项", {
+          blockCount: blocks.length,
+          httpLinkCount: count,
+          hasProtyle: Boolean(protyle),
+        });
+        return [];
+      }
+      context.logger?.debug("生成块菜单项：批量提取链接标题", { blockCount: blocks.length, httpLinkCount: count });
       return [{
         id: "extract-block-link-titles",
         label: t("titledLink.menuBatch", { count }),
         icon: "iconLink",
-        run: async () => { await controller.runBatch(blocks, protyle); },
+        run: async () => {
+          context.logger?.debug("触发块菜单项：批量提取链接标题", { blockCount: blocks.length, httpLinkCount: count });
+          await controller.runBatch(blocks, protyle);
+        },
       }];
     };
     context.menus.contribute(scope, this.meta.id, "blockicon", "extract-block-link-titles", onBlockMenu);

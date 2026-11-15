@@ -109,6 +109,15 @@ export class MenuRegistry {
           iconHTML: item.iconHTML,
           disabled,
           click: () => {
+            this.logger?.debug("点击菜单项", {
+              owner: entry.owner,
+              location,
+              itemId: item.id,
+              label: cleanLabel,
+              active: entry.scope.active,
+              running: this.isFeatureRunning(entry.owner),
+              disabled,
+            });
             // @invariant An already-open menu may outlive the contribution.
             if (!entry.scope.active || !this.isFeatureRunning(entry.owner)) {
               this.notifyInactive?.();

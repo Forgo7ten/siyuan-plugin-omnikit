@@ -64,11 +64,20 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
   const linkHandler = (event: CustomEvent<any>) => {
     const detail = event.detail;
     const link = detail?.element as HTMLElement | undefined;
-    if (!detail?.menu || link?.getAttribute?.("data-type")?.split(" ").includes("a") !== true) return;
+    const isLink = link?.getAttribute?.("data-type")?.split(" ").includes("a") === true;
+    if (!detail?.menu || !isLink) {
+      logger?.debug("忽略链接菜单事件", { 存在链接目标: isLink, 存在菜单: Boolean(detail?.menu) });
+      return;
+    }
+    const href = link.getAttribute?.("data-href") ?? undefined;
+    const text = link.textContent ?? undefined;
+    const blockID = link.closest?.("[data-node-id]")?.getAttribute?.("data-node-id") ?? undefined;
+    const rootID = detail?.protyle?.block?.rootID ?? detail?.protyle?.protyle?.block?.rootID;
+    logger?.debug("打开链接菜单", { href, text, blockID, rootID });
     menus.render("link", detail.menu, {
       location: "link",
-      rootID: detail?.protyle?.block?.rootID,
-      blockID: link.closest("[data-node-id]")?.getAttribute("data-node-id") ?? undefined,
+      rootID,
+      blockID,
       detail,
     });
   };
@@ -76,9 +85,10 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
   const blockIconHandler = (event: CustomEvent<any>) => {
     const detail = event.detail;
     if (!detail?.menu || !Array.isArray(detail.blockElements)) return;
+    const rootID = detail?.protyle?.block?.rootID ?? detail?.protyle?.protyle?.block?.rootID;
     menus.render("blockicon", detail.menu, {
       location: "blockicon",
-      rootID: detail?.protyle?.block?.rootID,
+      rootID,
       detail,
     });
   };

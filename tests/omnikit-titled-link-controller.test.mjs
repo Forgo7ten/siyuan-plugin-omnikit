@@ -234,3 +234,128 @@ test("batch mode reuses in-flight request for duplicate URLs", async () => withB
   assert.equal(links[1].textContent, "Shared Title");
   scope.dispose();
 }));
+
+test("manual execution succeeds with SiYuan IProtyle wrapper and notifies success", async () => withBatchDOMParser(async () => {
+  const links = [new BatchLink("https://example.com/page", "https://example.com/page")];
+  const block = new BatchBlock("block", links);
+  const notices = [];
+  const debugLogs = [];
+  const transactions = [];
+  const runner = {
+    updateTransactionElement(element, oldHTML) {
+      transactions.push({ element, oldHTML });
+    },
+  };
+  const iProtyle = {
+    block: { rootID: "root", box: "notebook" },
+    getInstance() { return runner; },
+  };
+  const scope = new FeatureScope();
+  const controller = new TitledLinkController({
+    settings: {
+      getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, maxTitleLength: 80, fallbackToHostname: true }),
+      getUserAgent: () => "UA",
+    },
+    logger: {
+      warn() {},
+      debug(message, meta) { debugLogs.push({ message, meta }); },
+    },
+  }, scope, {
+    frontend: () => "desktop",
+    notify: message => notices.push(message),
+    translate: key => key,
+    fetchImpl: async () => htmlResponse("Fetched Title"),
+    kernel: {
+      post: async path => path === "/api/block/getBlockInfo"
+        ? { data: { rootID: "root", box: "notebook" } }
+        : { data: { id: "block", dom: block.outerHTML } },
+    },
+  });
+
+  const result = await controller.runManual(links[0], iProtyle);
+  assert.equal(result, "updated");
+  assert.equal(transactions.length, 1);
+  assert.equal(links[0].textContent, "Fetched Title");
+  assert.deepEqual(notices, ["titledLink.updated"]);
+  assert.ok(debugLogs.some(log => log.message === "手动触发提取链接标题"));
+  assert.ok(debugLogs.some(log => log.message === "开始处理链接标题"));
+  assert.ok(debugLogs.some(log => log.message === "链接标题写入完成"));
+  scope.dispose();
+}));
+
+test("manual execution warns and notifies failed when target cannot be captured", async () => {
+  const disconnectedLink = {
+    isConnected: false,
+    textContent: "https://example.com/page",
+    getAttribute: () => "https://example.com/page",
+    closest: () => null,
+  };
+  const notices = [];
+  const warnings = [];
+  const scope = new FeatureScope();
+  const controller = new TitledLinkController({
+    settings: {
+      getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, maxTitleLength: 80, fallbackToHostname: true }),
+      getUserAgent: () => "UA",
+    },
+    logger: {
+      warn(message, meta) { warnings.push({ message, meta }); },
+      debug() {},
+    },
+  }, scope, {
+    frontend: () => "desktop",
+    notify: message => notices.push(message),
+    translate: key => key,
+    fetchImpl: async () => htmlResponse("Title"),
+    kernel: { post: async () => ({ data: {} }) },
+  });
+
+  const result = await controller.runManual(disconnectedLink, {});
+  assert.equal(result, "failed");
+  assert.deepEqual(notices, ["titledLink.failed"]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0].message, /无法捕获链接目标信息/);
+  assert.equal(warnings[0].meta.hasBlock, false);
+  assert.equal(warnings[0].meta.hasUpdateTransaction, false);
+  scope.dispose();
+});
+
+test("manual execution notifies failed when URL is not HTTP(S)", async () => {
+  const jsLink = {
+    isConnected: true,
+    textContent: "javascript:void(0)",
+    getAttribute(name) { return { "data-type": "a", "data-href": "javascript:void(0)" }[name] ?? null; },
+    closest(selector) { return selector === "[data-node-id]" ? block : null; },
+  };
+  const block = {
+    isConnected: true,
+    outerHTML: '<div data-node-id="block"><span data-type="a" data-href="javascript:void(0)">javascript:void(0)</span></div>',
+    getAttribute(name) { return name === "data-node-id" ? "block" : null; },
+    querySelectorAll(selector) { return selector === 'span[data-type~="a"]' ? [jsLink] : []; },
+  };
+  const protyle = {
+    block: { rootID: "root", box: "notebook" },
+    notebookId: "notebook",
+    updateTransactionElement() {},
+  };
+  const notices = [];
+  const scope = new FeatureScope();
+  const controller = new TitledLinkController({
+    settings: {
+      getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, maxTitleLength: 80, fallbackToHostname: true }),
+      getUserAgent: () => "UA",
+    },
+    logger: { warn() {}, debug() {} },
+  }, scope, {
+    frontend: () => "desktop",
+    notify: message => notices.push(message),
+    translate: key => key,
+    fetchImpl: async () => htmlResponse("Title"),
+    kernel: { post: async () => ({ data: {} }) },
+  });
+
+  const result = await controller.runManual(jsLink, protyle);
+  assert.equal(result, "failed");
+  assert.deepEqual(notices, ["titledLink.failed"]);
+  scope.dispose();
+});

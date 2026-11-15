@@ -44,20 +44,42 @@ function linkElements(block: HTMLElement): HTMLElement[] {
   return [...block.querySelectorAll<HTMLElement>('span[data-type~="a"]')];
 }
 
+/**
+ * Resolve a runnable TitledLinkProtyle target from either a Protyle instance, a test mock,
+ * or SiYuan's IProtyle event detail wrapper (which exposes `getInstance(): Protyle`).
+ */
+export function resolveTitledLinkProtyle(protyle: any): TitledLinkProtyle | null {
+  if (typeof protyle?.updateTransactionElement === "function") {
+    return protyle as TitledLinkProtyle;
+  }
+  if (typeof protyle?.getInstance === "function") {
+    const instance = protyle.getInstance();
+    if (typeof instance?.updateTransactionElement === "function") {
+      return instance as TitledLinkProtyle;
+    }
+  }
+  if (typeof protyle?.protyle?.updateTransactionElement === "function") {
+    return protyle.protyle as TitledLinkProtyle;
+  }
+  return null;
+}
+
 /** Capture one occurrence before asynchronous title fetching begins. */
 export function captureLinkTarget(link: HTMLElement, protyle: any): LinkOccurrenceTarget | null {
+  const runner = resolveTitledLinkProtyle(protyle);
+  if (!runner) return null;
   const block = link.closest<HTMLElement>("[data-node-id]");
   const blockID = block?.getAttribute("data-node-id") ?? "";
-  const rootID = protyle?.block?.rootID;
-  const notebook = protyle?.notebookId ?? protyle?.block?.box;
+  const rootID = protyle?.block?.rootID ?? protyle?.protyle?.block?.rootID ?? (runner as any)?.block?.rootID;
+  const notebook = protyle?.notebookId ?? protyle?.block?.box ?? protyle?.protyle?.notebookId ?? protyle?.protyle?.block?.box ?? (runner as any)?.notebookId ?? (runner as any)?.block?.box;
   const href = link.getAttribute("data-href");
   if (!block || !blockID || typeof rootID !== "string" || !rootID ||
       typeof notebook !== "string" || !notebook || typeof href !== "string" || !href) return null;
   const ordinal = linkElements(block).indexOf(link);
-  if (ordinal < 0 || typeof protyle?.updateTransactionElement !== "function") return null;
+  if (ordinal < 0) return null;
   const text = link.textContent ?? "";
   return {
-    protyle: protyle as TitledLinkProtyle,
+    protyle: runner,
     notebook,
     rootID,
     blockID,
@@ -98,8 +120,13 @@ function persistedOccurrence(dom: string, target: LinkOccurrenceTarget): HTMLEle
 }
 
 async function verifyPersisted(target: LinkOccurrenceTarget, kernel: LinkWriterKernel, signal?: AbortSignal): Promise<boolean> {
-  const blockHTML = await readPersistedBlock(target, kernel, signal);
-  return blockHTML !== null && persistedOccurrenceUnchanged(blockHTML, target);
+  try {
+    const blockHTML = await readPersistedBlock(target, kernel, signal);
+    return blockHTML !== null && persistedOccurrenceUnchanged(blockHTML, target);
+  } catch (error) {
+    if (signal?.aborted || (error as { name?: string })?.name === "AbortError") throw error;
+    return false;
+  }
 }
 
 /** Read the persisted block once; callers can then verify every occurrence in it. */
@@ -108,17 +135,22 @@ async function readPersistedBlock(
   kernel: LinkWriterKernel,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  const identity = await kernel.post<BlockIdentity>("/api/block/getBlockInfo", {
-    id: target.blockID,
-    notebook: target.notebook,
-  }, { signal });
-  if (identity.data?.rootID !== target.rootID || identity.data?.box !== target.notebook) return null;
-  const response = await kernel.post<BlockDOM>("/api/block/getBlockDOM", {
-    id: target.blockID,
-    notebook: target.notebook,
-  }, { signal });
-  if (response.data?.id !== target.blockID || typeof response.data.dom !== "string") return null;
-  return response.data.dom;
+  try {
+    const identity = await kernel.post<BlockIdentity>("/api/block/getBlockInfo", {
+      id: target.blockID,
+      notebook: target.notebook,
+    }, { signal });
+    if (identity?.data?.rootID !== target.rootID || identity?.data?.box !== target.notebook) return null;
+    const response = await kernel.post<BlockDOM>("/api/block/getBlockDOM", {
+      id: target.blockID,
+      notebook: target.notebook,
+    }, { signal });
+    if (response?.data?.id !== target.blockID || typeof response?.data?.dom !== "string") return null;
+    return response.data.dom;
+  } catch (error) {
+    if (signal?.aborted || (error as { name?: string })?.name === "AbortError") throw error;
+    return null;
+  }
 }
 
 function persistedOccurrenceUnchanged(dom: string, target: LinkOccurrenceTarget): boolean {

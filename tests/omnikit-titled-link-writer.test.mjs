@@ -1,6 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { captureLinkTarget, commitLinkTitle, commitLinkTitles } from "../src/features/titled-link/services/safe-writer.ts";
+import {
+  captureLinkTarget,
+  commitLinkTitle,
+  commitLinkTitles,
+  resolveTitledLinkProtyle,
+} from "../src/features/titled-link/services/safe-writer.ts";
 
 class LinkElement {
   constructor(href, text, title = null) {
@@ -201,4 +206,80 @@ test("abandons grouped commit when any target in the batch has a mismatched base
     { target: alteredSecond, title: "Second" },
   ], { replaceTitle: false });
   assert.deepEqual(results, ["conflict", "conflict"]);
+}));
+
+test("resolveTitledLinkProtyle supports direct instance, IProtyle getInstance, and rejects invalid targets", () => {
+  const direct = { updateTransactionElement() {} };
+  assert.equal(resolveTitledLinkProtyle(direct), direct);
+
+  const inner = { updateTransactionElement() {} };
+  const iProtyle = { getInstance: () => inner };
+  assert.equal(resolveTitledLinkProtyle(iProtyle), inner);
+
+  const nested = { protyle: { updateTransactionElement() {} } };
+  assert.equal(resolveTitledLinkProtyle(nested), nested.protyle);
+
+  assert.equal(resolveTitledLinkProtyle(null), null);
+  assert.equal(resolveTitledLinkProtyle(undefined), null);
+  assert.equal(resolveTitledLinkProtyle({}), null);
+  assert.equal(resolveTitledLinkProtyle({ getInstance: () => null }), null);
+});
+
+test("resolves and commits via SiYuan IProtyle wrapper", async () => installDOMParser(async () => {
+  const links = [new LinkElement("https://example.com/item", "https://example.com/item")];
+  const block = new BlockElement("20260101000000-block123", links);
+  const transactions = [];
+  const runner = {
+    updateTransactionElement(element, oldHTML) {
+      transactions.push({ element, oldHTML, newHTML: element.outerHTML });
+    },
+  };
+  const iProtyle = {
+    block: { rootID: "20260101000000-root123", box: "notebook-123" },
+    getInstance() { return runner; },
+  };
+  const target = captureLinkTarget(links[0], iProtyle);
+  assert.ok(target);
+  assert.equal(target.rootID, "20260101000000-root123");
+  assert.equal(target.notebook, "notebook-123");
+  assert.equal(target.protyle, runner);
+
+  const kernel = kernelFor(block, { rootID: "20260101000000-root123", box: "notebook-123" });
+  const result = await commitLinkTitle(target, "Resolved Title", { replaceTitle: true, kernel });
+  assert.equal(result, "updated");
+  assert.equal(links[0].textContent, "Resolved Title");
+  assert.equal(transactions.length, 1);
+  assert.match(transactions[0].newHTML, />Resolved Title<\/span>/);
+}));
+
+test("safely handles kernel network failures in verifyPersisted as conflict", async () => installDOMParser(async () => {
+  const { links, block, protyle, transactions } = fixture();
+  const target = captureLinkTarget(links[0], protyle);
+  const throwingKernel = {
+    post: async () => { throw new Error("Network timeout or connection refused"); },
+  };
+  const result = await commitLinkTitle(target, "Example", { replaceTitle: false, kernel: throwingKernel });
+  assert.equal(result, "conflict");
+  assert.equal(transactions.length, 0);
+}));
+
+test("safely propagates AbortError during verifyPersisted as aborted", async () => installDOMParser(async () => {
+  const { links, block, protyle, transactions } = fixture();
+  const target = captureLinkTarget(links[0], protyle);
+  const controller = new AbortController();
+  const abortingKernel = {
+    post: async () => {
+      controller.abort();
+      const err = new Error("This operation was aborted");
+      err.name = "AbortError";
+      throw err;
+    },
+  };
+  const result = await commitLinkTitle(target, "Example", {
+    replaceTitle: false,
+    kernel: abortingKernel,
+    signal: controller.signal,
+  });
+  assert.equal(result, "aborted");
+  assert.equal(transactions.length, 0);
 }));
