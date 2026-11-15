@@ -74,9 +74,9 @@ test("menu router dispatches link and block icon host contexts", () => {
   } };
   const registry = new MenuRegistry(() => true, error => { throw error; });
   const rendered = [];
-  for (const location of ["link", "blockicon"]) {
+  for (const location of ["link", "blockicon", "doc-title"]) {
     registry.contribute(new FeatureScope(), "titledLink", location, location, context => {
-      rendered.push({ location: context.location, detail: context.detail });
+      rendered.push({ location: context.location, detail: context.detail, rootID: context.rootID });
       return [{ id: "run", label: "Run", run: () => {} }];
     });
   }
@@ -89,7 +89,14 @@ test("menu router dispatches link and block icon host contexts", () => {
   const blockElements = [{ id: "block-1" }];
   listeners.get("click-blockicon")({ detail: { blockElements, protyle: { block: { rootID: "root-1" } }, menu: { addItem: item => blockMenu.push(item) } } });
   assert.equal(blockMenu[0].label, "[OmniKit] Run");
-  assert.deepEqual(rendered.map(item => item.location), ["link", "blockicon"]);
+
+  // click-editortitleicon with detail.data.rootID fallback
+  const titleMenu = [];
+  listeners.get("click-editortitleicon")({ detail: { data: { rootID: "doc-from-data-root" }, menu: { addItem: item => titleMenu.push(item) } } });
+  assert.equal(titleMenu[0].label, "[OmniKit] Run");
+  assert.equal(rendered.find(r => r.location === "doc-title")?.rootID, "doc-from-data-root");
+
+  assert.deepEqual(rendered.map(item => item.location), ["link", "blockicon", "doc-title"]);
   assert.equal(rendered[1].detail.blockElements, blockElements);
   dispose();
   assert.equal(listeners.size, 0);

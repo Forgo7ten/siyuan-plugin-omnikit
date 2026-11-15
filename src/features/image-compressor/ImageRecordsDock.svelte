@@ -308,7 +308,7 @@
         await locateOccurrences(record, "original", "post_action");
         return;
       }
-      const res = await references.commitOccurrence(item.target, record.compressedPath);
+      const res = await references.commitOccurrence(item.target, record.compressedPath, context.scope?.signal);
       const replaced = res === "replaced" ? 1 : 0;
       const conflicts = res === "replaced" ? 0 : 1;
       const msg = format("image.records.replaceResult", { replaced, conflicts });
@@ -338,7 +338,7 @@
           conflicts++;
           continue;
         }
-        const res = await references.commitOccurrence(item.target, record.compressedPath);
+        const res = await references.commitOccurrence(item.target, record.compressedPath, context.scope?.signal);
         if (res === "replaced") replaced++;
         else conflicts++;
       }
@@ -368,7 +368,7 @@
         await locateOccurrences(record, "compressed", "post_action");
         return;
       }
-      const res = await references.commitOccurrence(item.target, record.originalPath);
+      const res = await references.commitOccurrence(item.target, record.originalPath, context.scope?.signal);
       const restored = res === "replaced" ? 1 : 0;
       const conflicts = res === "replaced" ? 0 : 1;
       const msg = format("image.records.restoreResult", { restored, conflicts });
@@ -398,7 +398,7 @@
           conflicts++;
           continue;
         }
-        const res = await references.commitOccurrence(item.target, record.originalPath);
+        const res = await references.commitOccurrence(item.target, record.originalPath, context.scope?.signal);
         if (res === "replaced") restored++;
         else conflicts++;
       }

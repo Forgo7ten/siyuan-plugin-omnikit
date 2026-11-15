@@ -141,15 +141,17 @@ export class OmniKitPlugin extends Plugin {
     }
   }
 
-  onunload(): void {
+  async onunload(): Promise<void> {
     this.unloading = true;
     this.disposeCoreSubscription?.();
     this.disposeStatusSubscription?.();
     this.manager?.freezeAll();
     this.disposeMenuRouter?.();
     this.settingsWindow?.close();
-    void this.manager?.disposeAll().catch(error => {
+    try {
+      await this.manager?.disposeAll();
+    } catch (error) {
       this.logger.error("清理功能失败", error);
-    });
+    }
   }
 }

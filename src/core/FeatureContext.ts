@@ -18,7 +18,12 @@ export interface FeatureMetadata {
  * values, so a feature always reads the current configuration instead of a stale copy.
  */
 export interface FeatureContext {
-  plugin: Plugin; settings: SettingsManager; menus: MenuRegistry; compatibility: Compatibility; logger: Logger;
+  plugin: Plugin;
+  settings: SettingsManager;
+  menus: MenuRegistry;
+  compatibility: Compatibility;
+  logger: Logger;
+  scope?: FeatureScope;
 }
 export interface FeatureCallbacks { onEnabled?: () => void; onDisabled?: () => void; onFailed?: (error: unknown) => void; }
 export type FeatureSetup = (context: FeatureContext, scope: FeatureScope) => void | Promise<void>;

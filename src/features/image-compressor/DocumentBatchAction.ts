@@ -1,6 +1,7 @@
 import { showMessage } from "siyuan";
 import type { FeatureContext } from "../../core/FeatureContext.ts";
 import type { FeatureScope } from "../../core/FeatureScope.ts";
+import { combineSignals, resolveEditorRootID } from "../../core/ProtyleAdapter.ts";
 import { translate } from "../../i18n/translate.ts";
 import { recordRewrittenReference, type CompressionBatchSummary, type CompressionProgress } from "./CompressionResult.ts";
 import { isDocumentRootIdentity } from "./DocumentIdentity.ts";
@@ -27,14 +28,14 @@ export async function compressDocumentImages(
   options: BatchActionOptions = {},
 ): Promise<CompressionBatchSummary> {
   const protyle = detail?.protyle ?? detail?.editor?.protyle;
-  const rootID = protyle?.block?.rootID;
+  const rootID = resolveEditorRootID(detail);
   const summary: CompressionBatchSummary = {
     scanComplete: false, scannedBlocks: 0, total: 0, completed: 0, succeeded: 0, skipped: 0, failed: 0,
     conflicts: 0, cancelled: false, originalBytes: 0, compressedBytes: 0, referencesRewritten: 0,
     originalReferencedBytes: 0, newReferencedBytes: 0, logicalReductionBytes: 0, diskReclaimedBytes: 0,
   };
   const report = (currentFile?: string) => options.onProgress?.({ ...summary, currentFile });
-  const signal = combineSignals(scope.signal, options.signal);
+  const signal = combineSignals(scope.signal, options.signal) ?? scope.signal;
   if (signal.aborted || !scope.active) {
     return cancelledSummary(summary);
   }
@@ -264,15 +265,6 @@ function patchAuthorizedBaseline(dom: string, blockID: string, replacements: Map
   return root.outerHTML;
 }
 
-function combineSignals(...signals: Array<AbortSignal | undefined>): AbortSignal {
-  const controller = new AbortController();
-  for (const signal of signals) {
-    if (!signal) continue;
-    if (signal.aborted) controller.abort(signal.reason);
-    else signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
-  }
-  return controller.signal;
-}
 function cancelledSummary(summary: CompressionBatchSummary): CompressionBatchSummary { summary.cancelled = true; return summary; }
 function showComplete(context: FeatureContext, summary: CompressionBatchSummary): void {
   showMessage(translate(context.plugin.i18n, "image.batch.complete", {

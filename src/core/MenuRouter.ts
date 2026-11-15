@@ -1,6 +1,7 @@
 import type { Plugin } from "siyuan";
 import type { Logger } from "./Logger.ts";
 import type { MenuContext, MenuRegistry } from "./MenuRegistry.ts";
+import { resolveEditorRootID } from "./ProtyleAdapter.ts";
 
 export interface SingleDocumentTarget {
   rootID: string;
@@ -21,7 +22,7 @@ export interface ImageMenuTarget {
 export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: Logger): () => void {
   const titleHandler = (event: CustomEvent<any>) => {
     const detail = event.detail;
-    const rootID = detail?.protyle?.block?.rootID ?? detail?.editor?.protyle?.block?.rootID;
+    const rootID = resolveEditorRootID(detail);
     if (!rootID || !detail?.menu) {
       logger?.debug("忽略文档标题菜单事件", { 文档根ID: rootID, 存在菜单: Boolean(detail?.menu) });
       return;
@@ -72,7 +73,7 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
     const href = link.getAttribute?.("data-href") ?? undefined;
     const text = link.textContent ?? undefined;
     const blockID = link.closest?.("[data-node-id]")?.getAttribute?.("data-node-id") ?? undefined;
-    const rootID = detail?.protyle?.block?.rootID ?? detail?.protyle?.protyle?.block?.rootID;
+    const rootID = resolveEditorRootID(detail);
     logger?.debug("打开链接菜单", { href, text, blockID, rootID });
     menus.render("link", detail.menu, {
       location: "link",
@@ -85,7 +86,7 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
   const blockIconHandler = (event: CustomEvent<any>) => {
     const detail = event.detail;
     if (!detail?.menu || !Array.isArray(detail.blockElements)) return;
-    const rootID = detail?.protyle?.block?.rootID ?? detail?.protyle?.protyle?.block?.rootID;
+    const rootID = resolveEditorRootID(detail);
     menus.render("blockicon", detail.menu, {
       location: "blockicon",
       rootID,
@@ -184,6 +185,6 @@ export function resolveImageMenuTarget(detail: any): ImageMenuTarget | undefined
     element: image,
     url,
     blockID: image.closest("[data-node-id]")?.getAttribute("data-node-id") ?? undefined,
-    rootID: detail?.protyle?.block?.rootID ?? detail?.editor?.protyle?.block?.rootID ?? undefined,
+    rootID: resolveEditorRootID(detail),
   };
 }

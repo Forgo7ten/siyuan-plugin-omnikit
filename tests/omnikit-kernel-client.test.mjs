@@ -4,31 +4,49 @@ import { readFile } from "node:fs/promises";
 import { stripTypeScriptTypes } from "node:module";
 
 const source = await readFile(new URL("../src/core/KernelClient.ts", import.meta.url), "utf8");
-const runnable = stripTypeScriptTypes(source.replace('import { fetchPost } from "siyuan";', "const fetchPost = globalThis.__kernelFetchPost;"));
+const runnable = stripTypeScriptTypes(
+  source.replace('import { fetchSyncPost } from "siyuan";', "const fetchSyncPost = globalThis.__kernelFetchPost;"),
+);
 const { KernelClient } = await import(`data:text/javascript,${encodeURIComponent(runnable)}`);
 
-test("settles callback success and supports JSON and FormData bodies", async () => {
+test("settles success and supports JSON and FormData bodies", async () => {
   const bodies = [];
-  const client = new KernelClient((path, body, callback) => { bodies.push(body); callback({ code: 0, data: path, msg: "" }); });
+  const client = new KernelClient(async (path, body) => {
+    bodies.push(body);
+    return { code: 0, data: path, msg: "" };
+  });
   assert.equal((await client.post("/json", { id: "x" })).data, "/json");
   const form = new FormData();
   await client.post("/form", form);
   assert.deepEqual(bodies, [{ id: "x" }, form]);
 });
 
-test("settles SDK failure callback", async () => {
-  const client = new KernelClient((_path, _body, _ok, _headers, fail) => fail({ msg: "offline" }));
+test("settles rejected promise from fetchSyncPost", async () => {
+  const client = new KernelClient(async () => {
+    throw new Error("offline");
+  });
   await assert.rejects(client.post("/write", {}), /offline/);
 });
 
-test("preserves the HTTP-derived API code when a native endpoint is missing", async () => {
-  const client = new KernelClient((_path, _body, ok) => ok({ code: -404, data: null, msg: "Not Found" }));
+test("preserves the HTTP-derived API code when an endpoint returns negative code", async () => {
+  const client = new KernelClient(async () => ({ code: -404, data: null, msg: "Not Found" }));
   await assert.rejects(client.post("/api/asset/findAssetReferences", {}), error => error.code === -404);
 });
 
-test("settles cancellation even when SDK swallows AbortError and ignores callbacks", async () => {
+test("immediately rejects when kernel returns negative business code without 30s timeout", async () => {
+  const client = new KernelClient(async () => ({ code: -1, data: null, msg: "block not found" }));
+  await assert.rejects(
+    client.post("/api/block/getBlockInfo", { id: "none" }),
+    error => error.code === -1 && error.message === "block not found",
+  );
+});
+
+test("settles cancellation even when SDK swallows AbortError", async () => {
   let forwardedSignal;
-  const client = new KernelClient((_path, _body, _ok, _headers, _fail, signal) => { forwardedSignal = signal; });
+  const client = new KernelClient((_path, _body, _headers, _process, signal) => {
+    forwardedSignal = signal;
+    return new Promise(() => {});
+  });
   const controller = new AbortController();
   const pending = client.post("/write", {}, { signal: controller.signal });
   assert.equal(forwardedSignal, controller.signal);
@@ -36,12 +54,17 @@ test("settles cancellation even when SDK swallows AbortError and ignores callbac
   await assert.rejects(pending, error => error.name === "AbortError" && error.outcome === "unknown");
 });
 
-test("settles timeout even when no SDK callback occurs and marks write result unknown", async () => {
-  const client = new KernelClient(() => {});
+test("settles timeout even when no SDK response occurs and marks write result unknown", async () => {
+  const client = new KernelClient(() => new Promise(() => {}));
   await assert.rejects(client.post("/write", {}, { timeout: 5 }), error => error.name === "TimeoutError" && error.outcome === "unknown");
 });
 
-test("settles only once if the SDK invokes more than one callback", async () => {
-  const client = new KernelClient((_path, _body, ok, _headers, fail) => { ok({ code: 0, data: 1 }); fail({ msg: "late failure" }); });
-  assert.equal((await client.post("/read", {})).data, 1);
+test("settles immediately if already aborted before request", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const client = new KernelClient(async () => ({ code: 0, data: "ok", msg: "" }));
+  await assert.rejects(
+    client.post("/write", {}, { signal: controller.signal }),
+    error => error.name === "AbortError" && error.outcome === "not-sent",
+  );
 });

@@ -30,7 +30,7 @@ test("dock lookups are user-triggered and restore is occurrence-scoped with pers
   assert.match(dock, /\/api\/block\/getBlockInfo/);
   assert.match(dock, /\/api\/block\/getBlockDOM/);
   assert.match(dock, /info\?\.rootID !== row\.rootID \|\| info\.box !== row\.notebook/);
-  assert.match(dock, /references\.commitOccurrence\(item\.target, record\.originalPath\)/);
+  assert.match(dock, /references\.commitOccurrence\(item\.target, record\.originalPath(?:,\s*context\.scope\?\.signal)?\)/);
   assert.match(dock, /\/api\/asset\/statAsset/);
   assert.match(dock, /openTab\(/);
   assert.match(dock, /jumpToBlock\(/);

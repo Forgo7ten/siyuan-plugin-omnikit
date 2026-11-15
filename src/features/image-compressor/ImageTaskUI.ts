@@ -92,6 +92,7 @@ export function createImageUI(scope: ImageTaskScope, t: (key: string) => string)
         content: '<div class="b3-dialog__content"><p class="omnikit-copy-reason"></p><input class="b3-text-field omnikit-copy-path" readonly /><button type="button" class="b3-button omnikit-copy-button"></button></div>',
         width: "min(640px, 94vw)",
       });
+      scope.own(() => dialog.destroy());
       const reason = dialog.element.querySelector<HTMLElement>(".omnikit-copy-reason");
       const input = dialog.element.querySelector<HTMLInputElement>(".omnikit-copy-path");
       const copy = dialog.element.querySelector<HTMLButtonElement>(".omnikit-copy-button");

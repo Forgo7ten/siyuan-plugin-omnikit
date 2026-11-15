@@ -1,4 +1,5 @@
 import type { LinkOccurrenceTarget, TitledLinkProtyle } from "../types.ts";
+import { resolveProtyleRunner, resolveEditorRootID, resolveNotebookID } from "../../../core/ProtyleAdapter.ts";
 
 export type LinkWriteResult = "updated" | "unchanged" | "conflict" | "aborted";
 
@@ -49,19 +50,7 @@ function linkElements(block: HTMLElement): HTMLElement[] {
  * or SiYuan's IProtyle event detail wrapper (which exposes `getInstance(): Protyle`).
  */
 export function resolveTitledLinkProtyle(protyle: any): TitledLinkProtyle | null {
-  if (typeof protyle?.updateTransactionElement === "function") {
-    return protyle as TitledLinkProtyle;
-  }
-  if (typeof protyle?.getInstance === "function") {
-    const instance = protyle.getInstance();
-    if (typeof instance?.updateTransactionElement === "function") {
-      return instance as TitledLinkProtyle;
-    }
-  }
-  if (typeof protyle?.protyle?.updateTransactionElement === "function") {
-    return protyle.protyle as TitledLinkProtyle;
-  }
-  return null;
+  return resolveProtyleRunner(protyle) as TitledLinkProtyle | null;
 }
 
 /** Capture one occurrence before asynchronous title fetching begins. */
@@ -70,8 +59,8 @@ export function captureLinkTarget(link: HTMLElement, protyle: any): LinkOccurren
   if (!runner) return null;
   const block = link.closest<HTMLElement>("[data-node-id]");
   const blockID = block?.getAttribute("data-node-id") ?? "";
-  const rootID = protyle?.block?.rootID ?? protyle?.protyle?.block?.rootID ?? (runner as any)?.block?.rootID;
-  const notebook = protyle?.notebookId ?? protyle?.block?.box ?? protyle?.protyle?.notebookId ?? protyle?.protyle?.block?.box ?? (runner as any)?.notebookId ?? (runner as any)?.block?.box;
+  const rootID = resolveEditorRootID(protyle) ?? (runner as any)?.block?.rootID;
+  const notebook = resolveNotebookID(protyle) ?? (runner as any)?.notebookId ?? (runner as any)?.block?.box;
   const href = link.getAttribute("data-href");
   if (!block || !blockID || typeof rootID !== "string" || !rootID ||
       typeof notebook !== "string" || !notebook || typeof href !== "string" || !href) return null;

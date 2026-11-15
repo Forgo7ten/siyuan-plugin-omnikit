@@ -99,7 +99,8 @@ export class TitledLinkController {
     const timer = setTimeout(() => {
       release();
       if (!this.scope.active || !this.config().auto.enabled) return;
-      const editorElement = protyle.wysiwyg.element as HTMLElement;
+      const editorElement = protyle?.wysiwyg?.element as HTMLElement | undefined;
+      if (!editorElement?.isConnected) return;
       const current = editorElement.querySelector<HTMLElement>(`[data-node-id="${blockID}"]`);
       if (!current) return;
       const matches = matchingLinks(current, url);
