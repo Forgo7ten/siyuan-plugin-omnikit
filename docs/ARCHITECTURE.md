@@ -152,7 +152,7 @@ flowchart TD
   - **顶栏与下拉菜单装配**：统筹注册 Core Dock 单槽位、TopBar 图标与设置对话框；构建顶栏下拉菜单时严格按分层组织：顶部 Core 平台项（「OmniKit 设置」） + 调用思源原生 `menu.addSeparator({ id: "separator_settings" })` 物理分隔线 + 各 Feature 业务选项（Dock 栏已有常驻入口，顶栏不设立重复且无控的打开 Dock 选项）。
 
 ### 3.2 `FeatureCatalog` 与 `FeatureManager` (生命周期与状态机)
-- **文件位置**：`src/core/FeatureCatalog.ts`、`src/core/FeatureManager.ts`
+- **文件位置**：`src/core/framework/FeatureCatalog.ts`、`src/core/framework/FeatureManager.ts`
 - **主要职责**：
   - `FeatureCatalog` 集中持有所有 Feature 的声明式元数据（`FeatureRegistration<T>`），包含 `id`、`defaultEnabled` 及支持端声明 `frontends` 等，对外暴露只读索引与存储文件命名合法性校验；
   - `FeatureManager` 维护每个 Feature 的严格串行化启停队列（Promise Queue），提供跨端安全的生命周期调度；
@@ -188,7 +188,7 @@ stateDiagram-v2
   - 当 Feature 启动失败时，置状态为 `error` 并记录异常，保持用户在 `omnikit-core.json` 中配置的期望偏好不变。
 
 ### 3.3 `BaseFeature` 与 `FeatureScope` (资源作用域与中止信号)
-- **文件位置**：`src/core/BaseFeature.ts`、`src/core/FeatureScope.ts`
+- **文件位置**：`src/core/framework/BaseFeature.ts`、`src/core/framework/FeatureScope.ts`
 - **主要职责**：
   - 每个业务功能继承 `BaseFeature`，通过 `context` 获得受控的 Core 基础设施；
   - `FeatureScope` 原生封装 `AbortController`：
@@ -201,7 +201,7 @@ stateDiagram-v2
   - 当 Feature 停用或插件卸载时，`scope.dispose()` **首先广播 `abort` 信号**通知所有在途任务安全终止，再按后进先出（LIFO）顺序释放所有监听器。
 
 ### 3.4 `SettingsManager` 与 `JsonStore` (确定性存储体系)
-- **文件位置**：`src/core/SettingsManager.ts`、`src/core/JsonStore.ts`
+- **文件位置**：`src/core/store/SettingsManager.ts`、`src/core/store/JsonStore.ts`
 - **核心机制**：
   - **每文件独占 Promise 队列**：每个 JSON 文件的保存操作串行化执行，防止写竞争；
   - **内容指纹防抖**：内存维护序列化指纹（`fingerprint`），相同数据重复保存自动跳过实际 I/O；
@@ -209,7 +209,7 @@ stateDiagram-v2
   - **异常损坏隔离**：解析 JSON 失败时不使用默认值覆盖。将损坏文件备份为 `.backup` 并提示用户显式确认修复。
 
 ### 3.5 `KernelClient` (安全内核 API 封装)
-- **文件位置**：`src/core/KernelClient.ts`
+- **文件位置**：`src/core/host/KernelClient.ts`
 - **主要职责**：
   - 封装对思源内核 `/api/...` 的网络交互；
   - 支持调用方传入 `AbortSignal` 与自定义超时；
@@ -233,7 +233,7 @@ stateDiagram-v2
     - **总开关置灰禁用（Disabled Guard）**：卡片头部总开关设置 `disabled` 属性置灰禁用，不可点击切换，彻底阻止非法生命周期触发；
     - **状态 Badge 与平台说明**：卡片顶部 Badge 渲染 `runtime.unsupported`（「当前平台暂不支持」），并展示友好的支持平台列表说明（如“仅支持：桌面端、桌面窗口”）；
     - **专属设置项允许预调**：卡片主体内的专属设置组件（`settingsView`）保持挂载并允许交互调整，满足跨端云同步场景下提前配置参数的诉求；修改保存仅局限于其专属配置文件 `feature-{id}-settings.json`，绝对不触碰 `omnikit-core.json`；
-- **统一菜单路由器 (`MenuRouter` / `MenuRegistry`)** (`src/core/MenuRouter.ts` / `MenuRegistry.ts`)：
+- **统一菜单路由器 (`MenuRouter` / `MenuRegistry`)** (`src/core/feedback/MenuRouter.ts` / `src/core/feedback/MenuRegistry.ts`)：
   - 集中拦截思源上下文菜单事件（`event-bus`）；
   - 严格校验菜单所属 Feature 的运行态（`phase === "enabled"`）；
   - **平台兼容性排除**：处于 `unsupported` 状态的功能未被激活且无 `FeatureScope`，不向 `MenuRegistry` 注入任何菜单动作项；`isFeatureRunning` 核验天然拦截，外部宿主上下文菜单与顶栏快捷菜单自动跳过渲染，无冗余开销；
@@ -248,7 +248,7 @@ stateDiagram-v2
   - 若触发时对应功能处于停用状态，调用轻量通知 `showMessage` 提示功能未启用，不弹出模态对话框。
 
 ### 3.7 `UiFeedback` (统一通知与交互反馈门面)
-- **文件位置**：`src/core/UiFeedback.ts`
+- **文件位置**：`src/core/feedback/UiFeedback.ts`
 - **主要职责**：
   - 注入 `FeatureContext.feedback`，为所有 Feature 提供平台统筹的用户交互与反馈服务；
   - **前缀自动补齐**：统一对外弹窗追加 `[OmniKit] ` 前缀，Feature 调用时仅传入纯语义内容；
@@ -258,7 +258,7 @@ stateDiagram-v2
   - **通用能力**：提供标准的 `notify(message, type, options)` 及 `copyable(text, label)`。
 
 ### 3.8 `PluginStatusBar` (宿主底栏状态栏管理)
-- **文件位置**：`src/core/PluginStatusBar.ts`
+- **文件位置**：`src/core/feedback/PluginStatusBar.ts`
 - **主要职责**：
   - 注入 `FeatureContext.statusBar`，作为主工作区底部轻量单行任务进度的单例入口；
   - **生命周期挂载**：在主窗口 `onLayoutReady()` 中由 Core 统一调用思源官方原生 `plugin.addStatusBar({ element, position: "left" })` 挂载；插件注销 `onunload()` 时调用 `dispose()` 清理；

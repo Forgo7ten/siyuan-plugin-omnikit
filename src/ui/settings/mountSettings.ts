@@ -1,9 +1,9 @@
 import { Dialog } from "siyuan";
 import { mount, unmount } from "svelte";
 import SettingsRoot from "./SettingsRoot.svelte";
-import type { FeatureRegistration } from "../../core/FeatureRegistration.ts";
-import type { SettingsManager } from "../../core/SettingsManager.ts";
-import type { FeatureManager } from "../../core/FeatureManager.ts";
+import type { FeatureRegistration } from "../../core/framework/FeatureRegistration.ts";
+import type { SettingsManager } from "../../core/store/SettingsManager.ts";
+import type { FeatureManager } from "../../core/framework/FeatureManager.ts";
 
 /**
  * @design Svelte controls only view lifetime. It never starts Feature runtime or registers

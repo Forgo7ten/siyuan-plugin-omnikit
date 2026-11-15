@@ -1,6 +1,6 @@
-import type { FeatureContext } from "../../core/FeatureContext.ts";
-import type { FeatureScope } from "../../core/FeatureScope.ts";
-import type { KernelClient } from "../../core/KernelClient.ts";
+import type { FeatureContext } from "../../core/framework/FeatureContext.ts";
+import type { FeatureScope } from "../../core/framework/FeatureScope.ts";
+import type { KernelClient } from "../../core/host/KernelClient.ts";
 import { extractStaticFileName } from "./services/static-file.ts";
 import { fetchTitleResource } from "./services/dual-track-fetcher.ts";
 import { readAndDecodeTitleResource } from "./services/stream-parser.ts";
@@ -13,7 +13,7 @@ import {
   resolveTitledLinkProtyle,
 } from "./services/safe-writer.ts";
 import type { GroupedLinkTitleUpdate } from "./services/safe-writer.ts";
-import type { LinkOccurrenceTarget, TitleFetchResult, TitledLinkConfig } from "./types.ts";
+import type { LinkOccurrenceTarget, TitleFetchResult, TitledLinkConfig } from "./policy/types.ts";
 
 export type LinkActionResult = "updated" | "unchanged" | "conflict" | "failed" | "aborted" | "superseded";
 export interface TitledLinkControllerOptions {

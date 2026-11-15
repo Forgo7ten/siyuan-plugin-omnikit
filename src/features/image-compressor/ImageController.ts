@@ -1,18 +1,18 @@
 import { showMessage } from "siyuan";
-import type { FeatureContext } from "../../core/FeatureContext.ts";
-import type { FeatureScope } from "../../core/FeatureScope.ts";
+import type { FeatureContext } from "../../core/framework/FeatureContext.ts";
+import type { FeatureScope } from "../../core/framework/FeatureScope.ts";
 import { translate } from "../../i18n/translate.ts";
-import type { ImageProcessingServices } from "./ImageProcessingServices.ts";
+import type { ImageProcessingServices } from "./services/ImageProcessingServices.ts";
 import {
   compressSelectedImageQuick,
   compressSelectedImageCustom,
   type SingleImageEditorContext,
   type ImageActionOutcome,
-} from "./SingleImageAction.ts";
-import { compressDocumentImages, type BatchActionOptions } from "./DocumentBatchAction.ts";
-import type { TaskRegistry } from "./TaskRegistry.ts";
-import type { ImageTaskState } from "./ImageTaskUI.ts";
-import type { AutoUploadNotice } from "./AutoUploadHandler.ts";
+} from "./actions/SingleImageAction.ts";
+import { compressDocumentImages, type BatchActionOptions } from "./actions/DocumentBatchAction.ts";
+import type { TaskRegistry } from "./policy/TaskRegistry.ts";
+import type { ImageTaskState } from "./ui/ImageTaskUI.ts";
+import type { AutoUploadNotice } from "./actions/AutoUploadHandler.ts";
 
 /**
  * ImageController: Unified facade for all image compression actions.

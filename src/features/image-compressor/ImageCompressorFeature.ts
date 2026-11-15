@@ -1,27 +1,27 @@
 import { showMessage } from "siyuan";
-import { BaseFeature } from "../../core/BaseFeature.ts";
-import type { FeatureContext } from "../../core/FeatureContext.ts";
-import type { FeatureScope } from "../../core/FeatureScope.ts";
-import type { MenuContext } from "../../core/MenuRegistry.ts";
-import type { SettingsManager } from "../../core/SettingsManager.ts";
-import type { Logger } from "../../core/Logger.ts";
-import { PageAllowlist } from "./PageAllowlist.ts";
-import { isDocumentRootIdentity, type BlockIdentity } from "./DocumentIdentity.ts";
-import { KernelClient } from "../../core/KernelClient.ts";
-import { NODE_ID } from "./parseImageConfig.ts";
-import { TaskRegistry } from "./TaskRegistry.ts";
-import { IMAGE_FEATURE_ID } from "./settings.ts";
+import { BaseFeature } from "../../core/framework/BaseFeature.ts";
+import type { FeatureContext } from "../../core/framework/FeatureContext.ts";
+import type { FeatureScope } from "../../core/framework/FeatureScope.ts";
+import type { MenuContext } from "../../core/feedback/MenuRegistry.ts";
+import type { SettingsManager } from "../../core/store/SettingsManager.ts";
+import type { Logger } from "../../core/host/Logger.ts";
+import { PageAllowlist } from "./policy/PageAllowlist.ts";
+import { isDocumentRootIdentity, type BlockIdentity } from "./policy/DocumentIdentity.ts";
+import { KernelClient } from "../../core/host/KernelClient.ts";
+import { NODE_ID } from "./policy/parseImageConfig.ts";
+import { TaskRegistry } from "./policy/TaskRegistry.ts";
+import { IMAGE_FEATURE_ID } from "./policy/settings.ts";
 import type { ImageFeatureConfig } from "./registration.ts";
-import { registerAutoUpload, type AutoUploadNotice } from "./AutoUploadHandler.ts";
-import { shouldAutoCompress } from "./AutoPolicy.ts";
-import { imageMenuContributions } from "./menuContributions.ts";
-import { type SingleImageEditorContext } from "./SingleImageAction.ts";
+import { registerAutoUpload, type AutoUploadNotice } from "./actions/AutoUploadHandler.ts";
+import { shouldAutoCompress } from "./policy/AutoPolicy.ts";
+import { imageMenuContributions } from "./actions/menuContributions.ts";
+import { type SingleImageEditorContext } from "./actions/SingleImageAction.ts";
 import { ImageController } from "./ImageController.ts";
 import { translate } from "../../i18n/translate.ts";
-import { createImageServices } from "./createImageServices.ts";
-import type { ImageProcessingServices } from "./ImageProcessingServices.ts";
-import { watchRemoteImages, type RemoteWatcherHandle } from "./RemoteImageWatcher.ts";
-import type { DocumentRow } from "./references.ts";
+import { createImageServices } from "./services/createImageServices.ts";
+import type { ImageProcessingServices } from "./services/ImageProcessingServices.ts";
+import { watchRemoteImages, type RemoteWatcherHandle } from "./actions/RemoteImageWatcher.ts";
+import type { DocumentRow } from "./services/references.ts";
 
 /**
  * @invariant The feature owns all business registrations through FeatureScope.

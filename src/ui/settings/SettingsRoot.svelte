@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import type { FeatureRegistration } from "../../core/FeatureRegistration.ts";
-  import type { SettingsManager, CoreSettings } from "../../core/SettingsManager.ts";
-  import type { FeatureManager } from "../../core/FeatureManager.ts";
-  import type { FeatureStatus } from "../../core/FeatureManager.ts";
-  import { isFrontendSupported, type SiyuanFrontend } from "../../core/Platform.ts";
+  import type { FeatureRegistration } from "../../core/framework/FeatureRegistration.ts";
+  import type { SettingsManager, CoreSettings } from "../../core/store/SettingsManager.ts";
+  import type { FeatureManager } from "../../core/framework/FeatureManager.ts";
+  import type { FeatureStatus } from "../../core/framework/FeatureManager.ts";
+  import { isFrontendSupported, type SiyuanFrontend } from "../../core/host/Platform.ts";
 
   interface Props {
     registrations: readonly FeatureRegistration<any>[];

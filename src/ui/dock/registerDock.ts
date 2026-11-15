@@ -1,8 +1,8 @@
 import type { Component } from "svelte";
 import { mount, unmount } from "svelte";
 import type { Plugin } from "siyuan";
-import type { FeatureContext } from "../../core/FeatureContext.ts";
-import { isFrontendSupported, type SiyuanFrontend } from "../../core/Platform.ts";
+import type { FeatureContext } from "../../core/framework/FeatureContext.ts";
+import { isFrontendSupported, type SiyuanFrontend } from "../../core/host/Platform.ts";
 import { button, el } from "../common/dom.ts";
 
 export interface FeatureDockView {

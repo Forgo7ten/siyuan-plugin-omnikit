@@ -1,9 +1,9 @@
 import { adaptiveQualitySearch, type QualitySearchProgress } from "./adaptive-quality-search.ts";
 import { SimilarityWorkerSession, type WorkerFactory } from "./SimilarityWorkerSession.ts";
 import { getSimilarityPolicy } from "./similarity-policy.ts";
-import type { CompressionMode } from "../contracts.ts";
-import type { EncodeOptions, EncodeResult, ImageCodec } from "../image.ts";
-import type { ImageConfig } from "../parseImageConfig.ts";
+import type { CompressionMode } from "../policy/contracts.ts";
+import type { EncodeOptions, EncodeResult, ImageCodec } from "../services/image.ts";
+import type { ImageConfig } from "../policy/parseImageConfig.ts";
 
 export interface AdaptiveImageCompressorOptions {
   workerFactory?: WorkerFactory;

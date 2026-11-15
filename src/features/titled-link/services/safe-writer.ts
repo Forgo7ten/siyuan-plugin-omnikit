@@ -1,5 +1,5 @@
-import type { LinkOccurrenceTarget, TitledLinkProtyle } from "../types.ts";
-import { resolveProtyleRunner, resolveEditorRootID, resolveNotebookID } from "../../../core/ProtyleAdapter.ts";
+import type { LinkOccurrenceTarget, TitledLinkProtyle } from "../policy/types.ts";
+import { resolveProtyleRunner, resolveEditorRootID, resolveNotebookID } from "../../../core/host/ProtyleAdapter.ts";
 
 export type LinkWriteResult = "updated" | "unchanged" | "conflict" | "aborted";
 

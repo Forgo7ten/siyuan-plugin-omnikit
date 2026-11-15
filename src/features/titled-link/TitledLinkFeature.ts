@@ -1,10 +1,10 @@
 import { getFrontend, showMessage } from "siyuan";
-import { BaseFeature } from "../../core/BaseFeature.ts";
-import type { FeatureContext } from "../../core/FeatureContext.ts";
-import type { FeatureScope } from "../../core/FeatureScope.ts";
-import type { MenuContext } from "../../core/MenuRegistry.ts";
-import type { SettingsManager } from "../../core/SettingsManager.ts";
-import { KernelClient } from "../../core/KernelClient.ts";
+import { BaseFeature } from "../../core/framework/BaseFeature.ts";
+import type { FeatureContext } from "../../core/framework/FeatureContext.ts";
+import type { FeatureScope } from "../../core/framework/FeatureScope.ts";
+import type { MenuContext } from "../../core/feedback/MenuRegistry.ts";
+import type { SettingsManager } from "../../core/store/SettingsManager.ts";
+import { KernelClient } from "../../core/host/KernelClient.ts";
 import { translate } from "../../i18n/translate.ts";
 import { TitledLinkController } from "./TitledLinkController.ts";
 import { isHttpUrl } from "./TitledLinkController.ts";

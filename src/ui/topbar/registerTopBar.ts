@@ -1,5 +1,5 @@
 import { Menu, getActiveEditor, getFrontend, type Plugin } from "siyuan";
-import type { MenuRegistry } from "../../core/MenuRegistry.ts";
+import type { MenuRegistry } from "../../core/feedback/MenuRegistry.ts";
 
 export interface TopBarOptions {
   title: string;

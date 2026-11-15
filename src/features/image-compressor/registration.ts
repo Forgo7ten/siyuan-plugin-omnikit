@@ -1,9 +1,9 @@
-import { defineFeature, featureConfigFile } from "../../core/FeatureRegistration.ts";
+import { defineFeature, featureConfigFile } from "../../core/framework/FeatureRegistration.ts";
 import { ImageCompressorFeature } from "./ImageCompressorFeature.ts";
-import ImageRecordsDock from "./ImageRecordsDock.svelte";
-import ImageSettingsBridge from "./ImageSettingsBridge.svelte";
-import { defaultImageFeatureConfig, parseImageConfig, type ImageFeatureConfig } from "./parseImageConfig.ts";
-export type { ImageFeatureConfig, PagePermission } from "./parseImageConfig.ts";
+import ImageRecordsDock from "./ui/ImageRecordsDock.svelte";
+import ImageSettingsBridge from "./ui/ImageSettingsBridge.svelte";
+import { defaultImageFeatureConfig, parseImageConfig, type ImageFeatureConfig } from "./policy/parseImageConfig.ts";
+export type { ImageFeatureConfig, PagePermission } from "./policy/parseImageConfig.ts";
 
 export const imageCompressorRegistration = defineFeature<ImageFeatureConfig>({
   id: "imageCompressor",

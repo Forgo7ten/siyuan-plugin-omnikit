@@ -1,4 +1,4 @@
-import { isMobileFrontend } from "../../../core/Platform.ts";
+import { isMobileFrontend } from "../../../core/host/Platform.ts";
 
 export interface SimilarityPolicy {
   maxEvaluations: number;

@@ -1,8 +1,8 @@
-import { defineFeature, featureConfigFile } from "../../core/FeatureRegistration.ts";
+import { defineFeature, featureConfigFile } from "../../core/framework/FeatureRegistration.ts";
 import { TitledLinkFeature } from "./TitledLinkFeature.ts";
-import TitledLinkSettingsPanel from "./TitledLinkSettingsPanel.svelte";
-import { titledLinkSettingsCodec } from "./settings.ts";
-import type { TitledLinkConfig } from "./types.ts";
+import TitledLinkSettingsPanel from "./ui/TitledLinkSettingsPanel.svelte";
+import { titledLinkSettingsCodec } from "./policy/settings.ts";
+import type { TitledLinkConfig } from "./policy/types.ts";
 
 export const titledLinkRegistration = defineFeature<TitledLinkConfig>({
   id: "titled-link",

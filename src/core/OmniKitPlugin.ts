@@ -1,14 +1,14 @@
 import { Plugin, getFrontend, showMessage } from "siyuan";
-import { FeatureCatalog } from "./FeatureCatalog.ts";
-import { FeatureManager } from "./FeatureManager.ts";
-import type { FeatureContext } from "./FeatureContext.ts";
-import { SettingsManager } from "./SettingsManager.ts";
-import { MenuRegistry } from "./MenuRegistry.ts";
-import { installMenuRouter } from "./MenuRouter.ts";
-import { Logger } from "./Logger.ts";
-import { Compatibility } from "./Compatibility.ts";
-import { UiFeedback } from "./UiFeedback.ts";
-import { PluginStatusBar } from "./PluginStatusBar.ts";
+import { FeatureCatalog } from "./framework/FeatureCatalog.ts";
+import { FeatureManager } from "./framework/FeatureManager.ts";
+import type { FeatureContext } from "./framework/FeatureContext.ts";
+import { SettingsManager } from "./store/SettingsManager.ts";
+import { MenuRegistry } from "./feedback/MenuRegistry.ts";
+import { installMenuRouter } from "./feedback/MenuRouter.ts";
+import { Logger } from "./host/Logger.ts";
+import { Compatibility } from "./host/Compatibility.ts";
+import { UiFeedback } from "./feedback/UiFeedback.ts";
+import { PluginStatusBar } from "./feedback/PluginStatusBar.ts";
 import { imageCompressorRegistration } from "../features/image-compressor/registration.ts";
 import { titledLinkRegistration } from "../features/titled-link/registration.ts";
 import { createSettingsWindow } from "../ui/settings/mountSettings.ts";
@@ -16,7 +16,7 @@ import { registerTopBar } from "../ui/topbar/registerTopBar.ts";
 import { registerDock } from "../ui/dock/registerDock.ts";
 import { OMNIKIT_ICONS } from "../ui/icons.ts";
 import { translate } from "../i18n/translate.ts";
-import { setFrontendResolver } from "./Platform.ts";
+import { setFrontendResolver } from "./host/Platform.ts";
 import "../styles/index.scss";
 
 /** @design Add one registration here; no changes to core schema or SettingsRoot.svelte. */

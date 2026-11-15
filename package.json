@@ -8,7 +8,7 @@
     "check": "tsc --noEmit -p tsconfig.omnikit.json && svelte-check --tsconfig ./tsconfig.omnikit.json",
     "check:types": "tsc --noEmit -p tsconfig.omnikit.json",
     "check:svelte": "svelte-check --tsconfig ./tsconfig.omnikit.json",
-    "test": "node --experimental-transform-types --test tests/omnikit-*.test.mjs",
+    "test": "node --experimental-transform-types --test 'tests/**/*.test.mjs'",
     "build": "pnpm check && pnpm test && pnpm build:app",
     "build:app": "pnpm render:icons && cross-env NODE_ENV=production vite build",
     "build:fast": "pnpm build:app",
