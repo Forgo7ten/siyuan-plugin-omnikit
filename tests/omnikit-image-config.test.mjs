@@ -32,8 +32,18 @@ test("image config validates complete grouped settings and document permissions"
 test("compression options enforce numeric bounds and complete schema", () => {
   for (const value of [0.009, 1.01]) rejects(c => { c.compression.initialQuality = value; }, `quality ${value}`);
   for (const value of [512.5, 511, 16385]) rejects(c => { c.compression.manualMaxEdge = value; }, `dimension ${value}`);
-  rejects(c => { c.remote.downloadUserAgent = "x".repeat(257); }, "long user agent");
   rejects(c => { c.metadata.preserveExif = true; }, "EXIF unsupported");
+});
+
+test("legacy config with remote downloadUserAgent is safely parsed and silently discarded", () => {
+  const legacy = {
+    ...valid(),
+    remote: { downloadUserAgent: "CustomUA/1.0" },
+  };
+  const parsed = parseImageConfig(legacy);
+  assert.equal(parsed.schemaVersion, 1);
+  assert.equal("remote" in parsed, false);
+  assert.deepEqual(parsed, valid());
 });
 
 test("extension lists are normalized and validated", () => {

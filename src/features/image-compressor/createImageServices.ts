@@ -47,6 +47,7 @@ export function createImageServices(context: FeatureContext, scope: FeatureScope
     origin,
     mobile,
     desktopFiles: Boolean(desktop),
+    userAgent: () => context.settings.getUserAgent(),
     config: () => context.settings.getFeature<ImageConfig>("imageCompressor"),
   };
 }

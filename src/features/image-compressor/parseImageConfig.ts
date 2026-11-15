@@ -3,7 +3,7 @@ import type { CompressionMode } from "./contracts.ts";
 export const MiB = 1024 * 1024;
 export const NODE_ID = /^\d{14}-[a-z0-9]{7}$/;
 
-/** Runtime limits remain part of the validated in-memory config, not user-facing v2 settings. */
+/** Runtime limits remain part of the validated in-memory config. */
 export interface ImageConfig {
   schemaVersion: 1;
   auto: { globalEnabled: boolean; pageAllowlist: Record<string, { grantedAt: number; title: string }> };
@@ -13,9 +13,8 @@ export interface ImageConfig {
     maxInputBytes: number; maxPixels: number; maxEncodeMs: number;
     concurrencyDesktop: number; concurrencyMobile: number; excludedExtensions: string[];
   };
-  remote: { downloadUserAgent: string };
   metadata: { preserveExif: false };
-  /** Internal compatibility knobs used by current services; not persisted in v2. */
+  /** Internal compatibility knobs used by current services. */
   sources: { desktopLocalFiles: boolean };
   references: { backend: "auto" | "sql"; maxDocuments: number };
 }
@@ -36,7 +35,6 @@ export function defaultImageFeatureConfig(): ImageConfig {
     schemaVersion: 1,
     auto: { globalEnabled: false, pageAllowlist: {} },
     compression: { initialQuality: 0.8, manualMaxEdge: 4096, ...runtimeDefaults() },
-    remote: { downloadUserAgent: "" },
     metadata: { preserveExif: false },
     sources: { desktopLocalFiles: true },
     references: { backend: "auto", maxDocuments: 10_000 },
@@ -69,7 +67,7 @@ export function parseImageConfig(raw: unknown): ImageConfig {
   if (r.schemaVersion !== 1) throw new UnsupportedConfigError("Only image config schemaVersion 1 is supported");
   const defaults = defaultImageFeatureConfig();
   const a = object(r.auto, "auto"), c = object(r.compression, "compression");
-  const remote = object(r.remote, "remote"), metadata = object(r.metadata, "metadata");
+  const metadata = object(r.metadata, "metadata");
   const pages = object(a.pageAllowlist, "pageAllowlist");
   const pageAllowlist: ImageConfig["auto"]["pageAllowlist"] = {};
   for (const [id, value] of Object.entries(pages)) {
@@ -78,8 +76,6 @@ export function parseImageConfig(raw: unknown): ImageConfig {
     if (typeof p.title !== "string" || p.title.length > 512) throw new Error("Invalid title");
     pageAllowlist[id] = { grantedAt: number(p.grantedAt, "grantedAt", 0, Number.MAX_SAFE_INTEGER, true), title: p.title };
   }
-  if (typeof remote.downloadUserAgent !== "string" || remote.downloadUserAgent.length > 256 ||
-      /[\r\n\u0000-\u001f\u007f]/.test(remote.downloadUserAgent)) throw new Error("Invalid downloadUserAgent");
   if (metadata.preserveExif !== false) throw new Error("EXIF preservation is not supported");
   if (!Array.isArray(c.excludedExtensions) || c.excludedExtensions.some(v => typeof v !== "string" || !/^[a-z0-9]+$/.test(v))) throw new Error("Invalid excludedExtensions");
   const refsRaw = object(r.references ?? defaults.references, "references");
@@ -93,7 +89,6 @@ export function parseImageConfig(raw: unknown): ImageConfig {
       manualMaxEdge: number(c.manualMaxEdge, "manualMaxEdge", 512, 16_384, true),
       excludedExtensions: [...new Set(c.excludedExtensions as string[])],
     },
-    remote: { downloadUserAgent: remote.downloadUserAgent },
     metadata: { preserveExif: false },
     sources: { desktopLocalFiles: bool(sourcesRaw.desktopLocalFiles, "desktopLocalFiles") },
     references: {

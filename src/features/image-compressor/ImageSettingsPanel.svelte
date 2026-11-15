@@ -9,11 +9,11 @@
     store: JsonStore<ImageFeatureConfig>;
     runtimePhase: string;
     hostVersion: string;
-    desktopFrontend: boolean;
+    desktopFrontend?: boolean;
     t: (key: string) => string;
     validateDocument: (rootID: string) => Promise<{ id: string; title: string }>;
   }
-  let { store, runtimePhase, hostVersion, desktopFrontend, t, validateDocument }: Props = $props();
+  let { store, runtimePhase, hostVersion, desktopFrontend = false, t, validateDocument }: Props = $props();
   const copy = (value: ImageFeatureConfig): ImageFeatureConfig => JSON.parse(JSON.stringify(value)) as ImageFeatureConfig;
   const same = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
 
@@ -207,15 +207,6 @@
     </section>
 
     <section class="setting-card">
-      <header><h3>{t("settings.userAgent")}</h3><p>{t("settings.userAgentHelp")}</p></header>
-      <label class="setting-row">
-        <span><strong>{t("settings.userAgent")}</strong><small>{t(desktopFrontend ? "settings.userAgentDesktopOnly" : "settings.userAgentUnavailable")}</small></span>
-        <input class="b3-text-field text-control" maxlength="256" bind:value={draft.remote.downloadUserAgent}
-          disabled={!desktopFrontend} aria-label={t("settings.userAgent")} />
-      </label>
-    </section>
-
-    <section class="setting-card">
       <header><h3>{t("settings.documents")} · {Object.keys(draft.auto.pageAllowlist).length}</h3>
         <p>{t("settings.documentsHelp")}</p></header>
       <div class="document-controls">
@@ -293,7 +284,7 @@
   .range-control input { width: 160px; accent-color: var(--b3-theme-primary); }
   output { min-width: 40px; text-align: right; font-variant-numeric: tabular-nums; }
   .number-control { display: flex; align-items: center; gap: 8px; }
-  .number-control input { width: 104px; } .text-control { width: 220px; }
+  .number-control input { width: 104px; }
   .notice { background: var(--b3-theme-surface); border-radius: 6px; padding: 12px; margin: 8px 0 16px; line-height: 1.6; }
   .notice--error { border-inline-start: 3px solid var(--b3-theme-error); }
   .warning { color: var(--b3-theme-error); }
@@ -428,8 +419,8 @@
 
   @media (max-width: 620px) {
     .setting-card { padding: 12px; } .setting-row { gap: 12px; }
-    .setting-row:has(.range-control), .setting-row:has(.text-control) { grid-template-columns: 1fr; }
-    .range-control, .text-control { width: 100%; } .range-control input { flex: 1; }
+    .setting-row:has(.range-control) { grid-template-columns: 1fr; }
+    .range-control { width: 100%; } .range-control input { flex: 1; }
     .save-bar {
       width: 100%;
       border-radius: 16px;

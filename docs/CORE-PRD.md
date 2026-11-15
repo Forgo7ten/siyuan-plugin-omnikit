@@ -323,7 +323,7 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 
 统一导出跨平台环境识别工具：
 - 识别桌面端（Windows / macOS / Linux）与移动/平板/Web 前端；
-- 为特性提供差异化能力前置检查（例如：仅桌面端支持配置下载 User-Agent、本地大图多线程处理等）。
+- 为特性提供差异化能力前置检查（例如：仅桌面端支持本地大图 Worker 多线程加速转码等）。
 
 ### 6.3 `Logger` 动态日志体系
 

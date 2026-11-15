@@ -18,6 +18,7 @@ function services(saveRecord) {
   const webp = new File(["webp"], "image.webp", { type: "image/webp" });
   const service = {
     origin: "http://localhost:6806",
+    userAgent: () => "OmniKit/Test",
     reader: { async read(source) {
       calls.push(`read:${source.path}`);
       return { blob: source.path === "assets/original.png" ? original : webp, name: "original.png" };

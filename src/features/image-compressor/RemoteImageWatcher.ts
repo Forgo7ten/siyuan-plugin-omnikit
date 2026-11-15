@@ -121,7 +121,7 @@ export async function watchRemoteImages(
 
       const downloaded = await services.reader.read(candidate.source, {
         maxBytes: Math.min(config.compression.maxInputBytes, 32 * 1024 * 1024), timeoutMs: 30_000, signal: task.signal,
-        userAgent: config.remote.downloadUserAgent,
+        userAgent: services.userAgent(),
       });
       await assertImagePayload(downloaded.blob);
       if (!scope.active || task.signal.aborted) return;

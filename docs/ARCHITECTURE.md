@@ -218,7 +218,7 @@ SiYuan 工作区目录：data/storage/petal/siyuan-plugin-omnikit/
 | 存储分类 | 文件路径规则 | 包含内容 | 重置操作影响边界 |
 |---|---|---|---|
 | **Core 平台配置** | `omnikit-core.json` | `schemaVersion: 1`<br/>`general: { debugLog, userAgent }`<br/>`featureStates: { [id]: { enabled } }` | **全局重置时重置**（恢复 debugLog 为 false，userAgent 为空串） |
-| **Feature 设置** | `feature-{id}-settings.json` | 用户在各 Feature 设置页手动调整的业务参数（质量、白名单、UA、截断长度等） | **单功能重置**及**全局重置**时恢复默认值 |
+| **Feature 设置** | `feature-{id}-settings.json` | 用户在各 Feature 设置页手动调整的业务参数（质量、白名单、截断长度等偏好） | **单功能重置**及**全局重置**时恢复默认值 |
 | **Feature 业务数据** | `feature-{id}-{dataname}.json` | Feature 核心业务数据（如原图/WebP映射） | **不受设置重置影响**，仅支持在“数据管理专区”由用户显式操作清空 |
 
 ### 4.2 设置重置与数据管理专区机制

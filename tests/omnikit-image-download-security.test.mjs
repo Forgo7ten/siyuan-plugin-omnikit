@@ -3,9 +3,13 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
+import { readFile } from 'node:fs/promises';
 import { createDesktopBridge } from '../src/features/image-compressor/desktop.ts';
 import { requireRemotePermission } from '../src/features/image-compressor/download.ts';
 import { assertImagePayload } from '../src/features/image-compressor/RemoteImageWatcher.ts';
+import { prepareImage } from '../src/features/image-compressor/ImageProcessingServices.ts';
+import { defaultImageFeatureConfig } from '../src/features/image-compressor/parseImageConfig.ts';
+import { DEFAULT_USER_AGENT, SettingsManager } from '../src/core/SettingsManager.ts';
 
 function bridgeFor({ responses = [] } = {}) {
   const requests = [];
@@ -125,4 +129,67 @@ test('remote SVG validation checks dangerous markup past the first 4096 bytes', 
     assertImagePayload(new Blob(['<svg>', ' '.repeat(5000), '<script>alert(1)</script></svg>'])),
     /Unsafe SVG/,
   );
+});
+
+test('prepareImage passes Core userAgent from services to reader (default fallback and custom)', async () => {
+  function createPlugin(userAgent = '') {
+    const storage = new Map([
+      ['omnikit-core.json', { schemaVersion: 1, general: { debugLog: false, userAgent }, featureStates: {} }],
+    ]);
+    return {
+      async loadData(name) { return storage.get(name) ?? ''; },
+      async saveData(name, value) { storage.set(name, structuredClone(value)); },
+    };
+  }
+
+  const runWithUA = async (customUA) => {
+    let capturedOptions;
+    const settings = new SettingsManager(createPlugin(customUA), []);
+    await settings.load();
+
+    const mockServices = {
+      origin: 'http://localhost:6806',
+      userAgent: () => settings.getUserAgent(),
+      reader: {
+        async read(source, options) {
+          capturedOptions = options;
+          return { blob: new Blob(['x']), name: 'test.png' };
+        },
+      },
+      encoder: {
+        async encode() {
+          return { kind: 'skipped', reason: 'test' };
+        },
+      },
+      assets: { upload: async () => 'assets/test.webp' },
+      references: {},
+      records: {},
+      recordsReady: Promise.resolve(),
+      ui: { copyablePath() {} },
+    };
+    const source = { kind: 'asset', path: 'assets/test.png', key: 'asset:assets/test.png', name: 'test.png', raw: 'assets/test.png' };
+    const config = defaultImageFeatureConfig();
+    await prepareImage(mockServices, source, '20250101000000-abcdefg', { kind: 'manual-single', rootID: '20250101000000-abcdefg' }, config, new AbortController().signal);
+    return capturedOptions;
+  };
+
+  const defaultOptions = await runWithUA('');
+  assert.equal(defaultOptions?.userAgent, DEFAULT_USER_AGENT);
+
+  const customOptions = await runWithUA('OmniKit-Core/2.0 Custom');
+  assert.equal(customOptions?.userAgent, 'OmniKit-Core/2.0 Custom');
+});
+
+test('image compressor downloaders read userAgent from services.userAgent instead of private config', async () => {
+  const singleAction = await readFile(new URL('../src/features/image-compressor/SingleImageAction.ts', import.meta.url), 'utf8');
+  const watcher = await readFile(new URL('../src/features/image-compressor/RemoteImageWatcher.ts', import.meta.url), 'utf8');
+  const servicesCode = await readFile(new URL('../src/features/image-compressor/createImageServices.ts', import.meta.url), 'utf8');
+
+  assert.doesNotMatch(singleAction, /config\.remote\.downloadUserAgent/);
+  assert.match(singleAction, /userAgent:\s*services\.userAgent\(\)/);
+
+  assert.doesNotMatch(watcher, /config\.remote\.downloadUserAgent/);
+  assert.match(watcher, /userAgent:\s*services\.userAgent\(\)/);
+
+  assert.match(servicesCode, /userAgent:\s*\(\)\s*=>\s*context\.settings\.getUserAgent\(\)/);
 });

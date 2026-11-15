@@ -26,6 +26,7 @@ export interface ImageProcessingServices {
   origin: string;
   mobile: boolean;
   desktopFiles: boolean;
+  userAgent: () => string;
   config(): ImageConfig;
 }
 
@@ -55,7 +56,7 @@ export async function prepareImage(
     maxBytes: config.compression.maxInputBytes,
     timeoutMs: 30_000,
     signal,
-    userAgent: config.remote.downloadUserAgent,
+    userAgent: services.userAgent(),
     ...(providedFile ? { providedFiles: new Map([[source.key, providedFile]]) } : {}),
   };
   if (source.kind !== "asset") throw new Error("Remote images must be localized before compression");

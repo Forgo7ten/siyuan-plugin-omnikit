@@ -74,7 +74,7 @@ flowchart TD
 ### 3.2 远程下载网络规范
 - **协议支持**：仅支持 `http://` 与 `https://` 协议；
 - **系统网络栈与代理支持**：桌面端直接按 URL 发起请求，遵循宿主系统的代理与网络栈设置（兼容 Fake-IP 等常见代理模式），插件层不进行额外的 DNS 过滤或 IP 阻断；
-- **User-Agent 配置**：桌面端支持在设置中自定义下载使用的 `User-Agent`（默认空值，使用系统默认 UA），便于兼容部分有防盗链或 UA 校验的图床服务；非桌面端自动忽略该选项；
+- **Core 平台 User-Agent 统一下沉复用**：远程外链图片下载直接复用 Core 平台配置 `omnikit-core.json` 中的 `general.userAgent` 进行请求头伪装（留空则默认回退使用现代 Chrome 浏览器 User-Agent 兜底），便于兼容具备防盗链或 UA 校验的图床服务；图片压缩特性不再维护专属的 UA 配置项；
 - **请求边界**：单次下载超时为 30 秒，最大响应体体积限制为 32 MiB；自动跟随重定向（最多 3 次）；请求不附带思源身份凭证或 Cookie。
 
 ---
@@ -371,9 +371,6 @@ sequenceDiagram
     "manualMaxEdge": 4096,
     "excludedExtensions": ["gif", "svg", "webp"]
   },
-  "remote": {
-    "downloadUserAgent": ""
-  },
   "metadata": {
     "preserveExif": false
   }
@@ -382,13 +379,12 @@ sequenceDiagram
 
 | 配置字段 | 类型 | 默认值 | 约束与说明 |
 |---|---|---|---|
-| `schemaVersion` | number | `1` | 配置结构版本 |
+| `schemaVersion` | number | `1` | 配置结构版本（保持版本 1，不升版） |
 | `auto.globalEnabled` | boolean | `false` | 全局自动压缩开关（默认关闭） |
 | `auto.pageAllowlist` | object | `{}` | 精确文档 `rootID` 白名单映射表 |
 | `compression.initialQuality` | number | `0.8` | 默认 WebP 压缩质量，范围 `0.01` ~ `1.0` |
 | `compression.manualMaxEdge` | number | `4096` | 手动压缩时的最大等比长边限制 (px)，范围 `256` ~ `8192` |
 | `compression.excludedExtensions` | string[] | `["gif", "svg", "webp"]` | 保护排除的扩展名列表 |
-| `remote.downloadUserAgent` | string | `""` | 桌面端外链图片下载自定义 UA；为空时采用系统默认 UA |
 | `metadata.preserveExif` | boolean | `false` | 保留 EXIF 元数据（未支持时在设置界面禁用置灰） |
 
 ### 9.2 设置面板展示与操作规范
@@ -398,7 +394,9 @@ sequenceDiagram
      - **主标题（加粗）**：展示包含笔记本全名的完整层级路径（格式：`笔记本名/父文档/文档名`）；若内核返回为空或文档已删除，主标题回退展示 `rootID`；
      - **副标题 / 描述**：展示文档精确 ID（`rootID`），便于高级排查；
    - 每个条目右侧提供“移出白名单”快捷删除按钮。
-2. **特性重置按钮文案规范**：
+2. **全局 User-Agent 统一收口与面板精简**：
+   - 特性设置面板不设立任何“下载 User-Agent”输入项，彻底消除与 Core 平台设置的冗余配置；外链图片下载统一使用 Core 平台配置的全局 User-Agent。
+3. **特性重置按钮文案规范**：
    - 设置卡片右上角的重置操作按钮文案统一为**“重置为默认设置”**。
 
 ---

@@ -135,7 +135,7 @@ export async function compressSelectedImageCustom(
             maxBytes: source.kind === "remote" ? Math.min(config.compression.maxInputBytes, 32 * 1024 * 1024) : config.compression.maxInputBytes,
             timeoutMs: 30_000,
             signal: previewAbort.signal,
-            userAgent: config.remote.downloadUserAgent,
+            userAgent: services.userAgent(),
           });
           if (source.kind === "remote") await assertImagePayload(original.blob);
           previewOriginal = original;
@@ -192,7 +192,7 @@ async function localizeRemoteOccurrence(
     maxBytes: Math.min(config.compression.maxInputBytes, 32 * 1024 * 1024),
     timeoutMs: 30_000,
     signal,
-    userAgent: config.remote.downloadUserAgent,
+    userAgent: services.userAgent(),
   });
   await assertImagePayload(original.blob);
   const file = new File([original.blob], safeFileName(original.name), { type: original.blob.type });
