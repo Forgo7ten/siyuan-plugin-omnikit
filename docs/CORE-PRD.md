@@ -467,3 +467,23 @@ Core 平台在思源主工作区状态栏区域提供通用的轻量任务进度
 | `titled-link` | 自动标题链接 | 全端通用 (`all`) | [features/titled-link.md](features/titled-link.md) | 开启 (`true`) | 针对思源行内超链接异步获取并填充网页标题，支持非网页文件免抓取、单链右键菜单与块级批量提取，具备双轨网络、流式截断、万国码嗅探与并发冲突保护 |
 
 *(后续新增 Feature 需在完成需求规范编写与冻结后，补充更新至本索引表)*
+
+---
+
+## 8. 工程化发版与版本规范 (Engineering Release & Versioning Specification)
+
+### 8.1 插件版本权威源与双清单一致性
+- **单一版本权威源**：思源笔记插件生态将 `plugin.json` 中的 `version` 作为识别插件元数据与集市版本的唯一官方权威源；
+- **开发清单同步**：`package.json` 中的 `version` 保持原子同步一致，确保 Node.js/pnpm 工具链与思源宿主元数据强一致；
+- **语义化版本规范**：版本号严格采用标准三段式 `X.Y.Z` 语义化版本（SemVer），无多余前缀或预发布后缀。
+
+### 8.2 双入口自动化发版契约
+- **多入口触发模型**：发版工作流支持本地推送 `v*` Tag 自动触发与 GitHub Actions 页面 `workflow_dispatch` 手动一键发版；
+- **免参数手动发版**：手动发版页面免输入版本号，流水线自动从 `plugin.json` 提取版本并生成对应发布标签；
+- **发版质量门禁**：发版必须经过版本强一致性核验、`pnpm check`（TypeScript 严格模式与 Svelte 5 检查）、`pnpm test`（全量自动化测试）、`pnpm build:app`、`pnpm package:verify`（产物包静态结构校验）及压缩完整性核验；
+- **防递归死循环设计**：手动发版使用内置 `GITHUB_TOKEN` 调用 API 创建 Tag 与 Release，依托平台安全机制天然阻断 `push.tags` 递归触发。
+
+### 8.3 依赖安全与监控自动化
+- 通过 `.github/dependabot.yml` 实施 `npm` 与 `github-actions` 双生态月度监控；
+- `npm` 依赖升级遵循 `lockfile-only` 策略，仅更新锁文件，保全项目声明依赖范围；
+- Actions 核心大版本防御，自动化生成分组 PR 提升审查效率。

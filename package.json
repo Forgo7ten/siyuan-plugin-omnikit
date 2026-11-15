@@ -12,9 +12,12 @@
     "build": "pnpm check && pnpm test && pnpm build:app",
     "build:app": "pnpm render:icons && cross-env NODE_ENV=production vite build",
     "build:fast": "pnpm build:app",
-    "render:icons": "node tools/render-icons.mjs",
-    "install:workspace": "pnpm build && node tools/install-workspace.mjs",
-    "package:verify": "node scripts/verify-package.mjs"
+    "render:icons": "node scripts/build/render-icons.mjs",
+    "install:workspace": "pnpm build && node scripts/dev/install-workspace.mjs",
+    "package:verify": "node scripts/release/verify-package.mjs",
+    "clean": "node scripts/clean.mjs",
+    "version:bump": "node scripts/release/update-version.mjs",
+    "release": "node scripts/release/release.mjs"
   },
   "keywords": [
     "siyuan",

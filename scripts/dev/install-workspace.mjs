@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const pluginName = "siyuan-plugin-omnikit";
 const scriptPath = fileURLToPath(import.meta.url);
-const sourceDir = path.resolve(path.dirname(scriptPath), "../dist");
+const sourceDir = path.resolve(path.dirname(scriptPath), "../../dist");
 const requiredFiles = [
   "plugin.json",
   "index.js",

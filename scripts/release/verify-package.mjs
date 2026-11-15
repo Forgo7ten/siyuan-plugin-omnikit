@@ -1,5 +1,10 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import assert from "node:assert/strict";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const resolveRoot = (...segments) => path.join(root, ...segments);
 
 const required = [
   "dist/index.js", "dist/index.css", "dist/plugin.json",
@@ -8,30 +13,31 @@ const required = [
   "dist/browser-image-compression.js", "dist/icon.png",
   "dist/assets/omnikit-menu.svg", "dist/assets/omnikit-plugin.svg", "package.zip",
 ];
-for (const path of required) {
-  assert.ok(existsSync(path), `Missing build artifact: ${path}`);
-  assert.ok(statSync(path).size > 0, `Empty build artifact: ${path}`);
+for (const relPath of required) {
+  const fullPath = resolveRoot(relPath);
+  assert.ok(existsSync(fullPath), `Missing build artifact: ${relPath}`);
+  assert.ok(statSync(fullPath).size > 0, `Empty build artifact: ${relPath}`);
 }
-assert.ok(!existsSync("icon.png"), "icon.png is generated only as a build artifact");
-const icon = readFileSync("dist/icon.png");
+assert.ok(!existsSync(resolveRoot("icon.png")), "icon.png is generated only as a build artifact");
+const icon = readFileSync(resolveRoot("dist/icon.png"));
 assert.deepEqual(icon.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
 assert.equal(icon.readUInt32BE(16), 160, "marketplace icon width");
 assert.equal(icon.readUInt32BE(20), 160, "marketplace icon height");
 assert.ok(icon.byteLength <= 64 * 1024, "marketplace icon must be at most 64 KiB");
 for (const readme of ["README.md", "README.zh-CN.md"]) {
-  assert.match(readFileSync(readme, "utf8"), /assets\/omnikit-plugin\.svg/);
+  assert.match(readFileSync(resolveRoot(readme), "utf8"), /assets\/omnikit-plugin\.svg/);
 }
-const pkg = JSON.parse(readFileSync("package.json", "utf8"));
-const manifest = JSON.parse(readFileSync("dist/plugin.json", "utf8"));
+const pkg = JSON.parse(readFileSync(resolveRoot("package.json"), "utf8"));
+const manifest = JSON.parse(readFileSync(resolveRoot("dist/plugin.json"), "utf8"));
 assert.equal(manifest.name, "siyuan-plugin-omnikit");
 assert.equal(pkg.version, manifest.version);
 assert.equal(manifest.minAppVersion, "3.8.0");
 for (const locale of ["en", "zh-CN"]) {
-  JSON.parse(readFileSync(`dist/i18n/${locale}.json`, "utf8"));
+  JSON.parse(readFileSync(resolveRoot(`dist/i18n/${locale}.json`), "utf8"));
 }
 
 // Inspect ZIP central-directory names without an additional runtime dependency.
-const archive = readFileSync("package.zip");
+const archive = readFileSync(resolveRoot("package.zip"));
 let eocd = -1;
 for (let offset = Math.max(0, archive.length - 22 - 0xffff); offset <= archive.length - 22; offset++) {
   if (archive.readUInt32LE(offset) === 0x06054b50) eocd = offset;
@@ -48,13 +54,13 @@ for (let index = 0; index < entryCount; index++) {
   zipEntries.push(archive.toString("utf8", cursor + 46, cursor + 46 + nameLength));
   cursor += 46 + nameLength + extraLength + commentLength;
 }
-for (const path of [
+for (const entry of [
   "index.js", "index.css", "plugin.json", "i18n/en.json", "i18n/zh-CN.json",
   "browser-image-compression.js", "icon.png",
   "assets/omnikit-menu.svg", "assets/omnikit-plugin.svg",
 ]) {
-  assert.ok(zipEntries.includes(path), `Missing package.zip entry: ${path}`);
+  assert.ok(zipEntries.includes(entry), `Missing package.zip entry: ${entry}`);
 }
 assert.ok(!zipEntries.includes("kernel.js"), "package.zip must not contain the legacy kernel bundle");
-assert.ok(!zipEntries.some(path => path.startsWith("node_modules/")), "package.zip must not contain node_modules");
+assert.ok(!zipEntries.some(entry => entry.startsWith("node_modules/")), "package.zip must not contain node_modules");
 console.log("OmniKit Vite build package structure verified (not an in-app runtime test)");

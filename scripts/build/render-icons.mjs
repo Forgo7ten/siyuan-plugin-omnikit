@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Resvg } from "@resvg/resvg-js";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const input = path.join(root, "assets", "omnikit-plugin.svg");
 const outputDir = path.join(root, ".generated");
 const output = path.join(outputDir, "icon.png");

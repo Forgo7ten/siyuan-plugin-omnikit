@@ -22,7 +22,8 @@ OmniKit 是基于现代前端与思源笔记插件生态构建的高效、高可
 1. **微内核与单向依赖**：Core 平台层不感知具体 Feature 的内部实现，所有功能通过元数据驱动注入；
 2. **多实例与环境防护**：针对思源独立设置窗口（`body--settings`）进行无副作用纯渲染隔离；
 3. **确定性存储体系**：单文件 Promise 排队、30秒超时拦截、损坏备份恢复与配置/数据物理隔离；
-4. **防御性块级改写**：写前基于 `OccurrenceTarget` 进行精确节点读回核验、采用进程内写租约（Write Lease）与持久化前置闸门。
+4. **防御性块级改写**：写前基于 `OccurrenceTarget` 进行精确节点读回核验、采用进程内写租约（Write Lease）与持久化前置闸门；
+5. **可重现与确定性工程体系**：统一工程脚本体系、全自动化质量门禁与多入口幂等发版闭环。
 
 ---
 
@@ -662,7 +663,7 @@ sequenceDiagram
 4. **国际化补充**：在 `src/i18n/zh-CN.json` 和 `src/i18n/en.json` 添加对应的特性标题、描述及业务文案；
 5. **保持 Core Schema 独立**：新特性的专属配置项保存在特性独立配置文件中，不写入 `omnikit-core.json`。
 
-### 6.2 技术契约自查清单 (Contract Checklist)
+### 6.2 Feature 扩展技术契约自查清单 (Feature Checklist)
 - [ ] Feature 是否纯粹面向 `BaseFeature` 和 `FeatureContext` 编程？
 - [ ] 是否不存在任何跨 Feature 的直接代码引用（`import`）？
 - [ ] 是否按需声明了平台兼容性列表 `frontends`（5+1 取值集合，缺失或空数组时默认为全端支持）？在不受支持的环境下是否平稳保持在 `unsupported` 状态，不挂载任何资源与菜单，且不破坏跨端云同步中的启用偏好？
@@ -684,3 +685,384 @@ sequenceDiagram
 - [ ] 是否未调用任何主动删除原图或压缩图资产的 API？
 - [ ] 块改写是否基于 `OccurrenceTarget` 精确节点核验而非整块字符串比对？
 - [ ] 单图操作作用域是否严格限定为选中的单处引用？
+
+---
+
+## 7. 工程化脚本体系与构建工具链
+
+OmniKit 的工程化工具链统一人性化收敛在 `scripts/` 目录体系中，各脚本遵循单一职责原则（Single Responsibility Principle）与高可靠防御性设计，支撑从本地开发、静态校验到发布归档的全生命周期。
+
+### 7.1 统一脚本目录架构与分工
+
+项目工程脚本收敛于如下规范化目录拓扑，工程根目录下不设立零散或非标准的辅助工具目录：
+
+```text
+scripts/
+├── build/
+│   └── render-icons.mjs       # 多端与市场高精图标渲染
+├── dev/
+│   └── install-workspace.mjs  # 开发态向思源工作区安全安装与原子备份恢复
+├── release/
+│   ├── read-version.sh        # CI 手动发版从 plugin.json 提取版本并校验 X.Y.Z 语义化
+│   ├── reconcile-tag.sh       # 处理已有同名 Tag 与 GitHub Release 的状态协调
+│   ├── update-version.mjs     # plugin.json 与 package.json 双文件原子同步版本升级工具
+│   ├── verify-package.mjs     # 产物包清单、版本强一致与入口静态校验
+│   └── release.mjs            # 本地发版准备与校验工作流入口（对应 pnpm release）
+└── clean.mjs                  # 产物清理工具（对应 pnpm clean）
+```
+
+#### 脚本职责与执行契约
+
+| 脚本路径 | 对应 NPM 指令 | 运行环境与触发时机 | 核心技术职责 |
+|---|---|---|---|
+| `scripts/build/render-icons.mjs` | `pnpm render:icons` | 本地构建与 CI 构建 (`dev`, `build:app`) 前置 | 基于 `@resvg/resvg-js` 从 `assets/omnikit-plugin.svg` 渲染 $160 \times 160$ 像素 PNG 图标至 `.generated/icon.png`，核验文件体积 $\le 64\text{ KiB}$ |
+| `scripts/dev/install-workspace.mjs` | `pnpm install:workspace` | 本地开发调试（需传入工作区路径参数） | 向指定思源工作区 `data/plugins/siyuan-plugin-omnikit` 安全安装插件产物，执行路径逃逸防御、目标清单完整性核验、临时暂存部署与原子备份回滚 |
+| `scripts/release/read-version.sh` | CI 内部调用 | GitHub Actions 手动发布（`workflow_dispatch`）前置 | 校验触发分支为默认分支（`main`），使用 `jq` 从 `plugin.json` 提取版本号，严格核验 SemVer `X.Y.Z` 规范，输出 `release_tag=v${version}` 至 `$GITHUB_OUTPUT` |
+| `scripts/release/reconcile-tag.sh` | CI 内部调用 | GitHub Actions 手动发布产物构建与检验通过后 | 基于 GitHub REST API 查询目标 Tag 与 Release 状态，递归解析 Annotated Tag，依据状态矩阵执行 Tag 复用、幂等终止或旧提交覆盖清理 |
+| `scripts/release/update-version.mjs` | `pnpm version:update <X.Y.Z>` | 本地版本升级维护 | 校验输入版本号符合 `X.Y.Z`，原子化同步读写更新 `plugin.json` 与 `package.json` 中的 `version` 字段，确保两份清单完全一致并符合 JSON 格式 |
+| `scripts/release/verify-package.mjs` | `pnpm package:verify` | 本地测试与 CI 门禁构建后 | 静态校验 `dist/` 物理产物清单完整性、集市图标规范、文档引用有效性、双清单版本一致性、`minAppVersion` 字段以及原生解析 `package.zip` Central Directory 校验条目与排除项（严禁包含 `kernel.js` 和 `node_modules/`） |
+| `scripts/release/release.mjs` | `pnpm release` | 本地发版准备流水线 | 本地自动化发版入口，闭环执行版本递增确认、类型检查（`pnpm check`）、全量单元测试（`pnpm test`）、生产构建（`pnpm build:app`）、包验证（`pnpm package:verify`）与解包测试，并在完成后输出标准 Git 提交与 Tag 推送指引 |
+| `scripts/clean.mjs` | `pnpm clean` | 本地维护与构建重置 | 跨平台递归清理 `dist/`、`.generated/`、`package.zip` 等所有本地构建生成的临时目录与打包产物，使工作区恢复纯净基线 |
+
+#### NPM 脚本映射契约
+
+在 `package.json` 中，工程命令与底层脚本保持一一对应的确定性契约绑定：
+
+- `pnpm dev`：执行 `pnpm render:icons` 后启动 Vite 监听构建（开发模式）；
+- `pnpm check`：执行 `tsc --noEmit -p tsconfig.omnikit.json` 与 `svelte-check --tsconfig ./tsconfig.omnikit.json`；
+- `pnpm test`：通过 Node.js 原生 Test Runner（`--experimental-transform-types`）执行 `tests/**/*.test.mjs` 全量单元测试；
+- `pnpm build`：串行执行 `pnpm check && pnpm test && pnpm build:app` 完整构建流水线；
+- `pnpm build:app`：执行 `pnpm render:icons` 后调用生产级 Vite 构建输出 `dist/` 与 `package.zip`；
+- `pnpm render:icons`：调用 `node scripts/build/render-icons.mjs`；
+- `pnpm install:workspace`：调用 `pnpm build && node scripts/dev/install-workspace.mjs`；
+- `pnpm package:verify`：调用 `node scripts/release/verify-package.mjs`；
+- `pnpm release`：调用 `node scripts/release/release.mjs`；
+- `pnpm clean`：调用 `node scripts/clean.mjs`。
+
+### 7.2 核心构建与工具链实现契约
+
+#### 1. 多端与市场高精图标渲染规范 (`scripts/build/render-icons.mjs`)
+- **渲染引擎与入参**：基于 `@resvg/resvg-js` 高性能 Rust 原生 SVG 渲染引擎，输入源文件为 `assets/omnikit-plugin.svg`；
+- **输出隔离**：渲染结果输出至 `.generated/icon.png` 临时构建目录，仓库根目录下不留存或追踪静态 `icon.png`；
+- **渲染配置**：
+  - `fitTo: { mode: "width", value: 160 }`：生成符合思源笔记集市标准规范的 $160 \times 160$ 像素 PNG 图标；
+  - `font: { loadSystemFonts: false }`：禁用系统字体探测，确保在不同 OS 构建环境（Linux CI、macOS、Windows）下的渲染结果具备二进制级别的幂等稳定性；
+- **双重断言门禁**：
+  - 几何尺寸核验：渲染宽度与高度必须精确等于 160 像素，否则直接抛出异常；
+  - 体积门禁：产物大小必须严格 $\le 64\text{ KiB}$，杜绝超大图标阻塞思源集市加载；
+- **打包集成**：由 Vite 构建配置通过 `vite-plugin-static-copy` 将 `.generated/icon.png` 复制归档为 `dist/icon.png`。
+
+#### 2. 开发态工作区安全安装与原子备份回滚 (`scripts/dev/install-workspace.mjs`)
+- **真实物理路径与防逃逸核验**：
+  - 调用 `requireRealDirectory` 严格验证用户传入的思源工作区路径为物理真实目录；
+  - 严禁目标路径为软链接（`isSymbolicLink()` 立即拒绝）；
+  - 递归核验内部关键子目录：`conf/`、`data/`、`data/.siyuan/` 与 `data/plugins/` 必须真实存在；
+  - 解析工作区规范化路径（`realpath`），严格检查相对路径，杜绝向上逃逸出工作区根目录；
+- **目标插件目录所有权防御**：
+  - 若目标目录 `data/plugins/siyuan-plugin-omnikit` 已存在，必须读取其内部的 `plugin.json`；
+  - 严格校验其 `name` 属性必须精确等于 `"siyuan-plugin-omnikit"`；若不匹配，坚决拒绝覆盖并报错退出，防止因路径误配损坏其他第三方插件；
+- **待部署构建产物完整性前置核验**：
+  - 在执行任何写入前，校验 `dist/` 下必须完整包含：`plugin.json`、`index.js`、`index.css`、`icon.png`、`README.md`、`README.zh-CN.md`、`browser-image-compression.js`、`assets/`、`i18n/`；
+- **两阶段暂存部署与原子备份恢复**：
+  1. 生成包含高精度时间戳与 UUID 的专属暂存目录 `.${pluginName}.install-${Date.now()}-${uuid}`；
+  2. 将产物文件及资源目录完整写入暂存目录；
+  3. 若目标目录已存在旧版本，将其重命名为 `${pluginName}.backup-${Date.now()}-${uuid}` 完整保留作为容灾备份；
+  4. 将暂存目录原子重命名为正式插件目录名 `${pluginName}`；
+  5. **异常容灾保障**：若重命名或文件写入中途遭遇任何异常，捕获错误后立即清理暂存目录，并将备份目录重命名恢复为正式插件目录，确保思源工作区绝不处于半安装、损坏或空目录状态。
+
+#### 3. 双清单版本原子同步规范 (`scripts/release/update-version.mjs`)
+- **语义化版本严格核验**：使用正则表达式 `^[0-9]+\.[0-9]+\.[0-9]+$` 校验目标版本号，必须为标准的三段式 `X.Y.Z` 格式，拒绝带有非规范前缀或预发布后缀的输入；
+- **原子同步写入**：
+  - 同步读取 `plugin.json` 与 `package.json`；
+  - 同步更新两份清单中的 `version` 属性；
+  - 以标准 2 空格缩进格式化序列化并追加末尾换行符写入磁盘；
+  - 写后读回重新解析校验 JSON 语法完整性，确保两份清单始终保持完全一致。
+
+#### 4. 产物包结构静态核验规范 (`scripts/release/verify-package.mjs`)
+- **双清单版本强一致校验**：`package.json.version === dist/plugin.json.version`；
+- **思源内核最低版本约束**：`dist/plugin.json.minAppVersion === "3.8.0"`；
+- **物理产物存在性与非空校验**：
+  - 核验必须文件：`dist/index.js`、`dist/index.css`、`dist/plugin.json`、`dist/README.md`、`dist/README.zh-CN.md`、`dist/i18n/en.json`、`dist/i18n/zh-CN.json`、`dist/browser-image-compression.js`、`dist/icon.png`、`dist/assets/omnikit-menu.svg`、`dist/assets/omnikit-plugin.svg` 及 `package.zip` 全部存在且大小 $> 0$；
+  - 仓库根目录防御：断言根目录下严禁散落未管理的 `icon.png`；
+- **PNG 标头与集市规格深度核验**：
+  - 读取 `dist/icon.png` 二进制数据，比对前 8 字节 PNG 魔数标头 `[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]`；
+  - 读取 IHDR 块第 16~23 字节，核验宽度与高度均为 160 像素；
+  - 核验字节大小 $\le 64\text{ KiB}$；
+- **文档静态资源链接完整性**：校验 `README.md` 与 `README.zh-CN.md` 正文中明确引用 `assets/omnikit-plugin.svg`；
+- **国际化语法解析校验**：校验 `dist/i18n/en.json` 与 `dist/i18n/zh-CN.json` 能够被合法解析为标准 JSON 对象；
+- **零依赖原生 ZIP Central Directory 静态审查**：
+  - 避免引入外部依赖，直接从 `package.zip` 尾部定位 End of Central Directory (EOCD) 标头 `0x06054b50`；
+  - 解析 Central Directory 偏移与条目总数，逐条遍历 Central Directory Header `0x02014b50` 提取所有分发文件条目路径；
+  - 必须包含所有必要分发文件条目：`index.js`、`index.css`、`plugin.json`、`i18n/en.json`、`i18n/zh-CN.json`、`browser-image-compression.js`、`icon.png`、`assets/omnikit-menu.svg`、`assets/omnikit-plugin.svg`；
+  - **安全排除红线**：断言 ZIP 包内**绝对严禁包含 `kernel.js`**，**绝对严禁包含 `node_modules/` 下的任何文件**。
+
+#### 5. 本地发版闭环工作流 (`scripts/release/release.mjs`) 与产物清理 (`scripts/clean.mjs`)
+- **发版闭环工作流 (`release.mjs`)**：
+  - 协调本地完整的发版准备工作；
+  - 串行执行全套质量流水线：版本一致性检查、`pnpm check`（类型与 Svelte 检查）、`pnpm test`（全量单元测试）、`pnpm build:app`（生产打包）、`pnpm package:verify`（包静态校验）与 `unzip -t package.zip`（压缩包解压测试）；
+  - 全量门禁通过后，向控制台输出标准的 Git 提交与 Tag 推送指引，实现本地发版准备的确定性闭环；
+- **产物清理工具 (`clean.mjs`)**：
+  - 跨平台安全清理 `dist/`、`.generated/`、`package.zip` 以及测试与构建临时文件，使工作区恢复干净基线。
+
+---
+
+## 8. CI/CD 与多入口自动化发版架构规范
+
+OmniKit 构建并维护高可靠、自动化的 CI/CD 体系，通过 `.github/workflows/ci.yml` 守护日常代码提交质量，通过 `.github/workflows/release.yml` 实现多入口、幂等且具备防递归安全机制的自动化发版。
+
+### 8.1 双触发模型与发布架构拓扑
+
+发版工作流同时支持“本地推送 Tag”与“GitHub Actions 界面手动一键发版”双入口，两套入口共享完全一致的构建与质量门禁流水线：
+
+```mermaid
+flowchart TD
+    subgraph Trigger["发版触发入口 (Release Triggers)"]
+        TagPush["本地推送 Tag<br/>(git push origin vX.Y.Z)"]
+        ManualDispatch["GitHub Actions 手动一键发版<br/>(workflow_dispatch / 无输入参数)"]
+    end
+
+    subgraph VersionResolution["版本解析与权威源确定"]
+        CheckBranch["默认分支核验 (ref_name == default_branch)"]
+        ExtractVersion["scripts/release/read-version.sh<br/>读取 plugin.json.version 并校验 X.Y.Z"]
+        ResolvedTag["确定 RELEASE_TAG (vX.Y.Z)"]
+    end
+
+    subgraph QualityGate["全流程质量防护门禁 (Quality Gate Pipeline)"]
+        EnvSetup["Node 24 + pnpm 11.4.0 锁定环境"]
+        FrozenInstall["pnpm install --frozen-lockfile"]
+        VersionCheck["三方版本一致性强校验<br/>RELEASE_TAG == package.json == plugin.json"]
+        TypeCheck["pnpm check (TypeScript & Svelte 5)"]
+        UnitTests["pnpm test (全量单元测试)"]
+        BuildApp["pnpm build:app (图标渲染与生产打包)"]
+        VerifyPkg["pnpm package:verify (清单/图标/ZIP结构静态校验)"]
+        ZipTest["unzip -t package.zip (压缩完整性测试)"]
+    end
+
+    subgraph ReconcileTag["Tag 与 Release 状态协调 (reconcile-tag.sh)"]
+        QueryState["GitHub REST API 查询同名 Tag 与 Release"]
+        ResolveCommit["解析 Annotated Tag 获得目标 commit SHA"]
+        DecideAction{"状态转移判定"}
+        ReuseTag["复用现有 Tag"]
+        AbortDup["幂等拦截: 已存在且指向当前提交，终止发布"]
+        DeleteOld["删除指向旧提交的旧 Release 与旧 Tag"]
+    end
+
+    subgraph PublishStage["正式发布与产物归档 (Publish Stage)"]
+        GhRelease["gh release create (使用 GITHUB_TOKEN)<br/>天然防递归二次触发"]
+        NcipolloAction["ncipollo/release-action<br/>发布 Release 与 package.zip"]
+        Finish["发布完成: OmniKit vX.Y.Z (包含 package.zip)"]
+    end
+
+    TagPush -->|push.tags 触发| QualityGate
+    ManualDispatch -->|workflow_dispatch 触发| CheckBranch
+    CheckBranch --> ExtractVersion
+    ExtractVersion --> ResolvedTag
+    ResolvedTag --> QualityGate
+
+    QualityGate --> EnvSetup
+    EnvSetup --> FrozenInstall
+    FrozenInstall --> VersionCheck
+    VersionCheck --> TypeCheck
+    TypeCheck --> UnitTests
+    UnitTests --> BuildApp
+    BuildApp --> VerifyPkg
+    VerifyPkg --> ZipTest
+
+    ZipTest -->|workflow_dispatch 分支| ReconcileTag
+    ZipTest -->|push.tags 分支| NcipolloAction
+
+    ReconcileTag --> QueryState
+    QueryState --> ResolveCommit
+    ResolveCommit --> DecideAction
+    DecideAction -->|未发布且指向当前提交| ReuseTag
+    DecideAction -->|已发布且指向当前提交| AbortDup
+    DecideAction -->|指向旧提交| DeleteOld
+    DecideAction -->|Tag与Release均不存在| GhRelease
+
+    ReuseTag --> GhRelease
+    DeleteOld --> GhRelease
+
+    GhRelease --> Finish
+    NcipolloAction --> Finish
+```
+
+### 8.2 单一版本权威源与默认分支保护
+
+- **单一版本权威源**：
+  - 思源笔记生态将 `plugin.json` 作为识别插件元数据与版本的唯一官方契约；
+  - 手动一键发版时，工作流不设立任何外部手动输入参数框，统一由 `scripts/release/read-version.sh` 从 `plugin.json` 中的 `version` 提取；
+  - 自动生成的发布标签固定为 `v${plugin.json.version}`；
+- **默认分支保护原则**：
+  - `read-version.sh` 严格校验 `SELECTED_REF === DEFAULT_BRANCH`（通常为 `main`）；
+  - 严禁从临时特性分支、开发分支手动触发正式发布流水线，确保发布的代码必然归属于主干分支；
+- **语义化版本约束**：
+  - 提取的版本号必须严格匹配 `^[0-9]+\.[0-9]+\.[0-9]+$` 格式；
+  - 若包含非标准后缀或格式不合规，脚本立即报错并终止流水线。
+
+### 8.3 全流程质量防护门禁 (Quality Gate Pipeline)
+
+无论通过何种入口触发，所有发版任务必须依次通过以下 8 道刚性质量防护门禁，任一步骤失败立即阻断发布：
+
+1. **确定性运行时与包管理器装配**：
+   - 锁定 Node.js 运行时版本：Node 24（启用 pnpm 缓存）；
+   - 锁定 pnpm 包管理器版本：pnpm 11.4.0；
+2. **锁文件冻结安装**：
+   - 执行 `pnpm install --frozen-lockfile`，确保依赖树与 `pnpm-lock.yaml` 绝对一致，杜绝依赖漂移；
+3. **三方版本一致性强校验**：
+   - 校验当前发布目标 Tag 与两份清单中的版本号完全一致：
+     ```bash
+     RELEASE_TAG="${steps.version.outputs.release_tag || github.ref_name}"
+     test "${RELEASE_TAG#v}" = "$(node -p "require('./package.json').version")"
+     test "${RELEASE_TAG#v}" = "$(node -p "require('./plugin.json').version")"
+     ```
+4. **静态类型与模板检查**：
+   - 执行 `pnpm check`（包含 TypeScript 严格类型检查 `check:types` 与 Svelte 5 模板类型检查 `check:svelte`）；
+5. **全量自动化测试**：
+   - 执行 `pnpm test`，运行 Core 平台框架、存储系统、生命周期及所有 Feature 的全量单元测试与契约测试；
+6. **生产环境完整构建**：
+   - 执行 `pnpm build:app`，包含图标渲染与 Vite 生产打包，输出 `dist/` 目录与 `package.zip` 归档包；
+7. **产物包清单与静态结构校验**：
+   - 执行 `pnpm package:verify`，全面校验文件清单、双版本一致性、集市图标规范以及 `package.zip` 内置 Central Directory 条目完整性与黑名单（无 `kernel.js`、无 `node_modules/`）；
+8. **压缩包完整性解包测试**：
+   - 执行 `unzip -t package.zip`，底层校验 ZIP 压缩包的 CRC32 与物理完整性。
+
+### 8.4 Tag 与 Release 状态协调矩阵 (`reconcile-tag.sh`)
+
+在手动发版流程中，`reconcile-tag.sh` **严格位于产物构建与所有质量门禁全部通过之后**执行，确保构建失败时绝不提前对远端 Tag 或 Release 产生破坏性副作用。
+
+脚本通过 GitHub REST API 递归解析 Annotated Tag 至 commit SHA，并依据状态矩阵执行协调处理：
+
+| Git Tag 状态 | GitHub Release 状态 | 处理动作与策略 | 核心设计意图 |
+|---|---|---|---|
+| 不存在 | 不存在 | 放行后续流程，创建新 Tag 与 Release | 正常首次发版全新版本 |
+| 指向当前提交 (`GITHUB_SHA`) | 不存在 | 复用现有 Tag，放行后续创建 Release | Tag 已在本地打好但尚未创建 Release |
+| 指向当前提交 (`GITHUB_SHA`) | 已存在 | 终止发布，报错提示已发布 | **幂等设防**：杜绝重复触发导致已发布产物被意外覆盖 |
+| 指向历史旧提交 | 已存在 | 调用 `gh release delete "${RELEASE_TAG}" --cleanup-tag --yes` 删除旧 Release 与旧 Tag，重新指向当前提交 | 修正发版提交，确保产物与 Tag 严格绑定当前构建 commit |
+| 指向历史旧提交 | 不存在 | 调用 GitHub API `DELETE repos/.../git/refs/tags/${RELEASE_TAG}` 删除旧 Tag，重新指向当前提交 | 清除指向过时提交的孤立 Tag |
+| 不存在 | 已存在 | 终止发布，报错提示状态异常 | 异常状态设防拦截 |
+
+### 8.5 防递归死循环机制与并发安全防护
+
+#### 1. `GITHUB_TOKEN` 防递归天然安全原理
+- 在手动发版阶段，工作流通过 GitHub CLI 执行发布操作：
+  ```bash
+  gh release create "${RELEASE_TAG}" package.zip \
+    --target "${GITHUB_SHA}" \
+    --title "OmniKit ${RELEASE_TAG}" \
+    --generate-notes
+  ```
+- 环境变量注入平台默认安全 Token：`GH_TOKEN: ${{ github.token }}`；
+- **防递归原理**：依据 GitHub Actions 核心平台安全契约，**由工作流内置 `GITHUB_TOKEN` 授权产生的 Git 事件（包括通过 API 创建 Tag、创建 Release 或 Push 操作），天然不会触发仓库中配置的后续工作流**；
+- 因此，工作流在手动模式下自动创建的 `v*` Tag，绝对不会二次触发 `push.tags` 分支，从根本上隔绝了递归发版死循环；
+- 避免引入高权限的 Personal Access Token（PAT）或 Deploy Keys，遵循最小特权原则保障仓库权限隔离与自闭环安全。
+
+#### 2. 发布任务并发互斥控制
+- 在 `release.yml` 工作流顶部配置并发组策略：
+  ```yaml
+  concurrency:
+    group: release
+    cancel-in-progress: false
+  ```
+- 确保全局同一时间只能执行单个发版任务，后续触发的任务在队列中等待前序任务执行完成，严禁并发执行导致 Release 覆盖或 Git Tag 竞态损坏。
+
+---
+
+## 9. 自动化依赖安全与监控规范
+
+OmniKit 通过配置 `.github/dependabot.yml` 建立生产级依赖安全与自动化维护体系，保障依赖时效性与构建环境的严格稳定性。
+
+### 9.1 双生态监控架构
+
+Dependabot 实施双生态覆盖体系，统一采用月度监控周期，在依赖安全与开发者审查开销之间取得最佳平衡：
+
+```yaml
+version: 2
+updates:
+  # 1. npm 生态：前端与构建依赖监控
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    versioning-strategy: lockfile-only
+    groups:
+      dev-dependencies:
+        patterns:
+          - "*"
+    labels:
+      - "dependencies"
+      - "automated-pr"
+
+  # 2. github-actions 生态：CI/CD 外部动作监控
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - "dependencies"
+      - "automated-pr"
+```
+
+### 9.2 `lockfile-only` 依赖锁定保护策略
+
+- **策略约束**：针对 `npm` 生态严格配置 `versioning-strategy: lockfile-only`；
+- **保护核心**：Dependabot 仅被允许更新 `pnpm-lock.yaml` 文件中的子依赖解析版本，**绝对禁止自动修改 `package.json` 中声明的主版本号与 SemVer 范围**；
+- **稳定性保障**：保全项目显式声明的依赖契约，杜绝依赖版本隐式自动上浮引发构建不一致或破坏生产稳定性。
+
+### 9.3 Actions 核心大版本防御与自动化分组
+
+- **核心 Actions 大版本防御**：
+  - 严格锁定受信官方维护的 GitHub Actions：`actions/checkout@v4`、`actions/setup-node@v4`、`pnpm/action-setup@v4` 与 `ncipollo/release-action@v1`；
+  - 仅在经过安全审查与本地回归验证后，方可升级 Actions 大版本；
+- **自动化依赖分组 (PR Grouping)**：
+  - 配置 `groups` 机制，将零散的依赖更新聚合为单一 PR：
+    - `dev-dependencies`：将开发工具链相关的更新（如 TypeScript、Vite、Svelte、Sass、Node 类型库等）汇聚为单一 PR；
+    - `actions`：将所有 GitHub Actions 依赖更新汇聚为单一 PR；
+  - 自动追加 `dependencies` 与 `automated-pr` 标签，大幅提升团队审查与自动化合并效率。
+
+---
+
+## 10. 系统全链路自查与发版验收清单
+
+在执行代码提交、特性上线或正式发版前，开发人员与 AI Agent 必须逐项对照以下清单执行全量核查：
+
+### 10.1 Feature 业务与平台契约核验
+- [ ] Feature 是否纯粹面向 `BaseFeature` 和 `FeatureContext` 编程，无跨 Feature 依赖？
+- [ ] 是否按需声明了 `frontends` 平台兼容性列表（5+1 取值集合），在不受支持的端平稳处于 `unsupported` 且不破坏云同步偏好？
+- [ ] 存储文件命名是否严格遵循 `feature-${id}-settings.json` 与 `feature-${id}-{dataname}.json`，重置设置时绝对不影响数据文件？
+- [ ] 菜单动作是否由 `MenuRegistry` 权威收口分流（顶栏自有菜单无前缀，外部上下文菜单自动补齐 `[OmniKit] ` 前缀，禁止 Feature 层硬编码）？
+- [ ] 顶栏下拉菜单中「OmniKit 设置」与下方 Feature 选项之间是否使用了 `menu.addSeparator({ id: "separator_settings" })` 原生分隔线？
+- [ ] 设置面板左侧导航分组标题是否使用国际化键 `nav.features`？
+- [ ] Dock 顶部是否具备 52px~56px 品牌 Hero 卡片区，操作区下移 50px 以上避开思源右上角 32px 浮动 Snackbar？
+- [ ] Dock 状态 Badge 是否严格采用思源原生主题 CSS 变量（无硬编码 Hex 颜色），保证深浅模式对比度？
+- [ ] 异步任务在遭遇用户按 Esc、切换标签页或 `signal.abort` 时是否判定为正常中止并静默退出？
+- [ ] `SafeBlockWriter` 中止是否显式抛出 `AbortError` 或专用取消状态，严禁混淆为 `conflict`？
+- [ ] 批量处理 0 项时是否联动销毁了任务进度模态框？
+- [ ] Dock 改写后的静默刷新是否遵循防覆盖铁律，保留操作成功统计？
+
+### 10.2 工程脚本与工具链核验
+- [ ] 所有工程脚本是否收敛于 `scripts/` 目录体系，根目录下无任何遗留的 `tools/` 目录？
+- [ ] `scripts/build/render-icons.mjs` 是否正确生成 $160 \times 160$ 像素且 $\le 64\text{ KiB}$ 的图标至 `.generated/icon.png`？
+- [ ] `scripts/dev/install-workspace.mjs` 是否实施了软链接拒绝、路径逃逸防御、目标身份校验与原子备份回滚？
+- [ ] `scripts/release/read-version.sh` 是否验证默认分支、正确读取 `plugin.json.version` 并严格校验 `X.Y.Z` 语义化格式？
+- [ ] `scripts/release/reconcile-tag.sh` 是否在门禁通过后执行，并根据状态矩阵正确处理 Tag 复用、幂等终止与旧提交覆盖？
+- [ ] `scripts/release/update-version.mjs` 是否原子化同步更新 `plugin.json` 与 `package.json` 的版本号？
+- [ ] `scripts/release/verify-package.mjs` 是否严格核验物理清单、PNG 标头、文档引用、版本一致性与 ZIP Central Directory 条目（严禁包含 `kernel.js` 和 `node_modules/`）？
+- [ ] `scripts/clean.mjs` 是否正常清理 `dist/`、`.generated/` 与 `package.zip`？
+
+### 10.3 CI/CD 与发版工作流核验
+- [ ] `.github/workflows/release.yml` 是否同时支持 `push.tags: ["v*"]` 与 `workflow_dispatch` 双入口？
+- [ ] 手动发版是否免参数输入，单一以 `plugin.json.version` 为发版权威源？
+- [ ] 发版流水线是否完整对齐 8 道质量门禁（依赖冻结安装、版本一致性、`pnpm check`、`pnpm test`、`pnpm build:app`、`pnpm package:verify`、`unzip -t`）？
+- [ ] 手动发版是否采用默认 `GITHUB_TOKEN`，天然阻断 `push.tags` 递归死循环？
+- [ ] 工作流是否声明了 `concurrency: { group: "release", cancel-in-progress: false }` 避免并发冲突？
+
+### 10.4 依赖安全与规范核验
+- [ ] `.github/dependabot.yml` 是否覆盖 `npm` 与 `github-actions` 双生态月度监控？
+- [ ] `npm` 监控策略是否严格配置为 `lockfile-only`，保全 `package.json` 声明范围？
+- [ ] Actions 依赖是否锁定官方核心大版本，并配置分组 PR？
+- [ ] 仓库内部文档与代码中是否存在本机绝对路径、用户家目录路径或凭据泄漏（严格遵守准则 5.6）？
+- [ ] 所有文档描述是否保持客观终态陈述，无任何中间态与过渡性措辞（严格遵守准则 1.3）？

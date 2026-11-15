@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { installWorkspace } from "../../tools/install-workspace.mjs";
+import { installWorkspace } from "../../scripts/dev/install-workspace.mjs";
 
 const files = [
   "plugin.json",

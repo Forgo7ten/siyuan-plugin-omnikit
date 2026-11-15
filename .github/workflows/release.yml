@@ -1,39 +1,96 @@
 name: Release OmniKit
 
 on:
+  # 保留原有 Tag 自动发布。
   push:
     tags: ["v*"]
+
+  # 新增手动发布入口。
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+# 防止两个发布任务同时操作同一个 Release。
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
         with:
           version: 11.4.0
           run_install: false
-      - uses: actions/setup-node@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
+
+      # 只有手动发布时，才从 plugin.json 读取版本。
+      - name: Read release version from plugin.json
+        id: version
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          SELECTED_REF: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: bash scripts/release/read-version.sh
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # 保留原有版本一致性检查和测试。
       - name: Validate version and test
         shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag || github.ref_name }}
         run: |
-          test "${GITHUB_REF_NAME#v}" = "$(node -p "require('./package.json').version")"
-          test "${GITHUB_REF_NAME#v}" = "$(node -p "require('./plugin.json').version")"
+          test "${RELEASE_TAG#v}" = "$(node -p "require('./package.json').version")"
+          test "${RELEASE_TAG#v}" = "$(node -p "require('./plugin.json').version")"
           pnpm check
           pnpm test
+
+      # 保留原有构建与安装包检查。
       - name: Build archive
         run: |
           pnpm build:app
           pnpm package:verify
           unzip -t package.zip
-      - uses: ncipollo/release-action@v1
+
+      # 手动发布：构建成功后处理已有 Tag / Release。
+      - name: Reconcile release tag
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        run: bash scripts/release/reconcile-tag.sh
+
+      # 手动发布：创建 Tag 和 Release，上传 package.zip。
+      - name: Publish manual release
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        run: |
+          gh release create "${RELEASE_TAG}" package.zip \
+            --target "${GITHUB_SHA}" \
+            --title "OmniKit ${RELEASE_TAG}" \
+            --generate-notes
+
+      # Tag 自动发布：保留原有 ncipollo 发布方式。
+      - name: Publish tag release
+        if: ${{ github.event_name == 'push' }}
+        uses: ncipollo/release-action@v1
         with:
           artifacts: package.zip
           allowUpdates: true
