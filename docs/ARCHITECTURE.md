@@ -2,7 +2,7 @@
 
 > **版本**：v1.0（正式发布稿）  
 > **状态**：正式发布（Approved）  
-> **设计基准**：严格遵循 [AGENTS.md](../AGENTS.md)、[CORE-PRD.md](CORE-PRD.md) 及 [image-compressor.md](features/image-compressor.md)  
+> **设计基准**：严格遵循 [AGENTS.md](../AGENTS.md)、[CORE-PRD.md](CORE-PRD.md)、[image-compressor.md](features/image-compressor.md) 及 [titled-link.md](features/titled-link.md)  
 > **源码基线**：`Forgo7ten/siyuan-plugin-omnikit` (`feat-image-compressor`)
 
 ---
@@ -71,6 +71,16 @@ flowchart TD
             DockView["ImageRecordsDock.svelte (Tab 视图组件)"]
             SettingsView["ImageSettingsPanel.svelte (设置卡片组件)"]
         end
+
+        subgraph TitledLink["titled-link (自动标题链接特性)"]
+            FeatTitledLink["TitledLinkFeature"]
+            TitledLinkController["TitledLinkController (业务编排门面)"]
+            DualNetwork["DualTrackNetwork (桌面 fetch / 移动 forwardProxy)"]
+            StreamParser["StreamParser (32~64KB 流式截断 & 编码嗅探)"]
+            SafeTransactionWriter["SafeTransactionWriter (写前核验与事务提交)"]
+            TitledLinkCache["TitledLinkCache (短期内存 LRU 缓存)"]
+            TitledLinkSettingsView["TitledLinkSettingsPanel.svelte (设置组件)"]
+        end
         
         subgraph FutureFeatures["未来扩展特性..."]
             FeatX["Feature X (独立业务逻辑与数据)"]
@@ -87,6 +97,7 @@ flowchart TD
 
     Manager --> Scope
     Manager --> FeatImage
+    Manager --> FeatTitledLink
     Manager --> FeatX
 
     FeatImage --> ImgController
@@ -95,6 +106,14 @@ flowchart TD
     ImgController --> SafeWriter
     ImgController --> WorkerCodec
     ImgController --> RecordStore
+
+    FeatTitledLink --> TitledLinkController
+    TitledLinkController --> DualNetwork
+    TitledLinkController --> StreamParser
+    TitledLinkController --> SafeTransactionWriter
+    TitledLinkController --> TitledLinkCache
+    DualNetwork --> KernelClient
+    SafeTransactionWriter --> KernelClient
     
     SafeWriter --> KernelClient
     AutoUpload --> KernelClient
@@ -107,6 +126,7 @@ flowchart TD
 
     UnifiedDock -.-> DockView
     SettingsShell -.-> SettingsView
+    SettingsShell -.-> TitledLinkSettingsView
     MenuRouter --> H_UI
 ```
 
@@ -178,7 +198,7 @@ flowchart TD
   - **前缀分流权威收口规范 (Context-Aware Prefix via MenuRegistry)**：
     - 由 `MenuRegistry` 作为菜单项注册与派发的唯一权威分流收口，禁止 Feature 层硬编码前缀；
     - 顶栏自有菜单 (`location === "topbar"`)：彻底移除 `[OmniKit]` 前缀，保持清爽克制；
-    - 外部宿主上下文菜单 (`location === "doc-tree" | "doc-title" | "image"`)：由 `MenuRegistry` 自动保留并统一补齐 `[OmniKit] ` 前缀，确保明确的插件归属标识；
+    - 外部宿主上下文菜单 (`location === "doc-tree" | "doc-title" | "image" | "link" | "blockicon"`)：由 `MenuRegistry` 自动保留并统一补齐 `[OmniKit] ` 前缀，确保明确的插件归属标识；
   - 若触发时对应功能处于停用状态，调用轻量通知 `showMessage` 提示功能未启用，不弹出模态对话框。
 
 ---
@@ -188,16 +208,17 @@ flowchart TD
 ```
 SiYuan 工作区目录：data/storage/petal/siyuan-plugin-omnikit/
 ├── omnikit-core.json                      <-- Core 平台配置
-├── feature-image-compressor-settings.json <-- Feature 用户设置 (受重置管控)
-└── feature-image-compressor-records.json  <-- Feature 业务数据 (不受设置重置影响)
+├── feature-image-compressor-settings.json <-- Feature A 用户设置 (受重置管控)
+├── feature-image-compressor-records.json  <-- Feature A 业务数据 (不受设置重置影响)
+└── feature-titled-link-settings.json      <-- Feature B 用户设置 (受重置管控)
 ```
 
 ### 4.1 文件划分与生命周期
 
 | 存储分类 | 文件路径规则 | 包含内容 | 重置操作影响边界 |
 |---|---|---|---|
-| **Core 平台配置** | `omnikit-core.json` | `schemaVersion: 1`<br/>`general: { debugLog }`<br/>`featureStates: { [id]: { enabled } }` | **全局重置时重置**（恢复 debugLog 为 false） |
-| **Feature 设置** | `feature-{id}-settings.json` | 用户在各 Feature 设置页手动调整的业务参数（质量、白名单、UA等） | **单功能重置**及**全局重置**时恢复默认值 |
+| **Core 平台配置** | `omnikit-core.json` | `schemaVersion: 1`<br/>`general: { debugLog, userAgent }`<br/>`featureStates: { [id]: { enabled } }` | **全局重置时重置**（恢复 debugLog 为 false，userAgent 为空串） |
+| **Feature 设置** | `feature-{id}-settings.json` | 用户在各 Feature 设置页手动调整的业务参数（质量、白名单、UA、截断长度等） | **单功能重置**及**全局重置**时恢复默认值 |
 | **Feature 业务数据** | `feature-{id}-{dataname}.json` | Feature 核心业务数据（如原图/WebP映射） | **不受设置重置影响**，仅支持在“数据管理专区”由用户显式操作清空 |
 
 ### 4.2 设置重置与数据管理专区机制

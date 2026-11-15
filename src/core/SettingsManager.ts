@@ -4,6 +4,8 @@ import type { FeatureRegistration } from "./FeatureRegistration.ts";
 
 export interface GeneralSettings {
   debugLog: boolean;
+  /** Empty means use DEFAULT_USER_AGENT at request time. */
+  userAgent: string;
 }
 export interface CoreSettings {
   schemaVersion: 1;
@@ -12,9 +14,11 @@ export interface CoreSettings {
   featureStates: Record<string, { enabled: boolean }>;
 }
 
+export const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+
 const coreDefaults = (): CoreSettings => ({
   schemaVersion: 1,
-  general: { debugLog: false },
+  general: { debugLog: false, userAgent: "" },
   featureStates: {},
 });
 
@@ -33,6 +37,12 @@ const coreCodec: StoreCodec<CoreSettings> = {
     const general = object(value.general);
     const states = object(value.featureStates);
     if (typeof general.debugLog !== "boolean") throw new Error("Invalid general settings");
+    if (general.userAgent !== undefined && typeof general.userAgent !== "string") {
+      throw new Error("Invalid general User-Agent");
+    }
+    if (typeof general.userAgent === "string" && /[\r\n]/.test(general.userAgent)) {
+      throw new Error("Invalid general User-Agent");
+    }
     const featureStates: CoreSettings["featureStates"] = {};
     for (const [id, state] of Object.entries(states)) {
       const parsed = object(state);
@@ -43,6 +53,7 @@ const coreCodec: StoreCodec<CoreSettings> = {
       schemaVersion: 1,
       general: {
         debugLog: general.debugLog,
+        userAgent: general.userAgent ?? "",
       },
       featureStates,
     };
@@ -84,8 +95,22 @@ export class SettingsManager {
   }
 
   getGeneral(): GeneralSettings { return this.core.snapshot().general; }
+  getUserAgent(): string {
+    return this.getGeneral().userAgent.trim() || DEFAULT_USER_AGENT;
+  }
   updateGeneral(patch: Partial<GeneralSettings>): Promise<boolean> {
     return this.core.update(draft => Object.assign(draft.general, patch));
+  }
+
+  resetFeature(id: string): Promise<boolean> {
+    const definition = this.definitions.get(id);
+    if (!definition) throw new Error(`Unregistered feature config: ${id}`);
+    return this.store<any>(id).update(draft => replaceObject(draft, definition.codec.defaults()));
+  }
+
+  async resetAll(): Promise<void> {
+    await this.core.update(draft => replaceObject(draft, coreDefaults()));
+    for (const id of this.definitions.keys()) await this.resetFeature(id);
   }
 
   getFeatureEnabled(id: string, defaultEnabled = false): boolean {
@@ -125,4 +150,14 @@ export class SettingsManager {
     if (!store) throw new Error(`Unregistered feature config: ${id}`);
     return store;
   }
+}
+
+function replaceObject<T>(draft: T, replacement: T): void {
+  if (!draft || typeof draft !== "object" || !replacement || typeof replacement !== "object") {
+    throw new Error("Settings defaults must be JSON objects");
+  }
+  for (const key of Object.keys(draft as Record<string, unknown>)) {
+    delete (draft as Record<string, unknown>)[key];
+  }
+  Object.assign(draft as Record<string, unknown>, replacement as Record<string, unknown>);
 }

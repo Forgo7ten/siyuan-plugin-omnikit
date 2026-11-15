@@ -14,6 +14,7 @@
 
   let { registrations, settings, manager, t }: Props = $props();
   let core = $state<CoreSettings>(untrack(() => settings.core.snapshot()));
+  let userAgentDraft = $state(untrack(() => settings.getGeneral().userAgent));
   let coreRecovery = $state(untrack(() => settings.core.needsRecovery));
   let featureRecovery = $state<Record<string, boolean>>({});
   let activeId = $state("general");
@@ -29,6 +30,7 @@
   onMount(() => {
     const disposeCore = settings.core.subscribe(value => {
       core = value as CoreSettings;
+      userAgentDraft = core.general.userAgent;
       coreRecovery = settings.core.needsRecovery;
     });
     const disposeFeatures = registrations.map(entry => {
@@ -88,6 +90,17 @@
     error = "";
     try {
       await settings.updateGeneral({ debugLog: enabled });
+      core = settings.core.snapshot();
+    } catch (cause) { error = String(cause); }
+    finally { busy = false; }
+  }
+
+  async function changeUserAgent() {
+    if (busy) return;
+    busy = true;
+    error = "";
+    try {
+      await settings.updateGeneral({ userAgent: userAgentDraft.trim() });
       core = settings.core.snapshot();
     } catch (cause) { error = String(cause); }
     finally { busy = false; }
@@ -229,6 +242,18 @@
               checked={core.general.debugLog}
               disabled={busy || coreRecovery}
               onchange={e => changeDebugLog(e.currentTarget.checked)} />
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <span class="setting-title">{t("general.userAgent")}</span>
+              <span class="setting-hint">{t("general.userAgentNote")}</span>
+            </div>
+            <input
+              class="b3-text-field"
+              type="text"
+              bind:value={userAgentDraft}
+              disabled={busy || coreRecovery}
+              onchange={changeUserAgent} />
           </div>
         </div>
       </section>

@@ -28,7 +28,7 @@ export interface FeatureRegistration<T> {
 }
 
 function featureSlug(id: string): string {
-  if (!/^[a-z][a-zA-Z0-9]*$/.test(id)) throw new Error(`Invalid feature id: ${id}`);
+  if (!/^[a-z][a-zA-Z0-9]*(?:-[a-z0-9]+)*$/.test(id)) throw new Error(`Invalid feature id: ${id}`);
   return id.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase();
 }
 
@@ -59,7 +59,7 @@ export function validateFeatureFiles(ids: readonly string[]): void {
 }
 
 export function defineFeature<T>(registration: FeatureRegistration<T>): FeatureRegistration<T> {
-  if (!/^[a-z][a-zA-Z0-9]*$/.test(registration.id)) {
+  if (!/^[a-z][a-zA-Z0-9]*(?:-[a-z0-9]+)*$/.test(registration.id)) {
     throw new Error(`Invalid feature id: ${registration.id}`);
   }
   if (registration.file !== featureConfigFile(registration.id)) throw new Error(`Feature file must be derived from its id: ${registration.id}`);

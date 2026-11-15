@@ -1,7 +1,7 @@
 import type { FeatureScope } from "./FeatureScope.ts";
 import type { Logger } from "./Logger.ts";
 
-export type MenuLocation = "topbar" | "doc-title" | "doc-tree" | "image";
+export type MenuLocation = "topbar" | "doc-title" | "doc-tree" | "image" | "link" | "blockicon";
 
 export interface MenuContext {
   location: MenuLocation;

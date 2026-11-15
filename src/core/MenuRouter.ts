@@ -61,14 +61,40 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
     });
   };
 
+  const linkHandler = (event: CustomEvent<any>) => {
+    const detail = event.detail;
+    const link = detail?.element as HTMLElement | undefined;
+    if (!detail?.menu || link?.getAttribute?.("data-type")?.split(" ").includes("a") !== true) return;
+    menus.render("link", detail.menu, {
+      location: "link",
+      rootID: detail?.protyle?.block?.rootID,
+      blockID: link.closest("[data-node-id]")?.getAttribute("data-node-id") ?? undefined,
+      detail,
+    });
+  };
+
+  const blockIconHandler = (event: CustomEvent<any>) => {
+    const detail = event.detail;
+    if (!detail?.menu || !Array.isArray(detail.blockElements)) return;
+    menus.render("blockicon", detail.menu, {
+      location: "blockicon",
+      rootID: detail?.protyle?.block?.rootID,
+      detail,
+    });
+  };
+
   plugin.eventBus.on("click-editortitleicon", titleHandler);
   plugin.eventBus.on("open-menu-doctree", treeHandler);
   plugin.eventBus.on("open-menu-image", imageHandler);
+  plugin.eventBus.on("open-menu-link", linkHandler);
+  plugin.eventBus.on("click-blockicon", blockIconHandler);
 
   return () => {
     plugin.eventBus.off("click-editortitleicon", titleHandler);
     plugin.eventBus.off("open-menu-doctree", treeHandler);
     plugin.eventBus.off("open-menu-image", imageHandler);
+    plugin.eventBus.off("open-menu-link", linkHandler);
+    plugin.eventBus.off("click-blockicon", blockIconHandler);
   };
 }
 

@@ -187,14 +187,37 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 ├── omnikit-core.json                      [平台级全局配置]
 ├── feature-image-compressor-settings.json [Feature A 用户设置]
 ├── feature-image-compressor-records.json  [Feature A 核心业务数据]
+├── feature-titled-link-settings.json      [Feature B 用户设置]
 └── feature-{id}-settings.json             [Feature N 用户设置]
 ```
 
 | 文件类别 | 命名规范 | 读写权限与时机 | 重置敏感度 |
 |---|---|---|---|
-| **Core 平台配置** | `omnikit-core.json` | 仅由 `SettingsManager` 维护，包含 `general.debugLog` 及 Feature 启用偏好表 | 受“全局重置”管控 |
-| **Feature 设置** | `feature-{id}-settings.json` | 用户在各 Feature 设置页手动调整的业务参数（质量、白名单、UA 等） | 受“单功能重置”和“全局重置”管控 |
+| **Core 平台配置** | `omnikit-core.json` | 仅由 `SettingsManager` 维护，包含 `general.debugLog`、`general.userAgent` 及 Feature 启用偏好表 | 受“全局重置”管控 |
+| **Feature 设置** | `feature-{id}-settings.json` | 用户在各 Feature 设置页手动调整的业务参数（质量、白名单、截断长度等偏好） | 受“单功能重置”和“全局重置”管控 |
 | **Feature 业务数据** | `feature-{id}-{dataname}.json` | Feature 在运行过程中沉淀的核心业务资产映射（如 `records`） | **不受设置重置操作影响** |
+
+#### Core 平台配置模型 (`omnikit-core.json`)
+
+```json
+{
+  "schemaVersion": 1,
+  "general": {
+    "debugLog": false,
+    "userAgent": ""
+  },
+  "featureStates": {
+    "image-compressor": { "enabled": false },
+    "titled-link": { "enabled": true }
+  }
+}
+```
+
+- **`general.debugLog`**：全局调试日志开关，默认 `false`；
+- **`general.userAgent`**：全局网络请求 User-Agent 伪装配置（默认空字符串 `""`）：
+  - 当为空时，Core 与下游特性默认回退使用内置的现代 Chrome 浏览器 User-Agent（例如 `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36`）；
+  - **跨特性复用机制**：由 Core 平台统一集中维护并提供访问能力，供下游需要外网访问的特性（如 `titled-link` 标题抓取伪装、`image-compressor` 远程外链图片防盗链下载等）共同复用，避免在各个 Feature 设置中重复配置与碎片化管理；
+- **`featureStates`**：各 Feature 在平台中的期望启用偏好状态，由 Core 统一管理与持久化。
 
 ### 4.2 底层存储引擎 `JsonStore<T>`
 
@@ -269,7 +292,7 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 - **前缀分流权威收口规范 (Context-Aware Prefix via MenuRegistry)**：
   - 由 `MenuRegistry` 作为菜单项注册与派发的唯一权威分流收口，**严禁 Feature 层在菜单标题中硬编码 `[OmniKit]` 前缀**；
   - **顶栏自有菜单 (`location === "topbar"`)**：**彻底移除 `[OmniKit]` 前缀**（例如呈现为 `压缩当前文档图片`、`开启当前文档图片自动压缩`），与顶栏环境深度融合，保持清爽克制；
-  - **外部宿主上下文菜单 (`location === "doc-tree" | "doc-title" | "image"`)**：由 `MenuRegistry` **自动统一补齐 `[OmniKit] ` 前缀**（例如 `[OmniKit] 压缩此图片`、`[OmniKit] 压缩…`），帮助用户清晰区分思源原生菜单与其他第三方插件菜单。
+  - **外部宿主上下文菜单 (`location === "doc-tree" | "doc-title" | "image" | "link" | "blockicon"`)**：由 `MenuRegistry` **自动统一补齐 `[OmniKit] ` 前缀**（例如 `[OmniKit] 压缩此图片`、`[OmniKit] 提取链接标题`、`[OmniKit] 批量提取链接标题 (共 N 个)`），帮助用户清晰区分思源原生菜单与其他第三方插件菜单。
 - **轻量状态感知与路由防护**：
   - 通过 `MenuRouter` 与 `MenuRegistry` 集中管理菜单派发；
   - 菜单触发时，`MenuRouter` 首先核验对应 Feature 的运行状态（`phase === "enabled"`）；
@@ -315,5 +338,6 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 | Feature ID | 中文名称 | 业务规范文档 | 默认状态 | 说明 |
 |---|---|---|---|---|
 | `image-compressor` | 图片压缩 | [features/image-compressor.md](features/image-compressor.md) | 关闭 (`false`) | 针对思源新插入图片与文档已有图片的无损/高质 WebP 压缩，含统一 Dock 记录与引用回溯 |
+| `titled-link` | 自动标题链接 | [features/titled-link.md](features/titled-link.md) | 开启 (`true`) | 针对思源行内超链接异步获取并填充网页标题，支持非网页文件免抓取、单链右键菜单与块级批量提取，具备双轨网络、流式截断、万国码嗅探与并发冲突保护 |
 
 *(后续新增 Feature 需在完成需求规范编写与冻结后，补充更新至本索引表)*

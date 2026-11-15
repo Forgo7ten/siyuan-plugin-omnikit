@@ -8,6 +8,7 @@ import { installMenuRouter } from "./MenuRouter.ts";
 import { Logger } from "./Logger.ts";
 import { Compatibility } from "./Compatibility.ts";
 import { imageCompressorRegistration } from "../features/image-compressor/registration.ts";
+import { titledLinkRegistration } from "../features/titled-link/registration.ts";
 import { createSettingsWindow } from "../ui/settings/mountSettings.ts";
 import { registerTopBar } from "../ui/topbar/registerTopBar.ts";
 import { registerDock } from "../ui/dock/registerDock.ts";
@@ -17,7 +18,7 @@ import { setFrontendResolver } from "./Platform.ts";
 import "../styles/index.scss";
 
 /** @design Add one registration here; no changes to core schema or SettingsRoot.svelte. */
-const registrations = [imageCompressorRegistration];
+const registrations = [imageCompressorRegistration, titledLinkRegistration];
 
 /**
  * @migration-settings-window SiYuan 3.8.7+: a body--settings instance may mount stores
