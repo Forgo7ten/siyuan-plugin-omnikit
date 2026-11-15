@@ -11,10 +11,50 @@ const rejects = (mutate, label) => {
   assert.throws(() => parseImageConfig(config), undefined, label);
 };
 
-test("image defaults use schema 1 and the grouped configuration shape", () => {
+test("image defaults use schema 2 and the grouped configuration shape", () => {
   const config = valid();
-  assert.equal(config.schemaVersion, 1);
+  assert.equal(config.schemaVersion, 2);
+  assert.equal(config.compression.smartEnabled, false);
+  assert.equal(config.compression.targetSimilarity, 0.99);
   assert.deepEqual(parseImageConfig(config), config);
+});
+
+test("migrates schemaVersion 1 config to schemaVersion 2", () => {
+  const v1 = {
+    schemaVersion: 1,
+    auto: { globalEnabled: false, pageAllowlist: {} },
+    compression: {
+      initialQuality: 0.8,
+      manualMaxEdge: 4096,
+      minInputBytes: 102400,
+      minSavingBytes: 4096,
+      minSavingRatio: 0.05,
+      maxInputBytes: 33554432,
+      maxPixels: 32000000,
+      maxEncodeMs: 45000,
+      concurrencyDesktop: 2,
+      concurrencyMobile: 1,
+      excludedExtensions: ["gif", "svg", "webp"],
+    },
+    metadata: { preserveExif: false },
+    sources: { desktopLocalFiles: true },
+    references: { backend: "auto", maxDocuments: 10000 },
+  };
+  const parsed = parseImageConfig(v1);
+  assert.equal(parsed.schemaVersion, 2);
+  assert.equal(parsed.compression.smartEnabled, false);
+  assert.equal(parsed.compression.targetSimilarity, 0.99);
+});
+
+test("validates smartEnabled and targetSimilarity bounds", () => {
+  const config = valid();
+  config.compression.smartEnabled = true;
+  config.compression.targetSimilarity = 0.95;
+  assert.deepEqual(parseImageConfig(config), config);
+
+  rejects(c => { c.compression.smartEnabled = "true"; }, "smartEnabled type");
+  rejects(c => { c.compression.targetSimilarity = 0.899; }, "targetSimilarity lower bound");
+  rejects(c => { c.compression.targetSimilarity = 1.0; }, "targetSimilarity upper bound");
 });
 
 test("image config validates complete grouped settings and document permissions", () => {
@@ -41,7 +81,7 @@ test("legacy config with remote downloadUserAgent is safely parsed and silently 
     remote: { downloadUserAgent: "CustomUA/1.0" },
   };
   const parsed = parseImageConfig(legacy);
-  assert.equal(parsed.schemaVersion, 1);
+  assert.equal(parsed.schemaVersion, 2);
   assert.equal("remote" in parsed, false);
   assert.deepEqual(parsed, valid());
 });
@@ -68,6 +108,6 @@ test("feature settings and data derive isolated stable names", () => {
 
 test("rejects unsupported schemaVersion", () => {
   const unknown = valid();
-  unknown.schemaVersion = 2;
+  unknown.schemaVersion = 3;
   assert.throws(() => parseImageConfig(unknown));
 });

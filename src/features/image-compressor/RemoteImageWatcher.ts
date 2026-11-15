@@ -5,6 +5,7 @@ import { autoAllowed, type ImageConfig } from "./parseImageConfig.ts";
 import { blockDOM, type DocumentRow } from "./references.ts";
 import { scanDOM } from "./dom.ts";
 import { resolveSource, type ImageSource } from "./source.ts";
+import { classifyImageCandidate } from "./ImageCandidateClassifier.ts";
 
 interface Candidate { blockID: string; source: ImageSource; count: number }
 export type RemoteWatcherLogger = Pick<Console, "warn">;
@@ -18,6 +19,12 @@ export function addedRemoteCandidates(
   if (!autoAllowed(config, rootID)) return [];
   return [...current].flatMap(([key, candidate]) => {
     if (candidate.source.kind !== "remote" || candidate.count <= (previous.get(key)?.count ?? 0)) return [];
+    const decision = classifyImageCandidate({
+      path: candidate.source.raw,
+      mode: "auto",
+      excludedExtensions: config.compression.excludedExtensions,
+    });
+    if (!decision.eligible) return [];
     try {
       const url = new URL(candidate.source.url);
       return ["https:", "http:"].includes(url.protocol) ? [candidate] : [];
@@ -88,6 +95,12 @@ export async function watchRemoteImages(
     if (disposed || paused || !scope.active || signal.aborted || oldCount !== 0 || candidate.count !== 1) return;
     const config = services.config();
     if (!autoAllowed(config, doc.id)) return;
+    const decision = classifyImageCandidate({
+      path: candidate.source.raw,
+      mode: "auto",
+      excludedExtensions: config.compression.excludedExtensions,
+    });
+    if (!decision.eligible) return;
     const taskKey = keyOf(candidate.blockID, candidate.source.key);
     if (inFlight.has(taskKey)) return;
     inFlight.add(taskKey);

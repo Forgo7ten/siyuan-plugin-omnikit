@@ -193,3 +193,30 @@ test("upload where all images are skipped remains completely silent without emit
   assert.equal(notices.length, 0);
   scope.dispose();
 });
+
+test("synchronously unauthorized document upload does not register onComplete or observer", () => {
+  const listeners = new Map();
+  const plugin = { eventBus: {
+    on(name, handler) { listeners.set(name, handler); },
+    off(name) { listeners.delete(name); },
+  } };
+  const scope = new FeatureScope();
+  let registered = false;
+  registerAutoUpload(
+    plugin,
+    scope,
+    () => false, // synchronous false
+    { origin: "https://siyuan.test", config: () => ({}) },
+    { warn() {}, debug() {} },
+  );
+  listeners.get("before-upload-assets")({
+    detail: {
+      requestId: "sync-unauth",
+      target: "editor",
+      protyle: { block: { rootID: "doc-1", box: "box-1" } },
+      onComplete() { registered = true; },
+    },
+  });
+  assert.equal(registered, false);
+  scope.dispose();
+});

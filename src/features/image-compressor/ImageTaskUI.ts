@@ -18,6 +18,7 @@ export interface ImageTaskState {
     referencesChanged: number | null;
     storageRecordsChanged: number | null;
   };
+  currentFile?: string;
 }
 
 export interface ImageTaskStateStore {

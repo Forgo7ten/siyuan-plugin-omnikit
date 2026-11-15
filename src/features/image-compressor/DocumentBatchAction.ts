@@ -1,8 +1,8 @@
 import { showMessage } from "siyuan";
 import type { FeatureContext } from "../../core/FeatureContext.ts";
 import type { FeatureScope } from "../../core/FeatureScope.ts";
-import { combineSignals, resolveEditorRootID } from "../../core/ProtyleAdapter.ts";
 import { translate } from "../../i18n/translate.ts";
+import { combineSignals, resolveEditorRootID } from "../../core/ProtyleAdapter.ts";
 import { recordRewrittenReference, type CompressionBatchSummary, type CompressionProgress } from "./CompressionResult.ts";
 import { isDocumentRootIdentity } from "./DocumentIdentity.ts";
 import type { ImageProcessingServices } from "./ImageProcessingServices.ts";
@@ -17,9 +17,18 @@ export interface BatchActionOptions {
 }
 
 interface AuthorizedOccurrence { target: OccurrenceTarget; source: ImageSource }
-interface Prepared { path: string; originalBytes: number; compressedBytes: number }
+interface Prepared {
+  path: string;
+  originalBytes: number;
+  compressedBytes: number;
+  quality?: number;
+  similarity?: number;
+}
 
-/** Compresses one document's assets once each, then commits only its captured occurrences. */
+/**
+ * Compresses one document's assets with bounded concurrency in preparation,
+ * then commits captured occurrences strictly sequentially with transactional verification.
+ */
 export async function compressDocumentImages(
   detail: any,
   context: FeatureContext,
@@ -63,7 +72,6 @@ export async function compressDocumentImages(
   } catch (error) {
     if (signal.aborted || !scope.active) return cancelledSummary(summary);
     context.logger.warn("扫描当前文档图片失败", error);
-    showMessage(translate(context.plugin.i18n, "image.batch.scanFailed"), 5000);
     return summary;
   }
 
@@ -102,7 +110,6 @@ export async function compressDocumentImages(
   summary.total = scanned.length;
   report();
   if (!scanned.length) {
-    showMessage(translate(context.plugin.i18n, "image.batch.noImages"), 4000);
     return summary;
   }
 
@@ -112,52 +119,83 @@ export async function compressDocumentImages(
     group.push(item);
     byKey.set(item.source.key, group);
   }
+
   const countedPaths = new Set<string>();
   const alreadyWritten = new Map<string, Map<number, { oldPath: string; newPath: string }>>();
+  const distinctGroups = [...byKey.entries()];
+  const preparedMap = new Map<string, Prepared>();
+  const failedKeys = new Set<string>();
   let uploaded = 0;
-  for (const [, locations] of byKey) {
+
+  // Preparation phase with bounded concurrency: desktop 2, mobile 1
+  const concurrency = services.mobile ? 1 : Math.max(1, config.compression.concurrencyDesktop ?? 2);
+  let nextIdx = 0;
+
+  async function prepareWorker(): Promise<void> {
+    while (nextIdx < distinctGroups.length) {
+      if (signal.aborted || !scope.active) return;
+      const idx = nextIdx++;
+      const [key, locations] = distinctGroups[idx];
+      const source = locations[0].source;
+      report(source.raw);
+
+      if (source.kind !== "asset" || source.box) {
+        continue;
+      }
+
+      try {
+        const result = await services.compressOccurrence(locations[0].target, config, signal, {
+          replace: false,
+          mode: "document",
+        });
+        if (result.status === "saved") {
+          const origBytes = result.originalBytes ?? 0;
+          const compBytes = result.compressedBytes ?? 0;
+          preparedMap.set(key, {
+            path: result.path,
+            originalBytes: origBytes,
+            compressedBytes: compBytes,
+            quality: result.quality,
+            similarity: result.similarity,
+          });
+          uploaded++;
+          summary.originalBytes += origBytes;
+          summary.compressedBytes += compBytes;
+        }
+      } catch (error) {
+        if (signal.aborted || !scope.active) return;
+        context.logger.warn(`准备图片资源失败：${source.raw}`, error);
+        failedKeys.add(key);
+      }
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, distinctGroups.length) }, () => prepareWorker());
+  await Promise.all(workers);
+  if (signal.aborted || !scope.active) return cancelledSummary(summary);
+
+  // Sequential occurrence replacement phase
+  for (const [key, locations] of distinctGroups) {
     if (signal.aborted || !scope.active) return cancelledSummary(summary);
     const source = locations[0].source;
     report(source.raw);
+
     if (source.kind !== "asset" || source.box) {
-      // Encrypted notebook asset writes are deliberately refused until updateBlock supports scoped routing.
       for (const _item of locations) { summary.skipped++; summary.completed++; }
       continue;
     }
 
-    let prepared: Prepared | undefined;
-    try {
-      const result = await services.compressOccurrence(locations[0].target, config, signal, {
-        replace: false, mode: "document",
-      });
-      if (result.status === "saved") {
-        prepared = { path: result.path, originalBytes: 0, compressedBytes: 0 };
-        uploaded++;
-        try {
-          const readOptions = { maxBytes: config.compression.maxInputBytes, timeoutMs: 30_000, signal };
-          const original = await services.reader.read(source, readOptions);
-          const compressed = await services.reader.read(resolveSource(result.path, services.origin), readOptions);
-          prepared.originalBytes = original.blob.size;
-          prepared.compressedBytes = compressed.blob.size;
-          summary.originalBytes += original.blob.size;
-          summary.compressedBytes += compressed.blob.size;
-        } catch (error) {
-          context.logger.warn(`读取压缩后图片大小失败：${source.raw}`, error);
-        }
-      }
-    } catch (error) {
-      if (signal.aborted || !scope.active) return cancelledSummary(summary);
-      context.logger.warn(`准备图片资源失败：${source.raw}`, error);
+    if (failedKeys.has(key)) {
       for (const _item of locations) { summary.failed++; summary.completed++; }
       continue;
     }
+
+    const prepared = preparedMap.get(key);
     if (!prepared) {
       for (const _item of locations) { summary.skipped++; summary.completed++; }
       continue;
     }
 
-    // Re-read after each verified write. Rebase only the original authorized locations when
-    // the block equals the exact result of our prior authorized writes; concurrent edits stop it.
     let anyReplaced = false;
     for (const item of locations) {
       if (signal.aborted || !scope.active) return cancelledSummary(summary);
@@ -224,7 +262,6 @@ export async function compressDocumentImages(
   }
 
   summary.uploaded = uploaded;
-  showComplete(context, summary);
   report();
   return summary;
 }
@@ -266,10 +303,3 @@ function patchAuthorizedBaseline(dom: string, blockID: string, replacements: Map
 }
 
 function cancelledSummary(summary: CompressionBatchSummary): CompressionBatchSummary { summary.cancelled = true; return summary; }
-function showComplete(context: FeatureContext, summary: CompressionBatchSummary): void {
-  showMessage(translate(context.plugin.i18n, "image.batch.complete", {
-    succeeded: summary.succeeded, skipped: summary.skipped, failed: summary.failed, conflicts: summary.conflicts,
-    logical: formatBytes(summary.logicalReductionBytes), reclaimed: formatBytes(summary.diskReclaimedBytes),
-  }), 7000);
-}
-function formatBytes(size: number): string { return size < 1024 ? `${size} B` : `${(size / 1024).toFixed(1)} KB`; }

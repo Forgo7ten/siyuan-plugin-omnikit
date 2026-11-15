@@ -3,6 +3,8 @@ import type { FeatureScope } from "../../core/FeatureScope.ts";
 import type { ImageProcessingServices } from "./ImageProcessingServices.ts";
 import { waitForPersistedImageOccurrence, type ImageOccurrenceEvidence } from "./ImageOccurrenceResolver.ts";
 import { resolveSource } from "./source.ts";
+import { classifyImageCandidate } from "./ImageCandidateClassifier.ts";
+import type { ImageConfig } from "./parseImageConfig.ts";
 
 export interface DebugLogger {
   debug?: (message: string, data?: unknown) => void;
@@ -24,11 +26,31 @@ interface UploadSuccess {
   succMap?: Record<string, string>;
 }
 interface InsertedImage extends ImageOccurrenceEvidence { key: string }
-interface UploadDetail {
+
+export type UploadInput =
+  | { kind: "files"; files: File[] }
+  | { kind: "local-files"; files: Array<{ path: string; size: number | null; isDir?: boolean }> };
+
+export interface UploadDetail {
   requestId?: string;
   target?: string;
+  input?: UploadInput;
   protyle?: { element?: HTMLElement; block?: { rootID?: string; box?: string }; notebookId?: string };
   onComplete?: (callback: (result: UploadSuccess) => void) => void;
+}
+
+export function hasCompressibleInput(input: UploadInput | undefined, config: ImageConfig): boolean {
+  if (!input) return true;
+  const paths = input.kind === "files"
+    ? (Array.isArray(input.files) ? input.files.map(file => file.name) : [])
+    : (Array.isArray(input.files) ? input.files.filter(f => !f.isDir).map(f => f.path) : []);
+  if (paths.length === 0) return true;
+  const excluded = config?.compression?.excludedExtensions ?? ["gif", "svg", "webp"];
+  return paths.some(path => classifyImageCandidate({
+    path,
+    mode: "auto",
+    excludedExtensions: excluded,
+  }).eligible);
 }
 
 /** Successful entries from partial native batches remain independently processable. */
@@ -57,7 +79,7 @@ export function completedUploadPaths(result: UploadSuccess): string[] {
 export function registerAutoUpload(
   plugin: Plugin,
   scope: FeatureScope,
-  shouldCompress: (rootID: string) => Promise<boolean>,
+  shouldCompress: (rootID: string) => boolean | Promise<boolean>,
   services: ImageProcessingServices,
   logger: DebugLogger,
   onNotice?: (notice: AutoUploadNotice) => void,
@@ -68,6 +90,14 @@ export function registerAutoUpload(
     const notebook = detail?.protyle?.notebookId ?? detail?.protyle?.block?.box;
     if (!scope.active || detail?.target !== "editor" || !rootID || !notebook ||
         !detail.requestId || typeof detail.onComplete !== "function") return;
+
+    // Synchronous authorization pre-check
+    const auth = shouldCompress(rootID);
+    if (auth === false) return;
+
+    // Candidate image pre-screening
+    const config = services.config();
+    if (!hasCompressibleInput(detail.input, config)) return;
 
     logger.debug?.("收到 before-upload-assets 事件", {
       requestId: detail.requestId, target: detail.target, rootID, notebook,
@@ -165,7 +195,7 @@ async function processCompletedUpload(
   notebook: string,
   observed: InsertedImage[],
   scope: FeatureScope,
-  shouldCompress: (rootID: string) => Promise<boolean>,
+  shouldCompress: (rootID: string) => boolean | Promise<boolean>,
   services: ImageProcessingServices,
   logger: DebugLogger,
   editor?: HTMLElement,
@@ -182,7 +212,8 @@ async function processCompletedUpload(
   let successful = 0, skipped = 0, failed = 0;
   let lastSkipReason: "noBenefit" | "notAuthorized" | "conflict" | "notMatched" | "other" = "other";
 
-  const authorized = await shouldCompress(rootID);
+  const postAuth = shouldCompress(rootID);
+  const authorized = typeof postAuth === "boolean" ? postAuth : await postAuth;
   logger.debug?.("检查自动压缩授权", { rootID, authorized });
   if (!authorized) {
     logger.debug?.("当前文档未在自动压缩授权列表中，跳过处理", { rootID, paths });
@@ -192,6 +223,18 @@ async function processCompletedUpload(
   for (const rawPath of paths) {
     if (!scope.active || scope.signal.aborted) break;
     const path = rawPath.replaceAll("\\", "/");
+    const excluded = services.config()?.compression?.excludedExtensions ?? ["gif", "svg", "webp"];
+    const decision = classifyImageCandidate({
+      path,
+      mode: "auto",
+      excludedExtensions: excluded,
+    });
+    if (!decision.eligible) {
+      logger.debug?.("分类器跳过不合格文件", { path, reason: decision.reason });
+      skipped++;
+      lastSkipReason = "noBenefit";
+      continue;
+    }
     try {
       const source = resolveSource(path, services.origin);
       if (source.kind !== "asset") {

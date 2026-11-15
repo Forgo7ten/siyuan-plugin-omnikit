@@ -8,6 +8,7 @@ import type { ReferenceService } from "./references.ts";
 import type { ImageCompressionRecordStore } from "./ImageCompressionRecordStore.ts";
 import type { CompressionMode, OccurrenceTarget } from "./contracts.ts";
 import { resolveSource, type ImageSource } from "./source.ts";
+import { classifyImageCandidate } from "./ImageCandidateClassifier.ts";
 
 /** Concrete services shared by the existing image, document and upload entry points. */
 export interface ImageProcessingServices {
@@ -35,11 +36,21 @@ export interface PreparedImage {
   path: string;
   originalBytes: number;
   compressedBytes: number;
+  quality?: number;
+  similarity?: number;
 }
 
 export type OccurrenceCompressionResult =
   | { status: "skipped" }
-  | { status: "saved"; path: string; reference: "not-requested" | "replaced" | "conflict" | "unknown" };
+  | {
+      status: "saved";
+      path: string;
+      reference: "not-requested" | "replaced" | "conflict" | "unknown";
+      originalBytes?: number;
+      compressedBytes?: number;
+      quality?: number;
+      similarity?: number;
+    };
 
 /** Prepare one source without touching document references. */
 export async function prepareImage(
@@ -52,6 +63,14 @@ export async function prepareImage(
   providedFile?: File,
   selectedMode?: CompressionMode,
 ): Promise<PreparedImage | undefined> {
+  const mode = selectedMode ?? (intent.kind === "document" ? "document" : intent.kind === "upload" || intent.kind === "remote-auto" ? "auto" : "manual-quick");
+  const decision = classifyImageCandidate({
+    path: source.raw,
+    mode,
+    excludedExtensions: config.compression.excludedExtensions,
+  });
+  if (!decision.eligible) return undefined;
+
   const readOptions = {
     maxBytes: config.compression.maxInputBytes,
     timeoutMs: 30_000,
@@ -61,12 +80,18 @@ export async function prepareImage(
   };
   if (source.kind !== "asset") throw new Error("Remote images must be localized before compression");
   const original = await services.reader.read(source, readOptions);
-  const mode = selectedMode ?? (intent.kind === "document" ? "document" : intent.kind === "upload" || intent.kind === "remote-auto" ? "auto" : "manual-quick");
   const encoded = await services.encoder.encode(original.blob, original.name, config, signal, undefined, mode);
   if (encoded.kind === "skipped") return undefined;
   const path = await persistEncodedImage(services, source.path + (source.box ? `?box=${source.box}` : ""),
     encoded.value.file, rootID, signal, config.compression.maxInputBytes);
-  return { source, path, originalBytes: original.blob.size, compressedBytes: encoded.value.file.size };
+  return {
+    source,
+    path,
+    originalBytes: original.blob.size,
+    compressedBytes: encoded.value.file.size,
+    quality: encoded.value.quality,
+    similarity: encoded.value.similarity,
+  };
 }
 
 /** Upload, verify, and durably record one encoded asset before it can be referenced. */
@@ -116,7 +141,12 @@ export async function compressOccurrence(
     : { kind: "upload", rootID: target.rootID, originalInputCount: 1 };
   const prepared = await prepareImage(services, source, target.rootID, intent, config, signal, options.providedFile, mode);
   if (!prepared) return { status: "skipped" };
-  return finishSaved(services, target, prepared.path, signal, options.replace ?? false);
+  return finishSaved(services, target, prepared.path, signal, options.replace ?? false, {
+    originalBytes: prepared.originalBytes,
+    compressedBytes: prepared.compressedBytes,
+    quality: prepared.quality,
+    similarity: prepared.similarity,
+  });
 }
 
 export async function savePreview(
@@ -125,21 +155,29 @@ export async function savePreview(
   encodedFile: File,
   signal: AbortSignal,
   replace: boolean,
+  metrics?: { originalBytes?: number; compressedBytes?: number; quality?: number; similarity?: number },
 ): Promise<OccurrenceCompressionResult> {
   const path = await persistEncodedImage(services, target.oldPath, encodedFile, target.rootID, signal,
     services.config().compression.maxInputBytes);
-  return finishSaved(services, target, path, signal, replace);
+  return finishSaved(services, target, path, signal, replace, metrics);
 }
 
 async function finishSaved(
   services: ImageProcessingServices, target: OccurrenceTarget, path: string,
   signal: AbortSignal, replace: boolean,
+  metrics?: { originalBytes?: number; compressedBytes?: number; quality?: number; similarity?: number },
 ): Promise<OccurrenceCompressionResult> {
-  if (!replace || signal.aborted) return { status: "saved", path, reference: "not-requested" };
-  const reference = await services.references.commitOccurrence(target, path, signal);
-  await services.records.markOperation(target.oldPath, path,
-    reference === "replaced" ? "replaced" : "incomplete").catch(() => undefined);
-  return { status: "saved", path, reference };
+  const reference = !replace || signal.aborted ? "not-requested" : await services.references.commitOccurrence(target, path, signal);
+  if (replace && !signal.aborted) {
+    await services.records.markOperation(target.oldPath, path,
+      reference === "replaced" ? "replaced" : "incomplete").catch(() => undefined);
+  }
+  const result: OccurrenceCompressionResult = { status: "saved", path, reference };
+  if (metrics?.originalBytes !== undefined) result.originalBytes = metrics.originalBytes;
+  if (metrics?.compressedBytes !== undefined) result.compressedBytes = metrics.compressedBytes;
+  if (metrics?.quality !== undefined) result.quality = metrics.quality;
+  if (metrics?.similarity !== undefined) result.similarity = metrics.similarity;
+  return result;
 }
 
 export class RecordPersistenceError extends Error {

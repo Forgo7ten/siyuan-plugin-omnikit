@@ -9,6 +9,7 @@ import { AssetStore } from "./assets.ts";
 import { createDesktopBridge } from "./desktop.ts";
 import { SourceReader } from "./download.ts";
 import { BicEncoder } from "./image.ts";
+import { AdaptiveImageCompressor } from "./similarity/AdaptiveImageCompressor.ts";
 import { compressOccurrence, savePreview, type ImageProcessingServices } from "./ImageProcessingServices.ts";
 import { imageRecordsFor } from "./ImageCompressionRecordStore.ts";
 import type { ImageConfig } from "./parseImageConfig.ts";
@@ -27,7 +28,8 @@ export function createImageServices(context: FeatureContext, scope: FeatureScope
   const kernel = new KernelClient();
   const reader = new SourceReader(fetch, desktop);
   const libraryURL = new URL(`/plugins/${encodeURIComponent(context.plugin.name)}/browser-image-compression.js`, origin).href;
-  const encoder = new BicEncoder(imageCompression, libraryURL);
+  const bic = new BicEncoder(imageCompression, libraryURL);
+  const encoder = new AdaptiveImageCompressor(bic);
   const { store: records, ready: recordsReady } = imageRecordsFor(context.plugin);
   return {
     kernel,

@@ -184,6 +184,20 @@
     <section class="setting-card">
       <header><h3>{t("settings.quality")}</h3><p>{t("settings.qualityHelp")}</p></header>
       <label class="setting-row">
+        <span><strong>{t("settings.smartEnabled")}</strong><small>{t("settings.smartEnabledHelp")}</small></span>
+        <input type="checkbox" class="b3-switch" bind:checked={draft.compression.smartEnabled} />
+      </label>
+      {#if draft.compression.smartEnabled}
+        <label class="setting-row">
+          <span><strong>{t("settings.targetSimilarity")}</strong><small>{t("settings.targetSimilarityHelp")}</small></span>
+          <span class="range-control">
+            <input type="range" min="0.90" max="0.999" step="0.001" bind:value={draft.compression.targetSimilarity}
+              aria-label={t("settings.targetSimilarity")} />
+            <output>{(draft.compression.targetSimilarity * 100).toFixed(1)}%</output>
+          </span>
+        </label>
+      {/if}
+      <label class="setting-row">
         <span><strong>{t("settings.initialQuality")}</strong><small>{t("settings.notSimilarity")}</small></span>
         <span class="range-control">
           <input type="range" min="0.01" max="1" step="0.01" bind:value={draft.compression.initialQuality}

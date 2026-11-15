@@ -56,6 +56,8 @@ flowchart TD
             UnifiedDock["UnifiedDock (单槽位 Tab 容器)"]
             SettingsShell["SettingsRoot.svelte (iPad 双栏联动面板)"]
             MenuRouter["MenuRouter & MenuRegistry ([OmniKit] 前缀路由)"]
+            FeedbackService["UiFeedback (统一交互/前缀/防抖/静默)"]
+            StatusBar["PluginStatusBar (单例底栏状态栏)"]
         end
     end
 
@@ -63,10 +65,12 @@ flowchart TD
         subgraph ImgCompressor["image-compressor (图片压缩特性)"]
             FeatImage["ImageCompressorFeature"]
             ImgController["ImageController (业务编排门面)"]
+            Classifier["ImageCandidateClassifier (统一准入/视频/Excalidraw)"]
             AutoUpload["AutoUploadHandler (上传完成异步捕获)"]
             RemoteWatcher["RemoteImageWatcher (外链安全本地化)"]
             SafeWriter["SafeBlockWriter (写租约与 Occurrence 节点改写)"]
-            WorkerCodec["ImageCodec (WebP WebWorker 编解码引擎)"]
+            WorkerCodec["ImageCodec (WebP 编解码引擎)"]
+            SimilarityDomain["similarity/ (5尺度MS-SSIM/自适应搜索/内联Worker)"]
             RecordStore["ImageCompressionRecordStore (Dock 业务数据持久化)"]
             DockView["ImageRecordsDock.svelte (Tab 视图组件)"]
             SettingsView["ImageSettingsPanel.svelte (设置卡片组件)"]
@@ -94,6 +98,7 @@ flowchart TD
     PluginEntry --> SettingsMgr
     PluginEntry --> UnifiedDock
     PluginEntry --> MenuRouter
+    PluginEntry --> StatusBar
 
     Manager --> Scope
     Manager --> FeatImage
@@ -101,11 +106,15 @@ flowchart TD
     Manager --> FeatX
 
     FeatImage --> ImgController
+    ImgController --> Classifier
     ImgController --> AutoUpload
     ImgController --> RemoteWatcher
     ImgController --> SafeWriter
     ImgController --> WorkerCodec
+    ImgController --> SimilarityDomain
     ImgController --> RecordStore
+    ImgController --> FeedbackService
+    ImgController --> StatusBar
 
     FeatTitledLink --> TitledLinkController
     TitledLinkController --> DualNetwork
@@ -238,6 +247,25 @@ stateDiagram-v2
     - 外部宿主上下文菜单 (`location === "doc-tree" | "doc-title" | "image" | "link" | "blockicon"`)：由 `MenuRegistry` 自动保留并统一补齐 `[OmniKit] ` 前缀，确保明确的插件归属标识；
   - 若触发时对应功能处于停用状态，调用轻量通知 `showMessage` 提示功能未启用，不弹出模态对话框。
 
+### 3.7 `UiFeedback` (统一通知与交互反馈门面)
+- **文件位置**：`src/core/UiFeedback.ts`
+- **主要职责**：
+  - 注入 `FeatureContext.feedback`，为所有 Feature 提供平台统筹的用户交互与反馈服务；
+  - **前缀自动补齐**：统一对外弹窗追加 `[OmniKit] ` 前缀，Feature 调用时仅传入纯语义内容；
+  - **生命周期守卫**：检测 `scope.active`，当对应 Feature 处于停用状态或插件正在卸载时，静默丢弃未决的弹窗，杜绝幽灵通知；
+  - **`AbortError` / 取消信号自动吞咽**：捕获任务因用户 Esc、切页、关闭面板或 `signal.abort` 产生的中止信号与 `AbortError`，自动拦截并静默处理，严禁向用户弹报错气泡；
+  - **防抖抑制**：在 300ms 时间窗口内抑制相同文本的高频重复弹出；
+  - **通用能力**：提供标准的 `notify(message, type, options)` 及 `copyable(text, label)`。
+
+### 3.8 `PluginStatusBar` (宿主底栏状态栏管理)
+- **文件位置**：`src/core/PluginStatusBar.ts`
+- **主要职责**：
+  - 注入 `FeatureContext.statusBar`，作为主工作区底部轻量单行任务进度的单例入口；
+  - **生命周期挂载**：在主窗口 `onLayoutReady()` 中由 Core 统一调用思源官方原生 `plugin.addStatusBar({ element, position: "left" })` 挂载；插件注销 `onunload()` 时调用 `dispose()` 清理；
+  - **通用样式规范**：容器类名固定为通用的 `.omnikit-status-bar`，严禁硬编码 feature 名称；单行布局（`max-width: 260px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px;`）；
+  - **多任务字典调度**：内部维护 `tasks: Map<string, string>`，支持 `update(taskID, text)` 与 `clear(taskID)`；无活跃任务时自动添加 `.fn__none` 完全隐藏；
+  - **跨端兼容短路**：在移动端原生 App（`addStatusBar` 返回 `undefined`）与独立设置窗口中自动短路（`mounted = false`），不进行无意义的 DOM 操作。
+
 ---
 
 ## 4. 存储架构与持久化规范
@@ -273,11 +301,27 @@ sequenceDiagram
     autonumber
     participant Editor as 思源 Protyle 编辑器
     participant Host as 思源内核 (Kernel)
+    participant Classifier as ImageCandidateClassifier
     participant Handler as AutoUploadHandler
+    participant Controller as ImageController
     participant Resolver as ImageOccurrenceResolver
-    participant Worker as ImageCodec (Worker)
+    participant Similarity as similarity/ (Worker)
     participant RecordStore as ImageCompressionRecordStore
     participant SafeWriter as SafeBlockWriter
+    participant Feedback as Core UiFeedback
+    participant StatusBar as Core PluginStatusBar
+
+    rect rgb(245, 245, 255)
+    Note over Editor,Handler: 步骤零：上传前纯同步授权与候选预筛选
+    Editor->>Handler: before-upload-assets 事件 (detail.input)
+    Handler->>Handler: 同步核验 scope.active 与文档授权
+    Handler->>Classifier: 路径与扩展名预筛选 (排除视频/矢量/绘图)
+    alt 未授权或无候选图片
+        Handler-->>Editor: 零开销直接退出 (不挂载 MutationObserver)
+    else 授权且存在候选图片
+        Handler->>Editor: 挂载轻量 DOM 观察器并同步注册 onComplete
+    end
+    end
 
     Editor->>Host: 原生上传原始图片 (PNG/JPEG)
     Host-->>Editor: 返回原生资源路径并插入新块
@@ -292,13 +336,13 @@ sequenceDiagram
     end
 
     rect rgb(255, 250, 240)
-    Note over Handler,Worker: 步骤二：异步读取与 WebP 编解码
+    Note over Handler,Similarity: 步骤二：异步读取与两阶段智能质量搜索
     Handler->>Host: 读取原图二进制内容
-    Host-->>Handler: 原图数据 (ArrayBuffer)
-    Handler->>Worker: 投递编解码任务 (Worker 线程)
-    Worker->>Worker: 解码并严格核验像素尺寸、计算 WebP 编码
-    Worker-->>Handler: 编码产物 (WebP Blob, 收益统计)
-    Handler->>Handler: 核验三大黄金阈值 (>=100KiB, >=4KiB, >=5%)
+    Host-->>Handler: 原图数据 (ArrayBuffer / Blob)
+    Handler->>Similarity: 两阶段 Worker 评估 (initOriginal 预计算金字塔)
+    Similarity->>Similarity: 5 尺度 MS-SSIM 与割线+二分搜索 (桌面端≤7轮, 移动端≤5轮)
+    Similarity-->>Handler: 最优达标 WebP Blob 与质量指标 (>=0.99)
+    Handler->>Handler: 核验三大收益门槛 (>=100KiB, >=4KiB, >=5%)
     end
 
     rect rgb(240, 255, 240)
@@ -313,7 +357,7 @@ sequenceDiagram
     rect rgb(255, 240, 245)
     Note over Handler,SafeWriter: 步骤四：写租约排队与精确节点写回
     Handler->>SafeWriter: 提交块引用改写请求 (OccurrenceTarget, newWebpPath)
-    SafeWriter->>SafeWriter: 获取进程内排队写租约 (withWriteLease)
+    SafeWriter->>SafeWriter: 获取进程内排队写租约 (withBlockWriteLease)
     SafeWriter->>Host: POST /api/block/getBlockDOM (写前重新读回)
     Host-->>SafeWriter: 返回当前最新 currentBlockDOM
     SafeWriter->>SafeWriter: 精确核验: 块归属未变、序号节点存在且引用仍为 oldPath
@@ -329,7 +373,12 @@ sequenceDiagram
     SafeWriter->>SafeWriter: 释放写租约
     end
 
-    Handler->>Editor: 发送单次结果通知 (showMessage)
+    rect rgb(245, 255, 250)
+    Note over Controller,StatusBar: 步骤五：Controller 统筹反馈与状态同步
+    Handler-->>Controller: 返回纯数据结构化结果 (AutoUploadNotice / ImageActionOutcome)
+    Controller->>Feedback: 解释领域语义并派发规范化通知 ([OmniKit] 前缀与生命周期守卫)
+    Controller->>StatusBar: 更新/清除底栏轻量任务文本
+    end
 ```
 
 ### 5.2 子模块职责与设计契约
@@ -351,16 +400,24 @@ sequenceDiagram
 │ Controller 门面层 (ImageController.ts)                                 │
 │ - 唯一业务编排门面，负责前置准入判定 (全局自动开关 / 白名单校验)        │
 │ - 负责生命周期与状态调度 (TaskPanel 进度模态框装配与销毁、Abort 信号传递)│
-│ - 唯一对外用户交互与通知收口 (统一负责向思源 showMessage 派发结果提示)  │
+│ - 唯一负责领域结果解释：将 Action 返回的结构化纯数据解释为语义文案与通知 │
+│ - 对接 Core UiFeedback 派发结果提示，对接 Core PluginStatusBar 刷新状态 │
 │ - 严格识别正常中止 (Esc / 切页 / abort)，杜绝下游假性报错冒泡          │
 └───────────────────────────────────┬────────────────────────────────────┘
-                                    │ 调度纯领域执行
+                                    │ 调度纯领域执行 (无 UI 副作用)
                                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
 │ Action 纯领域层 (SingleImageAction / DocumentBatchAction / ...)         │
-│ - 纯领域逻辑执行者，专注扫描、节点定位、编解码与块改写                  │
+│ - 纯领域逻辑执行者，专注扫描、节点定位、编码评估与块安全改写           │
 │ - 严禁在 Action 内部直接调用 showMessage 发送全局通知气泡 (防重复弹窗)   │
-│ - 遇异常或冲突规范化返回/抛出结构化结果，由 Controller 统一汇报       │
+│ - 遇异常、冲突或取消时返回纯数据结构化结果，由 Controller 统筹呈现     │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ 调用独立算法与编解码模块
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 独立算法域 (similarity/ & ImageCodec)                                  │
+│ - 纯函数 MS-SSIM 计算、自适应搜索、内联 Worker 线程 Session 管理        │
+│ - 零宿主 API / DOM 依赖，支持独立单元测试与算力平台分流                │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -369,18 +426,69 @@ sequenceDiagram
 | 子模块文件 | 核心类 / 单元 | 职责与技术边界 |
 |---|---|---|
 | `ImageCompressorFeature.ts` | `ImageCompressorFeature` | Feature 入口；注册菜单、事件监听；提取 Protyle 与 blockID 上下文后直接委托 `ImageController`；所有监听句柄由 `FeatureScope` 集中托管与注销 |
-| `ImageController.ts` | `ImageController` | 业务编排唯一门面；负责全局开关与白名单准入校验；调度 Action 与 `ImageTaskPanel` 进度模态框；负责统一结果通知与正常中止识别 |
-| `AutoUploadHandler.ts` | `AutoUploadHandler` | 监听 Protyle 编辑器上传完成事件；**未授权静默与轻量化规范**：若当前文档未开启自动压缩，立即无感静默退出（直接 `return`），严禁派发 notice 或弹出任何提示气泡；且在确认未授权时尽早退出，严禁挂载无意义的 MutationObserver |
+| `ImageController.ts` | `ImageController` | 业务编排唯一门面；负责全局开关与白名单准入校验；调度 Action 与 `ImageTaskPanel` 进度模态框；接入 Core `UiFeedback` 发送统一通知，接入 Core `PluginStatusBar` 维护底栏轻量任务文本；统筹当前文件进度与正常中止静默 |
+| `ImageCandidateClassifier.ts` | `classifyImageCandidate` | 纯路径与扩展名前置准入分类器；统一过滤常见视频扩展名、动态图（GIF/APNG）、矢量图（SVG）与 Excalidraw / drawings 绘图专有路径；在扫描、上传前置、外链与读取前统一设防 |
+| `AutoUploadHandler.ts` | `AutoUploadHandler` | 监听 Protyle 编辑器上传事件；**上传前纯同步授权与候选预筛选**：在 `before-upload-assets` 中纯同步判断授权和候选图片预筛选，未授权或无图片时不创建 MutationObserver，零开销退出；授权且存在候选图片时挂载观察器并同步注册 `onComplete`；仅返回纯数据结构 `AutoUploadNotice` |
 | `RemoteImageWatcher.ts` | `RemoteImageWatcher` | 监听新插入 HTTP/HTTPS 外链图片；**未授权低开销设防**：在入口及 `sweep()` 扫描入口设防，未授权文档中严禁向内核发起 `blockDOM` 网络请求与全量 DOM 解析；授权文档中直接按 URL 下载并通过内核 API 本地化，不解析或分类目标 IP |
 | `ImageOccurrenceResolver.ts` | `ImageOccurrenceResolver` | 在 DOM 树中建立 `OccurrenceTarget` 精确定位（`rootID` + `notebook` + `blockID` + `imageOrdinal` + `oldPath`） |
-| `image.ts` / `ImageCodec.ts` | `ImageCodec` / Worker | 封装基于 WebWorker 的图片转码引擎；严格执行保尺寸校验、EXIF 探测与三大黄金收益阈值核验 |
-| `ImageProcessingServices.ts` | `ImageProcessingServices` | 聚合读取、本地化、编码、上传与写回步骤的编排服务层 |
+| `src/features/image-compressor/similarity/` | 智能压缩独立子模块 | 划分独立的相似度算法域：包含 `SimilarityEvaluator`、`computeMSSSIM`、`adaptiveQualitySearch`、`SimilarityWorkerSession` 与内联 Worker；负责多尺度相似度评估与质量搜索 |
+| `image.ts` / `BicEncoder.ts` | `BicEncoder` | 封装基于 WebP 编码器的物理生成引擎；严格执行保尺寸校验、EXIF 探测与输出字节完整性核验 |
+| `ImageProcessingServices.ts` | `ImageProcessingServices` | 聚合读取、本地化、编码、上传与写回步骤的编排服务层；统一执行分类器与持久化前置闸门 |
 | `ImageCompressionRecordStore.ts` | `ImageCompressionRecordStore` | 专职管理 `feature-image-compressor-records.json` 磁盘持久化，实现持久化前置闸门 |
 | `SafeBlockWriter.ts` | `SafeBlockWriter` | 进程内单写租约控制器（`withBlockWriteLease`），写前读回节点核验，调用 `/api/block/updateBlock`；中止时显式抛出 `AbortError` 或返回专用取消结果（如 `"aborted"`），严禁混淆为 `conflict` |
 | `ImageRecordsDock.svelte` | Svelte 5 组件 | 嵌入 Core 统一 Dock 的 Tab 视图，提供顶部 Hero 品牌卡片区（52px~56px，避开右上角 32px 浮动 Snackbar）、记录浏览、初始 present 状态与挂载自动异步核验、状态 Badge 纯主题 CSS 变量渲染（严禁硬编码 Hex，保证深浅模式对比度）、对称双向引用管理（查找原图引用/恢复原图引用，直接执行无需二次弹窗；严格区分主动查找与操作静默刷新；防覆盖铁律；全部处理完毕后自动收起展开区并保留成功统计）、失效记录清理（提示包含精确条数）与记录移除 |
-| `SingleImageAction.ts` | `SingleImageAction` | 纯领域单图处理，涵盖图片右键“压缩此图片”（直接执行）与“压缩…”（预览对话框）业务动作，作用域严格限定为仅替换当前选中的单处引用（最小副作用原则）；不越权弹出全局通知，由 Controller 统一收口 |
-| `DocumentBatchAction.ts` | `DocumentBatchAction` | 纯领域文档批量处理；扫描当前文档合格图片，同源图片合并编码，逐位置独立执行节点核验与改写；无待处理项或执行完成向 Controller 返回结构化结果；Controller 联动关闭 `ImageTaskPanel` 模态框并统一派发结果通知 |
-| `ImageSettingsPanel.svelte` | Svelte 5 组件 | 设置卡片组件，调用思源内核原生 `/api/filetree/getFullHPathByID` 解析并展示包含笔记本全名的白名单完整层级路径 |
+| `SingleImageAction.ts` | `SingleImageAction` | 纯领域单图处理，涵盖图片右键“压缩此图片”（直接执行）与“压缩…”（预览对话框）业务动作，作用域严格限定为仅替换当前选中的单处引用（最小副作用原则）；不调用 `showMessage`，统一向 Controller 返回纯数据结构 `ImageActionOutcome` |
+| `DocumentBatchAction.ts` | `DocumentBatchAction` | 纯领域文档批量处理；扫描当前文档合格图片，同源图片合并编码；执行桌面端 2 / 移动端 1 有界并发准备；字节数统计直接复用 `OccurrenceCompressionResult`，不重复读取磁盘；逐位置独立执行节点核验与改写；向 Controller 返回纯数据结构 `CompressionBatchSummary` |
+| `ImageSettingsPanel.svelte` | Svelte 5 组件 | 设置卡片组件，调用思源内核原生 `/api/filetree/getFullHPathByID` 解析并展示包含笔记本全名的白名单完整层级路径；支持智能压缩总开关与目标相似度配置 |
+
+#### 3. 智能压缩质量计算模块解耦与性能契约
+
+智能压缩通过客观图像质量指标（MS-SSIM）自适应探索最佳编码质量，设计遵循以下解耦与性能契约：
+
+1. **子模块独立解耦**：
+   - 算法域完全收敛在 `src/features/image-compressor/similarity/` 独立目录；
+   - 包含算法纯函数（`ms-ssim.ts`）、自适应搜索逻辑（`adaptive-quality-search.ts`）、Worker 会话驱动（`SimilarityWorkerSession.ts`）与内联 Worker 脚本（`similarity.worker.ts`）；
+   - 该模块不直接依赖思源内核 REST API、Protyle 编辑器 DOM 或文件存储体系，可独立进行纯数学与像素级单元测试。
+2. **全平台标准 5 尺度 MS-SSIM 评估体系**：
+   - 全平台统一采用标准的 **5 尺度 MS-SSIM** 评估体系，不降低尺度数量以保证质量指标的客观一致性与跨端准确性；
+   - 尺度标准权重分配：`[0.0448, 0.2856, 0.3001, 0.2363, 0.1333]`；
+   - 卷积核配置：$11 \times 11$ 局部高斯平滑窗口，标准差 $\sigma = 1.5$；
+   - 通道加权与合成：RGB 三通道分别计算局部亮度（Luminance）、对比度（Contrast）与结构项（Structure），依据标准亮度加权系数合并；
+   - **Alpha 通道与预乘优化 (Alpha-Premultiply)**：对含透明通道图片执行 Alpha 预乘，将全透明像素（$\alpha = 0$）的 RGB 色值归零，消除透明背景下因杂色数据导致的假性结构差异；同时当存在半透明像素时将 Alpha 相似度独立加权合并。
+3. **平台算力分流与搜索预算**：
+   - 通过调用思源官方 `getFrontend()` 区分平台算力预算：
+     - **桌面端（`desktop` / `desktop-window` / `browser-desktop`）**：单张图片最多允许 7 轮编码与评估搜索；
+     - **移动端（`mobile` / `browser-mobile`）**：单张图片最多允许 5 轮编码与评估搜索；
+   - **像素尺度归一化**：原图与候选图比较时，基准边长统一限制在不超过 512px（长边等比缩放至 512px，宽高比差异 $\le 0.005$），在保证高频纹理评估准确度的同时严格控制计算耗时。
+4. **自包含内联 Worker 与两阶段通信协议**：
+   - **Vite 内联打包机制**：Worker 脚本通过 Vite 原生 `import SimilarityWorker from "./similarity.worker.ts?worker&inline"` 打包为内联自包含 Blob Worker，彻底消除 CommonJS 打包产物与 `window.eval` 运行环境下的跨端路径解析与权限异常；
+   - **两阶段通信协议（直接节省 50% 以上计算量）**：
+     - **阶段一：原图预计算 (`initOriginal`)**：在单张图片质量搜索开始时，主线程向 Worker 传递原图 Blob。Worker 仅执行一次原图解码、Alpha 预乘、5 尺度降采样高斯金字塔构建，并常驻缓存原图各层的均值与方差统计量；
+     - **阶段二：候选图轻量评估 (`evaluate`)**：后续质量探索轮次中，主线程仅向 Worker 传递当前轮次的候选 WebP Blob。Worker 仅对候选图进行单向解码与金字塔生成，直接与缓存的原图金字塔与统计量执行 MS-SSIM 卷积计算；单次搜索复用同一 Worker 实例，完成或中止时立即销毁释放。
+5. **带区间保护的割线法 + 二分法混合搜索**：
+   - 基于初始质量点探测；
+   - 未达标时以最大质量为合格端点，已达标时以最小质量为不合格端点建立确定性收敛区间；
+   - 当割线预测点位于安全边界内部（距端点留有 10% 裕度）时采用割线加速收敛；当预测越界、斜率分母过小或检测到非单调扰动时，安全回退为二分折半法；
+   - 质量探索范围严格限制在 $[0.10, 1.00]$，质量区间收敛容差为 0.01。
+6. **早停收敛与收益门槛铁律**：
+   - **达标早停条件**：仅在“已达到目标相似度（默认 $\ge 0.99$）且候选 WebP 体积满足黄金收益门槛（原图 $\ge 100\text{ KiB}$，比原图节省 $\ge 4\text{ KiB}$ 且节省比例 $\ge 5\%$）”时，允许提前安全终止搜索；
+   - **不可达判定红线**：若最高质量仍无法达到目标相似度，算法坚决判定为 `unreachable` 并返回未达标状态。系统绝对禁止将未达标的图片当作合格产物进行自动替换，保持原图引用不变。
+
+#### 4. 批量处理性能与体验契约
+
+1. **已知字节数复用 (Zero Redundant I/O)**：
+   - 准备阶段（`prepareImage`）完成原图读取与 WebP 编码后，`OccurrenceCompressionResult` 明确返回已知元数据：`originalBytes`、`compressedBytes`、`quality`、`similarity`；
+   - `DocumentBatchAction` 在处理完成后，直接基于返回结果累计统计信息，不进行二次读盘 I/O，仅保留上传后的 SHA-256 完整性核验。
+2. **有界并发调度 (Bounded Concurrency)**：
+   - 依据平台前端类型实施严格的并发控制：桌面端最大并发度为 2，移动端最大并发度为 1；
+   - **阶段隔离并发原则**：并发仅应用于耗时的资源准备阶段（原图读取、智能质量搜索、WebP 上传与 Dock 记录持久化）；
+   - **写回串行保障**：笔记引用的最终替换必须严格按确定顺序逐项提交给 `SafeBlockWriter`，继续受进程内块级写租约与写前节点读回比对保护，杜绝多任务并发改写破坏块结构。
+3. **批量当前进度与底栏轻量反馈**：
+   - `DocumentBatchAction` 在每处理完成一个引用位置后，通过 `onProgress` 回调广播当前进度（`completed` / `total`）以及当前处理的文件名 `currentFile`；
+   - `ImageController` 将 `currentFile` 传入 `ImageTaskState`，驱动居中的 `ImageTaskPanel` 模态框实时展示当前正在处理的图片文件名与完成数；
+   - 同时，Controller 联动调用 Core `PluginStatusBar`，在支持的桌面客户端主窗口呈现单行轻量文本（如 `图片压缩 5/18 · photo.png`）；
+   - 移动端自动短路不操作状态栏；
+   - 当任务正常完成、被用户中止（按 Esc / 切换标签页）或所属 Feature 停用时，Controller 统筹销毁模态框并彻底清除状态栏任务，不残留失效进度。
 
 ### 5.3 核心技术安全机制
 

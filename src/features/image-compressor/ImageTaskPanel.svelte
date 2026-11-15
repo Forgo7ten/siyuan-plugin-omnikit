@@ -25,6 +25,13 @@
     <progress aria-label={t("task.progress")}></progress>
   {/if}
 
+  {#if state.currentFile}
+    <div class="current-file" title={state.currentFile}>
+      <span class="current-file-label">{t("task.currentFile") || "当前文件"}:</span>
+      <span class="current-file-path">{state.currentFile}</span>
+    </div>
+  {/if}
+
   <div class="metrics">
     <div><strong>{state.completed} / {state.total}</strong><span>{t("task.prepared")}</span></div>
     <div><strong>{state.uploaded}</strong><span>{t("task.uploaded")}</span></div>
@@ -63,6 +70,8 @@
   h3 { margin: 0 0 8px; }
   .task-id { overflow-wrap: anywhere; color: var(--b3-theme-on-surface); font-size: 12px; }
   progress { width: 100%; height: 8px; margin: 20px 0; accent-color: var(--b3-theme-primary); }
+  .current-file { display: flex; align-items: center; gap: 8px; font-size: 12px; margin: 8px 0; color: var(--b3-theme-on-surface); }
+  .current-file-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }
   .metrics div { min-width: 0; padding: 12px; border: 1px solid var(--b3-border-color); border-radius: 6px; }
   .metrics strong, .metrics span { display: block; overflow-wrap: anywhere; }

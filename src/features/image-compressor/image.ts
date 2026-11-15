@@ -11,6 +11,8 @@ export interface CompressionOptions {
   maxPixels: number;
   maxEncodeMs: number;
   excludedExtensions: string[];
+  smartEnabled?: boolean;
+  targetSimilarity?: number;
 }
 
 export interface ImageConfig {
@@ -124,11 +126,20 @@ export interface EncodedImage {
   outputBytes: number;
   width: number;
   height: number;
+  quality?: number;
+  similarity?: number;
+  targetSimilarity?: number;
+  searchRounds?: Array<{ quality: number; similarity: number; bytes: number }>;
 }
 
 export type EncodeResult =
   | { kind: "encoded"; value: EncodedImage }
   | { kind: "skipped"; reason: string };
+
+export interface EncodeOptions {
+  enforceSavings?: boolean;
+  onSearchProgress?: (progress: any) => void;
+}
 
 /**
  * ImageCodec: Plug-in interface for image compression / transcoding.
@@ -143,6 +154,7 @@ export interface ImageCodec {
     signal?: AbortSignal,
     onProgress?: (n: number) => void,
     mode?: CompressionMode,
+    options?: EncodeOptions,
   ): Promise<EncodeResult>;
 }
 
@@ -199,6 +211,7 @@ export class BicEncoder implements ImageCodec {
     signal?: AbortSignal,
     onProgress?: (n: number) => void,
     mode: CompressionMode = "auto",
+    options: EncodeOptions = {},
   ): Promise<EncodeResult> {
     if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
     const c = config.compression;
@@ -263,7 +276,8 @@ export class BicEncoder implements ImageCodec {
       }
 
       const saved = blob.size - output.size;
-      if (mode !== "manual-dialog" && (saved < c.minSavingBytes || saved <= 0 || saved / blob.size < c.minSavingRatio)) {
+      const enforceSavings = options.enforceSavings !== false && mode !== "manual-dialog";
+      if (enforceSavings && (saved < c.minSavingBytes || saved <= 0 || saved / blob.size < c.minSavingRatio)) {
         return { kind: "skipped", reason: "insufficient-savings" };
       }
 
@@ -273,6 +287,7 @@ export class BicEncoder implements ImageCodec {
           file: new File([output], outputName(name), { type: "image/webp" }),
           originalBytes: blob.size,
           outputBytes: output.size,
+          quality: c.initialQuality,
           ...dimensions,
         },
       };

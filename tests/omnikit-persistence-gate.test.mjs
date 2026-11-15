@@ -48,6 +48,6 @@ test("confirmed record write precedes occurrence update", async () => {
   const { service, calls } = services(() => undefined);
   const result = await compressOccurrence(service, target, defaultImageFeatureConfig(), new AbortController().signal,
     { replace: true });
-  assert.deepEqual(result, { status: "saved", path: "assets/output.webp", reference: "replaced" });
+  assert.deepEqual(result, { status: "saved", path: "assets/output.webp", reference: "replaced", originalBytes: 8, compressedBytes: 4 });
   assert.ok(calls.indexOf("record") < calls.indexOf("updateBlock"));
 });

@@ -27,6 +27,15 @@
 .omnikit-progress-dialog progress { width: 100%; }
 .omnikit-progress-dialog p { overflow-wrap: anywhere; }
 
+.omnikit-status-bar {
+  max-width: 260px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  cursor: default;
+}
+
 .image-records__hero {
   display: flex;
   align-items: center;

@@ -7,6 +7,8 @@ import { MenuRegistry } from "./MenuRegistry.ts";
 import { installMenuRouter } from "./MenuRouter.ts";
 import { Logger } from "./Logger.ts";
 import { Compatibility } from "./Compatibility.ts";
+import { UiFeedback } from "./UiFeedback.ts";
+import { PluginStatusBar } from "./PluginStatusBar.ts";
 import { imageCompressorRegistration } from "../features/image-compressor/registration.ts";
 import { titledLinkRegistration } from "../features/titled-link/registration.ts";
 import { createSettingsWindow } from "../ui/settings/mountSettings.ts";
@@ -32,6 +34,7 @@ export class OmniKitPlugin extends Plugin {
   private settingsManager?: SettingsManager;
   private manager?: FeatureManager;
   private menuRegistry?: MenuRegistry;
+  private statusBar?: PluginStatusBar;
   private disposeMenuRouter?: () => void;
   private refreshDock?: () => void;
   private disposeCoreSubscription?: () => void;
@@ -83,8 +86,16 @@ export class OmniKitPlugin extends Plugin {
         () => showMessage(this.t("menu.featureInactive"), 3000),
       );
       this.menuRegistry = menus;
+      const feedback = new UiFeedback(undefined, (msg, timeout, type) => showMessage(msg, timeout, type));
+      this.statusBar = new PluginStatusBar();
       featureContext = {
-        plugin: this, settings, menus, compatibility: this.compatibility, logger: this.logger,
+        plugin: this,
+        settings,
+        menus,
+        compatibility: this.compatibility,
+        logger: this.logger,
+        feedback,
+        statusBar: this.statusBar,
       };
       this.manager = new FeatureManager(this.catalog, featureContext);
       this.disposeStatusSubscription = this.manager.subscribeStatus(() => this.refreshDock?.());
@@ -119,6 +130,7 @@ export class OmniKitPlugin extends Plugin {
     // @safety onLayoutReady may fire before async onload finishes.
     void this.ready?.then(() => {
       if (this.unloading || this.settingsInstance || !this.menuRegistry) return;
+      this.statusBar?.mount(this);
       // Core UI remains available even if every Feature is disabled.
       registerTopBar(this, {
         title: this.t("settings"),
@@ -143,6 +155,7 @@ export class OmniKitPlugin extends Plugin {
 
   async onunload(): Promise<void> {
     this.unloading = true;
+    this.statusBar?.dispose();
     this.disposeCoreSubscription?.();
     this.disposeStatusSubscription?.();
     this.manager?.freezeAll();

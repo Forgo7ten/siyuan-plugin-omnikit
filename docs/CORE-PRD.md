@@ -63,6 +63,7 @@ stateDiagram-v2
   - 注册 Unified Dock、TopBar 入口及全局设置窗口实例。
 - **`onLayoutReady(): void`**：
   - 思源主界面 DOM 与编辑器完全渲染就绪；
+  - Core 平台统筹挂载单例底栏状态栏 `PluginStatusBar`（注入 `FeatureContext.statusBar`）；
   - 触发已启用 Feature 的 `onLayoutReady` 钩子，执行依赖编辑器 DOM 的初始化检测。
 - **`onDataChanged(): void`**：
   - 当外部环境或独立设置窗口修改并持久化了配置文件时触发；
@@ -70,6 +71,7 @@ stateDiagram-v2
 - **`onunload(): void`**：
   - 触发全系统注销流程；
   - 标记 `unloading = true`，停止接收并拒绝调度新任务；
+  - 销毁底栏状态栏 `PluginStatusBar` 实例；
   - 依相反顺序停用所有运行中的 Feature；
   - 销毁 Unified Dock、MenuRouter 路由监听与全局事件总线。
 
@@ -153,6 +155,28 @@ export interface FeatureRegistration<T> {
     context: FeatureContext;
     t: (key: string, params?: Record<string, unknown>) => string;
   }>;
+}
+
+/**
+ * Core 平台向 Feature 运行时注入的受控上下文契约
+ */
+export interface FeatureContext {
+  /** 思源插件宿主实例 */
+  readonly plugin: Plugin;
+  /** 当前 Feature 的生命周期作用域与 AbortSignal 广播器 */
+  readonly scope: FeatureScope;
+  /** 思源内核 REST API 安全调用门面 */
+  readonly kernel: KernelClient;
+  /** 动态日志记录器 */
+  readonly logger: Logger;
+  /** Core 统筹的用户交互与通知反馈门面 */
+  readonly feedback: UiFeedback;
+  /** 可选：Core 统筹的底栏状态栏单例（桌面端提供，移动端或设置窗口为 undefined） */
+  readonly statusBar?: PluginStatusBar;
+  /** 当前运行环境是否为思源独立设置窗口 */
+  readonly isSettingsWindow: boolean;
+  /** 国际化多语言翻译函数 */
+  t(key: string, params?: Record<string, unknown>): string;
 }
 ```
 
@@ -360,6 +384,47 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
   - **物理分隔线 (`separator`) 隔离**：在 Core 平台「OmniKit 设置」与下方各启用 Feature 贡献的业务选项之间，**必须使用视觉分隔线进行物理隔离**；
   - **思源原生 SDK 契约对齐**：必须显式调用思源原生 SDK 契约 `menu.addSeparator({ id: "separator_settings" })`，生成思源原生标准的 `<button data-id="separator_settings" class="b3-menu__separator"></button>` 分隔线，与思源官方 `openTopBarMenu.ts` 实现完全对齐，物理隔离 Core 平台设置与下方各 Feature 业务选项；
   - **下方 Feature 快捷指令**：分隔线下方动态渲染各已启用 Feature 注册的顶栏快捷操作（如当前文档图片压缩等），统一无 `[OmniKit]` 前缀。
+
+### 5.5 通用通知与用户反馈服务 (`UiFeedback`)
+
+Core 平台提供轻量级 `UiFeedback` 服务（注入 `FeatureContext.feedback`），统筹平台级用户交互通知、前缀治理、防抖与生命周期安全。
+
+- **前缀治理与规范化**：
+  - 对外发送通知气泡时由 `UiFeedback` 自动统一补齐 `[OmniKit] ` 前缀（例如 `[OmniKit] 已替换当前引用为 WebP`）；
+  - Feature 业务层调用时仅传递领域文案，严禁 Feature 业务代码硬编码通知前缀。
+- **生命周期绑定与静默设防**：
+  - `UiFeedback` 实例与对应 Feature 的生命周期作用域（`scope.active`）深度绑定；
+  - 当 Feature 处于未激活（`disabled` / `unsupported`）或插件正在卸载（`unloading`）时，自动静默丢弃未决的通知调用，防止失活的回调向界面弹出残存气泡。
+- **`AbortError` 与取消信号自动拦截吞咽**：
+  - 异步任务在遭遇用户按 Esc、切换编辑器标签页、关闭面板或触发 `signal.abort` 中止时，底层抛出的标准 `AbortError` 或传入的中止信号由 `UiFeedback` 自动拦截并静默吞咽；
+  - 严禁向用户弹出错误气泡，保障正常中止时界面完全静默退出。
+- **高频消息防抖抑制 (Notice Debouncing)**：
+  - 内置基于消息内容的防抖与去重窗口（默认 300ms）；
+  - 短时间内同一事件源触发的完全相同文本自动抑制二次弹出，防止高频事件或批量处理时在屏幕右上角堆叠大量重复 Snackbar 气泡。
+- **通用交互能力封装**：
+  - `notify(message: string, type?: "info" | "error", options?: { timeout?: number })`: 规范化气泡通知调度；
+  - `copyable(text: string, label?: string)`: 统一封装文本复制至系统剪贴板功能，并在复制成功后自动触发轻量提示（如 `[OmniKit] 已复制路径`），下游业务特性直接复用。
+
+### 5.6 通用底栏状态栏管理 (`PluginStatusBar`)
+
+Core 平台在思源主工作区状态栏区域提供通用的轻量任务进度呈现入口，注入至 `FeatureContext.statusBar`。
+
+- **单例入口与宿主生命周期挂载**：
+  - 全平台仅在思源主工作区窗口（非独立设置窗口）的 `onLayoutReady()` 生命周期中，由 Core 统一调用思源原生 SDK 契约 `plugin.addStatusBar({ element, position: "left" })` 挂载单例 DOM 容器；
+  - 插件注销（`onunload()`）时调用 `statusBar.dispose()` 统一清理；
+  - 严禁任何 Feature 在自身的 `onEnable()` 中重复注册或向宿主重复插入状态栏节点。
+- **通用样式与命名规范**：
+  - 状态栏容器 DOM 的 CSS 样式类名固定为通用的 `.omnikit-status-bar`，**严禁硬编码具体 feature 名称**；
+  - 样式设计遵循克制轻量的单行规范（`max-width: 260px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px;`），与思源原生底栏视觉风格深度融合。
+- **多任务文本汇聚与清除机制**：
+  - 内部维护 `tasks: Map<string, string>` 字典；
+  - 支持 `update(taskID: string, text: string)` 注册或刷新当前任务文本（展示最新活跃任务文本并同步更新 `title` 悬浮提示）；
+  - 支持 `clear(taskID: string)` 移除指定任务；
+  - 当活跃任务集合为空时，自动向容器追加思源原生隐藏类 `.fn__none` 完全隐藏节点，杜绝空白节点常驻。
+- **跨端分流与移动端安全短路**：
+  - 桌面客户端（Electron）正常挂载并提供轻量单行进度提示；
+  - 移动端 App（Android / iOS）因思源原生不支持底栏状态栏 API（`addStatusBar` 返回 `undefined`），以及桌面端独立设置窗口（`body--settings`），`PluginStatusBar.mount()` 检测到环境受限后自动短路并标记 `mounted = false`；
+  - 后续 `update()` 与 `clear()` 调用直接无感短路退出，不尝试操作不存在的 DOM 节点，也不向界面做任何侵入性回退，移动端保持纯粹使用任务面板查看进度。
 
 ---
 

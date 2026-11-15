@@ -197,9 +197,35 @@
           {#if preview.compressedBytes <= preview.originalBytes}
             <span>节省 {formatBytes(preview.originalBytes - preview.compressedBytes)}</span>
           {/if}
+          {#if preview.similarity !== undefined}
+            <span class="preview-metric">
+              {t("image.dialog.similarity")}: {(preview.similarity * 100).toFixed(2)}%
+            </span>
+          {/if}
+          {#if preview.quality !== undefined}
+            <span class="preview-metric">
+              {t("image.dialog.finalQuality")}: {Math.round(preview.quality * 100)}%
+            </span>
+          {/if}
         </div>
       </div>
     </div>
+
+    {#if preview.searchRounds && preview.searchRounds.length > 0}
+      <details class="search-rounds-details">
+        <summary>{t("image.dialog.searchRounds")} ({preview.searchRounds.length})</summary>
+        <div class="search-rounds-list">
+          {#each preview.searchRounds as round, idx}
+            <div class="search-round-item">
+              <span>#{idx + 1}</span>
+              <span>{Math.round(round.quality * 100)}%</span>
+              <span>{(round.similarity * 100).toFixed(2)}%</span>
+              <span>{formatBytes(round.bytes)}</span>
+            </div>
+          {/each}
+        </div>
+      </details>
+    {/if}
 
     {#if preview.compressedBytes > preview.originalBytes}
       <div class="larger-warning-bar">
@@ -423,6 +449,8 @@
 
     &__footer {
       display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
       align-items: center;
       justify-content: space-between;
       padding: 8px 12px;
@@ -430,6 +458,33 @@
       color: var(--b3-theme-on-surface-light);
       border-top: 1px solid var(--b3-border-color);
     }
+  }
+
+  .preview-metric {
+    font-weight: 500;
+  }
+
+  .search-rounds-details {
+    margin: 12px 0;
+    padding: 8px 12px;
+    background: var(--b3-theme-surface);
+    border: 1px solid var(--b3-border-color);
+    border-radius: 6px;
+    font-size: 12px;
+  }
+
+  .search-rounds-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 8px;
+  }
+
+  .search-round-item {
+    display: grid;
+    grid-template-columns: 32px 1fr 1fr 1fr;
+    gap: 8px;
+    font-variant-numeric: tabular-nums;
   }
 
   .saving-badge {

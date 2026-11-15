@@ -1,5 +1,6 @@
 import { imageSourceAttribute, trySource, type ImageSource } from "./source.ts";
 import type { ImageConfig } from "./parseImageConfig.ts";
+import { classifyImageCandidate } from "./ImageCandidateClassifier.ts";
 
 export interface DocumentImageOccurrence { blockId: string; imageOrdinal: number; source: ImageSource }
 
@@ -19,9 +20,12 @@ export function scanDocumentImages(dom: string, origin: string, config: ImageCon
     const source = raw && trySource(raw, origin);
     if (source && !blockId) throw new Error("Image has no owning block");
     if (!source || !blockId) continue;
-    const extension = source.name.split(".").pop()?.toLowerCase() ?? "";
-    if (["gif", "svg", "webp"].includes(extension) || config.compression.excludedExtensions.includes(extension) ||
-      source.name.toLowerCase().includes("excalidraw")) continue;
+    const decision = classifyImageCandidate({
+      path: source.raw,
+      mode: "document",
+      excludedExtensions: config.compression.excludedExtensions,
+    });
+    if (!decision.eligible) continue;
     occurrences.push({ blockId, imageOrdinal, source });
   }
   return { occurrences, scannedBlocks: blocks.length };

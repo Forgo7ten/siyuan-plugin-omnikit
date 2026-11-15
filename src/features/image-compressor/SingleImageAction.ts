@@ -10,6 +10,12 @@ import { NODE_ID } from "./parseImageConfig.ts";
 import { resolveSource } from "./source.ts";
 import { imagePath } from "./ImageOccurrenceResolver.ts";
 import { assertImagePayload, safeFileName } from "./RemoteImageWatcher.ts";
+import { classifyImageCandidate } from "./ImageCandidateClassifier.ts";
+
+export type ImageActionOutcome =
+  | { kind: "notify"; key: string; values?: Record<string, string | number> }
+  | { kind: "copyable-path"; path: string; key: string }
+  | { kind: "silent" };
 
 export interface SingleImageEditorContext {
   rootID: string;
@@ -24,6 +30,10 @@ export interface ManualCompressionPreview {
   compressedBytes: number;
   width: number;
   height: number;
+  quality?: number;
+  similarity?: number;
+  targetSimilarity?: number;
+  searchRounds?: Array<{ quality: number; similarity: number; bytes: number }>;
 }
 
 /** Captures the right-clicked image as one exact persisted occurrence. */
@@ -66,7 +76,7 @@ export async function compressSelectedImageQuick(
   scope: FeatureScope,
   editor: SingleImageEditorContext,
   services: ImageProcessingServices,
-): Promise<void> {
+): Promise<ImageActionOutcome | void> {
   const signal = scope.signal;
   if (!scope.active || signal.aborted) return;
   if (editor.disabled) return notify(context, services, "image.single.invalidTarget");
@@ -74,6 +84,12 @@ export async function compressSelectedImageQuick(
     let target = await resolveSelectedOccurrence(menuDetail, editor, services, signal);
     if (!scope.active || signal.aborted) return;
     if (!target) return notify(context, services, "image.single.unmappable");
+    const candidateDecision = classifyImageCandidate({
+      path: target.oldPath,
+      mode: "manual-quick",
+      excludedExtensions: services.config().compression.excludedExtensions,
+    });
+    if (!candidateDecision.eligible) return notify(context, services, "image.single.noBenefit");
     target = await localizeRemoteOccurrence(target, services, signal);
     if (!scope.active || signal.aborted) return;
     const result = await services.compressOccurrence(target, services.config(), signal, {
@@ -81,15 +97,18 @@ export async function compressSelectedImageQuick(
       mode: "manual-quick",
     });
     if (!scope.active || signal.aborted) return;
-    services.ui.notify(result.status === "skipped"
-      ? translate(context.plugin.i18n, "image.single.noBenefit")
+    const outcomeKey = result.status === "skipped"
+      ? "image.single.noBenefit"
       : result.reference === "replaced"
-        ? translate(context.plugin.i18n, "image.single.quickSuccess")
-        : translate(context.plugin.i18n, "image.single.conflict"));
+        ? "image.single.quickSuccess"
+        : "image.single.conflict";
+    services.ui.notify(translate(context.plugin.i18n, outcomeKey));
+    return { kind: "notify", key: outcomeKey };
   } catch (error) {
     if (!signal.aborted) {
       context.logger.warn("压缩所选图片失败", error);
       services.ui.notify(translate(context.plugin.i18n, "image.single.failed"));
+      return { kind: "notify", key: "image.single.failed" };
     }
   }
 }
@@ -101,7 +120,7 @@ export async function compressSelectedImageCustom(
   scope: FeatureScope,
   editor: SingleImageEditorContext,
   services: ImageProcessingServices,
-): Promise<void> {
+): Promise<ImageActionOutcome | void> {
   const signal = scope.signal;
   if (!scope.active || signal.aborted) return;
   if (editor.disabled) return notify(context, services, "image.single.invalidTarget");
@@ -109,6 +128,12 @@ export async function compressSelectedImageCustom(
     const target = await resolveSelectedOccurrence(menuDetail, editor, services, signal);
     if (!scope.active || signal.aborted) return;
     if (!target) return notify(context, services, "image.single.unmappable");
+    const candidateDecision = classifyImageCandidate({
+      path: target.oldPath,
+      mode: "manual-dialog",
+      excludedExtensions: services.config().compression.excludedExtensions,
+    });
+    if (!candidateDecision.eligible) return notify(context, services, "image.single.noBenefit");
     const source = resolveSource(target.oldPath, services.origin);
     const config = services.config();
     let previewOriginal: Downloaded | undefined;
@@ -149,6 +174,10 @@ export async function compressSelectedImageCustom(
             compressedBytes: encoded.value.file.size,
             width: encoded.value.width,
             height: encoded.value.height,
+            quality: encoded.value.quality,
+            similarity: encoded.value.similarity,
+            targetSimilarity: encoded.value.targetSimilarity,
+            searchRounds: encoded.value.searchRounds,
           } satisfies ManualCompressionPreview;
         },
         save: async (preview, replace) => {
@@ -206,8 +235,9 @@ async function localizeRemoteOccurrence(
   return updatedTarget;
 }
 
-function notify(context: FeatureContext, services: ImageProcessingServices, key: string): void {
+function notify(context: FeatureContext, services: ImageProcessingServices, key: string): ImageActionOutcome {
   services.ui.notify(translate(context.plugin.i18n, key));
+  return { kind: "notify", key };
 }
 
 function findTargetImage(detail: unknown): HTMLImageElement | undefined {

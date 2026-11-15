@@ -5,6 +5,8 @@ import type { MenuRegistry } from "./MenuRegistry.ts";
 import type { Logger } from "./Logger.ts";
 import type { Compatibility } from "./Compatibility.ts";
 import type { SiyuanFrontend } from "./Platform.ts";
+import type { UiFeedback } from "./UiFeedback.ts";
+import type { PluginStatusBar } from "./PluginStatusBar.ts";
 
 export type FeatureId = string;
 export interface FeatureMetadata {
@@ -23,6 +25,8 @@ export interface FeatureContext {
   menus: MenuRegistry;
   compatibility: Compatibility;
   logger: Logger;
+  feedback?: UiFeedback;
+  statusBar?: PluginStatusBar;
   scope?: FeatureScope;
 }
 export interface FeatureCallbacks { onEnabled?: () => void; onDisabled?: () => void; onFailed?: (error: unknown) => void; }

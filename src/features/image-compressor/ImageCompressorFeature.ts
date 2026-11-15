@@ -82,7 +82,7 @@ export class ImageCompressorFeature extends BaseFeature {
     }
 
     registerAutoUpload(ctx.plugin, scope,
-      async rootID => {
+      rootID => {
         const config = this.config(ctx);
         const featureEnabled = scope.active && ctx.settings.getFeatureEnabled(this.meta.id, this.meta.defaultEnabled);
         const allowlisted = Boolean(config.auto.pageAllowlist[rootID]);
@@ -103,7 +103,7 @@ export class ImageCompressorFeature extends BaseFeature {
         return allowed;
       },
       services, ctx.logger,
-      notice => this.showAutoUploadNotice(ctx, scope, notice));
+      notice => controller.reportAutoUploadNotice(notice));
     this.installRemoteWatchers(ctx, scope, services);
   }
 

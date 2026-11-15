@@ -22,12 +22,12 @@ OmniKit 图片压缩功能为思源笔记提供安全、透明、可追溯的图
 
 | 维度 | 纳入范围 (In-Scope) | 排除范围 (Out-of-Scope) |
 |---|---|---|
-| **图片检测** | 编辑器新插入（拖入/粘贴）图片的异步捕获；授权文档中的新增 HTTP/HTTPS 图片 | 存量图片全库全量扫描；子文档递归继承授权 |
-| **图片格式** | 静态 PNG、JPEG、WebP（支持二次优化） | 动态图片（GIF、APNG、动画 WebP）、矢量图（SVG）、Excalidraw 绘图 |
-| **触发方式** | 自动上传捕获、右键单图操作（快捷压缩/弹窗微调，作用域仅限当前选中的单处引用）、当前文档批量压缩 | 笔记本全量扫描压缩、定时常驻扫描任务 |
+| **图片检测** | 编辑器新插入（拖入/粘贴）图片的异步捕获；授权文档中的新增 HTTP/HTTPS 图片；`ImageCandidateClassifier` 统一路径与扩展名前置排除（常见视频、矢量、专有绘图） | 存量图片全库全量扫描；子文档递归继承授权 |
+| **图片格式** | 静态 PNG、JPEG、WebP（支持二次优化）；标准 5 尺度 MS-SSIM 质量自适应评估 | 动态图片（GIF、APNG、动画 WebP）、矢量图（SVG）、常见视频、Excalidraw 绘图 |
+| **触发方式** | 自动上传捕获、右键单图操作（快捷压缩/弹窗微调，作用域仅限当前选中的单处引用）、当前文档批量压缩（桌面端 2 / 移动端 1 有界并发准备与确定性顺序写回） | 笔记本全量扫描压缩、定时常驻扫描任务 |
 | **文件管理** | 压缩 WebP 上传至思源 `assets`；原图始终保留 | 插件主动删除原图或 WebP 附件；自定义图片归档属性 |
 | **引用改写** | 精确块级单图片位置改写（Occurrence-level，基于节点核验而非整块字符串比对）；当前文档范围内按位置改写 | 跨文档全局重链接 (`relinkAsset`)；直接操作 `.sy` 文件或数据库 |
-| **任务控制** | 系统生命周期中断保护（保留已完成产物、不回滚）；未授权完全静默与零开销（Silent by Default & Low Overhead）；用户按 Esc、切标签页或触发 signal abort 判定为正常中止并静默退出，严禁误报为“无法定位引用”、“无效文档”或并发冲突；操作完成精准通知 | 用户主动取消按钮；任务排队队列；失败自动重试机制；未授权文档中挂载无意义 MutationObserver 或发起冗余 blockDOM 查询 |
+| **任务控制** | 系统生命周期中断保护（保留已完成产物、不回滚）；未授权完全静默与零开销（Silent by Default & Low Overhead）；用户按 Esc、切标签页或触发 signal abort 判定为正常中止并静默退出，严禁误报为“无法定位引用”、“无效文档”或并发冲突；Core `UiFeedback` 统一通知分层与防抖；Core `PluginStatusBar` 进度与当前文件展示 | 用户主动取消按钮；任务排队队列；失败自动重试机制；未授权文档中挂载无意义 MutationObserver 或发起冗余 blockDOM 查询 |
 
 ---
 
@@ -43,22 +43,56 @@ OmniKit 图片压缩功能为思源笔记提供安全、透明、可追溯的图
 
 ```mermaid
 flowchart TD
-    Start[检测到编辑器新插入图片] --> FCheck{图片压缩功能已启用?}
-    FCheck -- 否 --> SilentExit[完全静默，不处理]
-    FCheck -- 是 --> GlobalCheck{全局“自动压缩”已开启?}
-    GlobalCheck -- 是 --> CheckFormat[进入格式与阈值检查]
-    GlobalCheck -- 否 --> AllowlistCheck{当前文档 rootID 在白名单中?}
-    AllowlistCheck -- 是 --> CheckFormat
-    AllowlistCheck -- 否 --> SilentExit
+    Start[收到思源 before-upload-assets 事件] --> FCheck{scope.active && target == 'editor'}
+    FCheck -- 否 --> SilentExit[直接返回，不创建观察器]
+    FCheck -- 是 --> AuthCheck{shouldCompress: 同步核验全局开关或白名单?}
+    AuthCheck -- 否 --> SilentExit
+    AuthCheck -- 是 --> InputCheck{detail.input 预筛选含合规图片?}
+    InputCheck -- 否 --> SilentExit
+    InputCheck -- 是 --> Observe[创建 MutationObserver 并注册 onComplete]
+    Observe --> UploadFinish[等待上传完成与块落盘]
+    UploadFinish --> RecheckAuth{二次核验授权有效?}
+    RecheckAuth -- 否 --> SilentExit
+    RecheckAuth -- 是 --> Compress[进入图片分类与异步智能压缩]
 ```
 
 - **未授权静默与轻量化规范 (Silent by Default & Low Overhead)**：
   - **彻底无感静默**：当新插入图片所在文档未开启自动压缩（全局自动压缩未开启且文档 `rootID` 不在白名单中）时，系统**完全静默处理，直接返回 (`return`)，严禁派发 notice 或弹出“未开启自动压缩，已跳过”及任何形式的 Toast 气泡打扰用户编辑**；全量跳过时也保持无感静默；
-  - **尽早退出与零监听开销**：原生上传监听逻辑（`AutoUploadHandler`）在确认当前文档未获得自动授权后立即尽早退出，**绝对禁止在未授权场景下挂载无意义的 MutationObserver 观察器**，彻底杜绝无谓的性能损耗；
+  - **上传前纯同步授权与候选预筛选（零观察器开销）**：
+    1. 授权判断函数 `shouldCompress(rootID): boolean` 规范为纯同步判定，仅在内存中读取当前配置、Feature 运行状态与白名单，无任何异步 I/O；
+    2. 收到思源 `before-upload-assets` 事件时，首先核验 `scope.active`、`detail.target === "editor"` 与当前目标文档授权；
+    3. 同步基于 `detail.input` 进行候选图片预筛选（`files` 取 `File.name`，`local-files` 取 `path`），调用分类器 `classifyImageCandidate` 判断是否包含可处理图片；
+    4. **未授权或不包含可处理候选图片时，直接同步退出，不创建 `MutationObserver` 观察器，不注册 `onComplete` 回调**，实现零 DOM 监听开销；
+    5. 仅当文档授权通过且存在候选图片时，创建轻量 DOM 观察器并同步挂载 `onComplete` 监听；
+    6. 上传完成回调触发时，保留一次同步授权复核，防止用户在上传在途期间撤销授权；
   - 维持沉浸式写作环境，仅在真正进入压缩流程并产生实质性结果时才提供轻量通知。
 - **白名单规则**：
   - 白名单存储文档的唯一 `rootID`，不受文档改名或移动影响；界面展示时调用内核原生 `/api/filetree/getFullHPathByID` 展示包含笔记本全名的完整层级路径；
   - **白名单不继承**：仅对加入白名单的具体文档生效，子文档不继承父文档的白名单授权。
+
+### 2.3 统一图片准入分类器 (`ImageCandidateClassifier`)
+
+为了消除各入口重复实现与口径不一致隐患，系统确立统一的低开销路径与扩展名前置分类器：
+
+- **调用点权威收拢**：
+  1. `scanDocumentImages`：扫描当前文档 DOM 阶段进行前置过滤；
+  2. `AutoUploadHandler`：上传前从 `detail.input` 预筛选候选，上传完成后再次按确定路径过滤；
+  3. `RemoteImageWatcher`：外链下载前进行前置过滤；
+  4. `SingleImageAction`：远程本地化前进行前置过滤；
+  5. `ImageProcessingServices.prepareImage`：读取原图二进制前的最终入口再次核验；
+- **常见视频扩展名统一前置排除**：
+  - 常见视频扩展名集合：`mp4, m4v, mov, avi, wmv, flv, mkv, webm, 3gp, ogv, mpeg, mpg, mts, m2ts, ts, vob, asf, rm, rmvb, f4v`；
+  - 路径解析算法：若为完整 URL，先提取 `URL.pathname`；规范化反斜杠并截取末尾扩展名（小写匹配）。严格杜绝直接用整段 URL 进行子串匹配，防止因 Query 参数（如 `video.MP4?token=abc`）或伪装文件名（如 `photo.mp4.png`）导致误判；
+- **Excalidraw 与专有绘图资产保护**：
+  - 路径或文件名包含 `excalidraw`、或位于 `drawings` / `drawing` 专用目录的资源，统一识别为保护排除；
+  - 普通包含 `drawing` 字样的普通文件名（如 `drawing-of-cat.png`）不因单一子串被误伤；
+- **动图与矢量格式前置排除**：
+  - 动态格式（`gif`, `apng`）直接识别为 `animated-format` 跳过；
+  - 矢量格式（`svg`）直接识别为 `vector-format` 跳过；
+- **操作模式与 WebP 二次优化联动**：
+  - 静态 WebP 图片在自动上传（`auto`）、快捷单图（`manual-quick`）与文档批量（`document`）模式下默认识别为排除扩展名并跳过；
+  - 仅在手动弹窗微调模式（`manual-dialog`）下允许对 WebP 进行二次优化调整；
+- **分工明确**：分类器专职处理路径与扩展名低成本过滤；读取后的图片签名、MIME、多帧动图与像素尺寸验证继续由 `inspectImage()` 负责，分类器不重复解析二进制签名。
 
 ---
 
@@ -107,6 +141,43 @@ flowchart TD
 - 设置中提供“保留 EXIF 元数据”开关（默认关闭）；
 - 若当前 WebP 编码库未支持 EXIF 保留，该控件在 UI 上保持展示但处于禁用状态，并附带功能暂不支持说明。
 
+### 4.5 智能压缩质量计算规格 (Adaptive MS-SSIM Quality Search)
+
+智能压缩通过多尺度结构相似度（MS-SSIM）客观图像质量指标自适应寻找最优 WebP 编码质量，规格确立如下：
+
+- **子模块独立解耦**：
+  - 算法域收拢在 `src/features/image-compressor/similarity/` 独立子模块；
+  - 包含算法纯函数（`ms-ssim.ts`）、自适应搜索逻辑（`adaptive-quality-search.ts`）、Worker 会话驱动（`SimilarityWorkerSession.ts`）与内联 Worker 脚本（`similarity.worker.ts`）；
+  - 该模块不依赖思源内核 REST API、Protyle 编辑器 DOM 或文件存储体系，具备完全独立的纯函数单元测试能力。
+- **全平台标准 5 尺度 MS-SSIM 评估体系**：
+  - 全平台统一保留标准的 **5 尺度 MS-SSIM** 评估体系，不降低尺度数量以保证质量指标的客观一致性与跨端准确性；
+  - 5 尺度标准权重：`[0.0448, 0.2856, 0.3001, 0.2363, 0.1333]`；
+  - 局部平滑窗口：$11 \times 11$ 高斯平滑核，标准差 $\sigma = 1.5$；
+  - 通道加权与合成：RGB 三通道分别计算局部亮度（Luminance）、对比度（Contrast）与结构项（Structure），按标准亮度系数加权合并；
+  - **Alpha 通道与预乘优化 (Alpha-Premultiply)**：对含透明通道图片执行 Alpha 预乘，将全透明像素（$\alpha = 0$）的 RGB 色值归零，消除透明背景下因杂色数据导致的假性结构差异；同时当存在半透明像素时将 Alpha 相似度独立加权合并；
+  - 小尺寸图片自动安全截断尺度数，并对剩余权重重新归一化，杜绝除零或 NaN。
+- **平台算力分流与搜索预算**：
+  - 调用思源官方 `getFrontend()` 区分平台预算：
+    - **桌面端（`desktop` / `desktop-window` / `browser-desktop`）**：单张图片最多允许 7 轮质量搜索；
+    - **移动端（`mobile` / `browser-mobile`）**：单张图片最多允许 5 轮质量搜索；
+  - **像素基准边长归一化**：原图与候选图基准比较边长统一限制在不超过 512px（长边等比缩放至 512px，宽高比偏差 $\le 0.005$），确保高频特征比对精度与计算耗时的最佳平衡。
+- **自包含内联 Worker 与两阶段通信协议**：
+  - **Vite 内联打包机制**：Worker 脚本通过 Vite 原生 `import SimilarityWorker from "./similarity.worker.ts?worker&inline"` 打包为内联自包含 Blob Worker，彻底消除 CommonJS 打包产物与 `window.eval` 运行环境下的跨端路径解析与权限异常；
+  - **两阶段通信协议（节省 50% 以上计算量）**：
+    1. **阶段一：原图预计算 (`initOriginal`)**：单张图片质量搜索开始时，主线程向 Worker 传递原图 Blob。Worker 仅执行一次原图解码、Alpha 预乘、5 尺度降采样高斯金字塔构建，并常驻缓存原图各层的均值与方差统计量；
+    2. **阶段二：候选图轻量评估 (`evaluate`)**：后续质量探索轮次中，主线程仅向 Worker 传递当前轮次的候选 WebP Blob。Worker 仅对候选图进行单向解码与金字塔生成，直接与缓存的原图金字塔与统计量执行 MS-SSIM 卷积计算；
+  - 单次搜索复用同一 Worker 实例，任务完成、异常或取消（AbortSignal）时立即终止（`worker.terminate()`）并释放资源。
+- **带区间保护的割线法 + 二分法混合搜索**：
+  - 基于初始质量点探测（默认 0.80）；
+  - 未达标时以最大质量建立合格端点，已达标时以最小质量建立不合格端点，形成确定性收敛区间；
+  - 当割线预测点位于安全边界内部（距端点留有 10% 裕度）时采用割线法加速收敛；当预测越界、斜率分母过小或检测到非单调扰动时，安全回退二分法；
+  - 搜索质量严格位于 $[0.10, 1.00]$，质量区间容差为 0.01；
+  - 从所有达标候选（$\text{similarity} \ge \text{target}$）中挑选文件体积最小的一个。
+- **早停收敛与双收益门槛铁律**：
+  - **达标早停条件**：仅在“已达到目标相似度（默认 $\ge 0.99$）且候选 WebP 体积满足黄金收益门槛（原图 $\ge 100\text{ KiB}$，比原图节省 $\ge 4\text{ KiB}$ 且节省比例 $\ge 5\%$）”时，允许提前安全终止搜索；
+  - **不可达判定红线**：若最高质量（1.00）仍无法达到目标相似度，算法坚决判定为 `unreachable` 并返回未达标状态。系统绝对禁止将未达标的图片当作合格产物进行自动替换，保持原图引用不变；
+  - **收益不足跳过**：相似度达标但体积收益不足（未达到 4 KiB 或 5%）时，判定为 `insufficient-savings` 并跳过自动替换。
+
 ---
 
 ## 5. 菜单动作与用户交互
@@ -132,12 +203,18 @@ flowchart TD
   - 采用原图与 WebP 压缩图并列对比卡片布局，直观展示两端图片缩略图、像素尺寸、格式及体积；
   - 提供体积节省药丸徽章（Badge），显示节省字节与节省百分比；
   - 滑块带实时百分比数值气泡，调节 WebP 压缩质量（1%~100%）与手动最大边长；
+  - **智能质量搜索过程与指标展示**：
+    - 展示目标相似度指标（例如 99% MS-SSIM，明确说明为多尺度结构相似度指标，非“99% 像素完全相同”）；
+    - 展示最终评估相似度与最终推荐质量参数；
+    - 展开展示搜索过程表格：列出轮次（Round）、尝试质量（Quality）、评估相似度（MS-SSIM）、产物体积（Bytes）与采用的搜索方法（初始/端点/割线/二分）；
+    - 展示当前正在计算的轮次与加载动画；未达标或收益不足时给出明确提示；
   - 底部操作栏提供标准 `b3-button` 取消与确认按钮，提供“是否使用压缩图替换当前图片”复选框，**默认未勾选（仅保存不替换）**；
 - **作用域与结果**：
   - 用户确认保存后，上传 WebP 并记录至 Dock；
-  - 未勾选替换时，WebP 作为独立附件保存并写入 Dock 记录，界面提示 `[OmniKit] 图片压缩完成，WebP 已保存至记录`；
+  - 未勾选替换时，WebP 作为独立附件保存并写入 Dock 记录，由 Controller 统筹提示 `[OmniKit] 图片压缩完成，WebP 已保存至记录`；
   - 勾选替换时，作用域同样**严格限定为仅替换当前选中的单处引用**，并执行持久化前置闸门与写前节点读回比对；
-  - 关闭或取消弹窗不执行上传；用户按 Esc 或点击取消属于正常中止，静默退出。
+  - 重新调节质量或尺寸时清空旧搜索轮次并重新触发计算；
+  - 关闭或取消弹窗不执行上传；用户按 Esc 或点击取消属于正常中止，立即终止当前预览 Worker 并静默退出。
 
 ### 5.3 文档批量：`[OmniKit] 压缩当前文档图片`
 - **入口**：文档树节点右键菜单、编辑器标题区域右键菜单；
@@ -145,9 +222,15 @@ flowchart TD
   - 扫描当前文档中所有合规图片块（含折叠块）；
   - 跳过静态 WebP 图片；
   - 同源图片复用编码与上传结果，避免重复生成附件；
-  - 逐位置独立执行基于 `OccurrenceTarget` 的写前节点比对更新，允许部分位置成功、冲突位置跳过；
+  - **P2 已知字节数复用 (Zero Redundant I/O)**：准备阶段完成后，`OccurrenceCompressionResult` 返回已知大小（`originalBytes`、`compressedBytes`），批处理汇总统计直接复用，不重复读取磁盘文件；
+  - **P2 有界并发调度**：按平台前端预算控制准备阶段并发度（桌面端最大 2 并发，移动端最大 1 并发）；写回阶段严格保持按确定顺序逐项提交给 `SafeBlockWriter` 串行写租约与写前节点比对更新；
+  - **批量单图进度与底栏轻量反馈**：
+    - `DocumentBatchAction` 广播当前进度与当前图片文件名 `currentFile`；
+    - `ImageController` 将 `currentFile` 传递给 `ImageTaskPanel` 进度模态框，直观展示当前处理的文件名与 `completed / total` 进度；
+    - 同时，Controller 联动调用 Core `PluginStatusBar`，在支持的桌面客户端主窗口呈现单行轻量文本（如 `图片压缩 5/18 · photo.png`）；
+    - 移动端自动短路不操作状态栏，仅通过居中任务面板展示；
   - **空状态模态框联动销毁**：扫描当前文档若可处理图片数为 0，Controller 向用户弹出提示气泡（如“当前文档未发现可压缩图片”），**必须同时联动自动关闭/销毁居中的 `ImageTaskPanel` 进度模态框**，严禁悬挂空模态框；
-  - **正常中止静默规范**：批量任务执行期间用户关闭模态框、按 Esc 或切标签页，判定为正常中止，立即安全停止未执行的后续任务并静默退出，严禁误报为“无效文档”或业务错误；
+  - **正常中止静默规范**：批量任务执行期间用户关闭模态框、按 Esc 或切标签页，判定为正常中止，立即安全停止未执行的后续任务，彻底清除状态栏任务并静默退出，严禁误报为“无效文档”或业务错误；
   - 正常完成时由 Controller 统一发送单条汇总通知（包含成功数、节省体积、跳过数及冲突数）。
 
 ### 5.4 白名单快捷菜单与动态状态
@@ -331,18 +414,47 @@ sequenceDiagram
 - **空状态模态框联动销毁**：
   - 批量压缩 0 张可处理图片时，若弹出了轻量提示气泡，必须同时联动自动关闭/销毁居中的 `ImageTaskPanel` 进度模态框，杜绝模态框悬挂堆叠。
 
-### 8.2 结果通知规范
+### 8.2 结果通知规范与分层收口 (Controller & Core UiFeedback Integration)
+
+通知反馈体系严格遵循“Action 纯数据返回 -> Controller 领域解释 -> Core UiFeedback 统一呈现”的三层分工：
+
+```
+┌────────────────────────────────────────────────────────┐
+│ Action 纯领域层 (SingleImageAction / DocumentBatchAction)│
+│ - 仅返回纯数据结构 (ImageActionOutcome / Summary)     │
+│ - 严禁在 Action 内部直接调用 showMessage 发送通知     │
+└───────────────────────────┬────────────────────────────┘
+                            │ 返回纯数据结果
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│ Controller 门面层 (ImageController.ts)                 │
+│ - 唯一通知决策层，负责将领域纯数据解释为语义文案与参数 │
+│ - 调度 ImageTaskPanel 进度模态框与 Core PluginStatusBar│
+└───────────────────────────┬────────────────────────────┘
+                            │ 派发纯语义文案
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│ Core UiFeedback 平台服务 (FeatureContext.feedback)     │
+│ - 自动补齐 [OmniKit] 前缀                             │
+│ - 检查 scope.active，失活时静默丢弃未决通知           │
+│ - 自动拦截并吞咽 AbortError 与取消信号 (杜绝误报)       │
+│ - 300ms 消息防抖抑制高频重复弹出                      │
+└────────────────────────────────────────────────────────┘
+```
+
 - **自动压缩未授权静默原则 (Silent by Default)**：
   - 当在未授权文档（未开启全局自动压缩且文档未加入白名单）中插入图片时，系统**完全静默处理，严禁弹出“未开启自动压缩，已跳过”或任何 Toast 提示打扰用户编辑**；
-  - 只有在真正进入压缩流程并产生明确结果时，才提示对应的轻量气泡，杜绝打扰用户正常写作。
-- 各类触发路径（单图、文档批量、自动新图、Dock 引用管理）在真正执行并结束时，统一通过 `showMessage` 与 Dock 顶部提示条（Banner）发送明确客观的结果通知：
-  - **单文件场景**：
-    - 替换成功：`[OmniKit] 已替换当前引用为 WebP（节省体积 ${saved}）` 或 `[OmniKit] 已替换当前引用为 WebP`；
-    - 并发冲突放弃：`[OmniKit] 目标图片已被修改或移动，已放弃替换当前引用，WebP 已保存至记录`；
-    - 仅保存模式（微调弹窗未勾选替换）：`[OmniKit] 图片压缩完成，WebP 已保存至记录`；
-    - 收益不足跳过：`[OmniKit] 图片压缩收益不足，已跳过`；
-    - 压缩处理失败：`[OmniKit] 图片压缩处理失败，已保留原图`。
-  - **多文件 / 批量场景**：
+  - 仅在真正进入压缩流程并产生明确结果时，才提示对应的轻量气泡，杜绝打扰用户正常写作。
+- 各类触发路径在真正执行并结束时，统一由 Controller 调用 Core `UiFeedback` 发送明确客观的结果通知：
+  - **单文件场景 (`ImageActionOutcome`)**：
+    - 替换成功 (`success`)：`[OmniKit] 已替换当前引用为 WebP（节省体积 ${saved}）` 或 `[OmniKit] 已替换当前引用为 WebP`；
+    - 并发冲突放弃 (`conflict`)：`[OmniKit] 目标图片已被修改或移动，已放弃替换当前引用，WebP 已保存至记录`；
+    - 仅保存模式 (`saved-only`，微调弹窗未勾选替换)：`[OmniKit] 图片压缩完成，WebP 已保存至记录`；
+    - 收益不足跳过 (`skipped`)：`[OmniKit] 图片压缩收益不足，已跳过`；
+    - 目标相似度不可达 (`skipped`)：`[OmniKit] 无法达到目标相似度，已保留原图`；
+    - 压缩处理失败 (`failed`)：`[OmniKit] 图片压缩处理失败，已保留原图`；
+    - 正常取消 (`cancelled`)：完全静默退出，无通知。
+  - **多文件 / 批量场景 (`CompressionBatchSummary`)**：
     - 统一发送至多一条汇总通知，按分类清晰报告各项张数（例如：`[OmniKit] 图片处理完成：${success} 张已替换为 WebP（节省 ${saved}），${skipped} 张未达收益跳过，${conflict} 张因冲突放弃替换（WebP 已保存至记录）`）；
   - **Dock 双向引用管理场景**：
     - **主动查询无结果提示（中性语境，区分模式）**：
@@ -357,16 +469,18 @@ sequenceDiagram
 
 ## 9. 设置项结构与界面规范 (`feature-image-compressor-settings.json`)
 
-### 9.1 数据结构
+### 9.1 数据结构 (Schema Version 2)
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "auto": {
     "globalEnabled": false,
     "pageAllowlist": {}
   },
   "compression": {
+    "smartEnabled": false,
+    "targetSimilarity": 0.99,
     "initialQuality": 0.8,
     "manualMaxEdge": 4096,
     "excludedExtensions": ["gif", "svg", "webp"]
@@ -379,9 +493,11 @@ sequenceDiagram
 
 | 配置字段 | 类型 | 默认值 | 约束与说明 |
 |---|---|---|---|
-| `schemaVersion` | number | `1` | 配置结构版本，当前规格固定为 `1` |
+| `schemaVersion` | number | `2` | 配置结构版本，当前现行规格固定为 `2` |
 | `auto.globalEnabled` | boolean | `false` | 全局自动压缩开关（默认关闭） |
 | `auto.pageAllowlist` | object | `{}` | 精确文档 `rootID` 白名单映射表 |
+| `compression.smartEnabled` | boolean | `false` | 智能压缩质量搜索开关（默认关闭，保持轻量默认行为） |
+| `compression.targetSimilarity` | number | `0.99` | 智能压缩目标多尺度结构相似度指标 (MS-SSIM)，范围 `0.01` ~ `1.0` |
 | `compression.initialQuality` | number | `0.8` | 默认 WebP 压缩质量，范围 `0.01` ~ `1.0` |
 | `compression.manualMaxEdge` | number | `4096` | 手动压缩时的最大等比长边限制 (px)，范围 `256` ~ `8192` |
 | `compression.excludedExtensions` | string[] | `["gif", "svg", "webp"]` | 保护排除的扩展名列表 |
@@ -394,14 +510,24 @@ sequenceDiagram
      - **主标题（加粗）**：展示包含笔记本全名的完整层级路径（格式：`笔记本名/父文档/文档名`）；若内核返回为空或文档已删除，主标题回退展示 `rootID`；
      - **副标题 / 描述**：展示文档精确 ID（`rootID`），便于高级排查；
    - 每个条目右侧提供“移出白名单”快捷删除按钮。
-2. **User-Agent 配置说明**：
+2. **智能压缩设置控件**：
+   - 提供“智能质量搜索”开关控件，开启后启用基于 MS-SSIM 相似度的自适应搜索；
+   - 提供“目标相似度”数值滑块或输入框，范围 80%~99.9%（默认 99%），附带说明明确该指标为 MS-SSIM 结构相似度指标。
+3. **User-Agent 配置说明**：
    - 特性设置面板不包含 User-Agent 配置项；外链图片下载直接遵循 Core 平台全局设置。
-3. **特性重置按钮文案规范**：
+4. **特性重置按钮文案规范**：
    - 设置卡片右上角的重置操作按钮文案统一为**“重置为默认设置”**。
+
+### 9.3 配置文件版本平滑迁移规格 (Schema Version Migration)
+- 当从磁盘读取到 `schemaVersion: 1` 或缺少新增字段的旧配置时，系统执行确定性平滑迁移：
+  1. 补齐 `compression.smartEnabled = false` 与 `compression.targetSimilarity = 0.99`；
+  2. 完整保留用户已存在的全局开关、白名单列表、初始质量、最大边长及排除扩展名等配置值；
+  3. 将 `schemaVersion` 标记更新为 `2` 并持久化写入；
+  4. 迁移过程零数据丢失，对用户无感。
 
 ---
 
-## 10. 架构职责划分与代码去重规范 (Architecture Responsibilities & Clean Code)
+## 10. 架构职责划分与代码规范 (Architecture Responsibilities & Clean Code)
 
 为了消除多层重复判断、避免职责混乱引发假性报错或多重提示，特性内部确立严格的单向职责划分与所有权模型：
 
@@ -413,14 +539,17 @@ sequenceDiagram
    - 所有副作用与事件监听句柄由 `FeatureScope`（`context.scope.own`）集中托管与自动释放。
 2. **Controller 门面层 (`ImageController.ts`)**：
    - 唯一业务编排门面，严格把控前置参数校验与准入条件（全局自动压缩开关、白名单匹配判定）；
-   - 调度纯领域 Action 与进度模态框 `ImageTaskPanel`；
-   - **唯一负责对外用户反馈**：Controller 统一收口思源 `showMessage` 提示，杜绝多处或重复弹出提示气泡；
+   - 调度纯领域 Action、居中进度模态框 `ImageTaskPanel` 与 Core `PluginStatusBar` 底栏文本；
+   - 唯一负责领域结果解释：接收 Action 返回的纯数据结构，解释为多语言语义并调用 Core `UiFeedback` 发送通知；
    - 负责识别正常中止（用户 Esc、切标签页、关闭面板、AbortSignal），静默退出，严禁假报错。
 3. **Action 纯领域层 (`SingleImageAction.ts` / `DocumentBatchAction.ts` / `RemoteImageWatcher.ts` 等)**：
    - 纯领域逻辑执行者，专注执行扫描、节点匹配、WebP 编解码、文件上传与块级安全改写；
    - 严禁在 Action 内部直接调用 `showMessage` 弹出全局通知气泡，避免与 Controller 重复提示；
-   - 遇到异常、冲突或取消时，统一返回或抛出结构化结果，交由 Controller 统筹判定与汇报。
+   - 遇到异常、冲突或取消时，统一返回纯数据结构化结果（`ImageActionOutcome` / `CompressionBatchSummary` / `AutoUploadNotice`），交由 Controller 统筹判定与汇报。
+4. **独立算法子模块 (`src/features/image-compressor/similarity/`)**：
+   - 专职承担 5 尺度 MS-SSIM 计算、割线+二分混合自适应搜索、内联 Worker 调度；
+   - 纯计算无 DOM 或内核 API 依赖，通过标准 `SimilarityEvaluator` 接口与编码器及业务层解耦。
 
-### 10.2 代码去重与清理规范
-- **杜绝多层重复判断**：白名单与自动授权的准入校验仅在 Controller / Watcher 设防入口判定一次，禁止在下游 Action 和辅助函数中层层重复判断；
-- **精简与自包含原则**：不保留无引用的多余逻辑或冗余事件监听（如多余的 MutationObserver），保持业务链路精炼透明。
+### 10.2 代码去重与准入前置规范
+- **准入分类前置收敛**：所有图片候选过滤统一收拢于 `ImageCandidateClassifier`，禁止在各 Action 和辅助函数中散落重复的扩展名或专有绘图正则判断；
+- **授权判断纯同步化**：原生上传入口前置纯同步授权判断与文件预筛选，杜绝未授权场景下创建多余的 MutationObserver，保持业务链路精炼透明。
