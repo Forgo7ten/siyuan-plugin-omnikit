@@ -69,7 +69,7 @@ stateDiagram-v2
   - 重新从磁盘加载相关 JSON 配置，刷新内存缓存，并触发受影响 Feature 的动态状态切换（热启用/热停用/参数热更新）；重新读取的数据不触发二次写盘操作。
 - **`onunload(): void`**：
   - 触发全系统注销流程；
-  - 标记 `unloading = true`，不再接收或调度新任务；
+  - 标记 `unloading = true`，停止接收并拒绝调度新任务；
   - 依相反顺序停用所有运行中的 Feature；
   - 销毁 Unified Dock、MenuRouter 路由监听与全局事件总线。
 
@@ -102,7 +102,7 @@ export interface FeatureRegistration<T> {
   /** 国际化简要描述对应的 key */
   readonly descriptionKey: string;
   
-  /** 功能首次安装或无历史配置时的默认开关状态（由 Feature 自行声明） */
+  /** 功能首次安装或无持久化配置时的默认开关状态（由 Feature 自行声明） */
   readonly defaultEnabled: boolean;
   
   /** 
@@ -239,7 +239,7 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 2. **“数据管理 (Data Management)”专区**：
    - 在 OmniKit 统一总设置底部提供独立的“数据管理专区”；
    - 扫描并展示当前已持久化的业务数据文件列表、条目数量及磁盘占用；
-   - 提供二次确认对话框的“清空数据”操作，支持用户自主选择清除特定 Feature 的业务数据（如清空图片压缩历史记录）。
+   - 提供二次确认对话框的“清空数据”操作，支持用户自主选择清除特定 Feature 的业务数据（如清空图片压缩映射记录）。
 
 ---
 
@@ -273,7 +273,7 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 - **Dock 顶部视觉与防遮挡规范 (Brand Hero Card)**：
   - **Hero 品牌卡片区**：在 Dock 视图顶部常驻渲染约 52px~56px 高度的品牌展示区，包含 OmniKit 图标、粗体大标题（如「OmniKit / 图片记录」）与轻量模式徽章，背景采用思源原生主题微渐变浅背景（`var(--b3-theme-primary)` 8% 透明度）；
   - **几何空间防遮挡下移 (50px+)**：通过 Hero 卡片使下方操作栏（刷新记录、搜索筛选等按钮）整体平滑下移 50px 以上，彻底避开思源桌面端（Windows）及网页端右上角 32px 浮动 Snackbar 消息层（`#message` / `.b3-snackbars`）与 Tooltip 浮层的绝对遮挡，保障交互区域无遮挡点击；
-  - **静默刷新防覆盖铁律 (Anti-Overwriting Invariant)**：Dock 在改写操作后执行的后续静默刷新（`post_action`）若遇异常或返回空结果，绝对禁止冲刷或覆盖原有操作产生的成功统计文案；当待处理项降为 0 时必须干净收起抽屉并保留成功统计，杜绝悬挂假性“未找到引用”。
+  - **静默刷新防覆盖铁律 (Anti-Overwriting Invariant)**：Dock 在改写操作后执行的后续静默刷新（`post_action`）若遇异常或返回空结果，绝对禁止冲刷或覆盖本次操作产生的成功统计文案；当待处理项降为 0 时必须干净收起抽屉并保留成功统计，杜绝悬挂假性“未找到引用”。
 - **生命周期挂载**：Dock 内部组件基于 Svelte 5 的 `mount` / `unmount` 管理，在 Tab 切换或宿主 Dock 折叠时安全清理。
 
 ### 5.2 统一设置面板 (Unified Settings Panel)

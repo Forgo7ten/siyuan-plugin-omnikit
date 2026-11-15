@@ -22,7 +22,7 @@ OmniKit 是基于现代前端与思源笔记插件生态构建的高效、高可
 1. **微内核与单向依赖**：Core 平台层不感知具体 Feature 的内部实现，所有功能通过元数据驱动注入；
 2. **多实例与环境防护**：针对思源独立设置窗口（`body--settings`）进行无副作用纯渲染隔离；
 3. **确定性存储体系**：单文件 Promise 排队、30秒超时拦截、损坏备份恢复与配置/数据物理隔离；
-4. **防御性块级改写**：写前基于 `OccurrenceTarget` 精确节点读回核验（废除整块 HTML 字符串全等比对）、进程内写租约（Write Lease）与持久化前置闸门。
+4. **防御性块级改写**：写前基于 `OccurrenceTarget` 进行精确节点读回核验、采用进程内写租约（Write Lease）与持久化前置闸门。
 
 ---
 
@@ -155,7 +155,7 @@ flowchart TD
 - **主要职责**：
   - 每个业务功能继承 `BaseFeature`，通过 `context` 获得受控的 Core 基础设施；
   - `FeatureScope` 原生封装 `AbortController`：
-    - `scope.own(disposer)`：注册所有运行期副作用（Protyle 事件监听器、DOM 钩子、定时器）；统一由 `FeatureScope` 集中托管与注销，清理死代码；
+    - `scope.own(disposer)`：注册所有运行期副作用（Protyle 事件监听器、DOM 钩子、定时器）；统一由 `FeatureScope` 集中托管与自动注销；
     - `scope.signal`：向下传递的只读 `AbortSignal`；
     - `scope.guard(fn)`：包装异步回调，若 Scope 已销毁则直接短路，防止失效的幽灵回调执行；
   - **任务正常中止与静默退出设计 (Normal Abort & Quiet Exit)**：
@@ -186,7 +186,7 @@ flowchart TD
   - **Dock 顶部视觉与防遮挡规范 (Brand Hero Card)**：
     - 在 Dock 视图顶部常驻渲染约 52px~56px 高度的品牌展示区，包含 OmniKit 图标、粗体大标题（如「OmniKit / 图片记录」）与轻量模式徽章，背景采用思源原生主题微渐变浅背景（`var(--b3-theme-primary)` 8% 透明度）；
     - **几何防遮挡下移 (50px+)**：使下方操作栏（刷新记录、搜索筛选等按钮）整体平滑下移 50px 以上，彻底避开思源桌面端（Windows）及网页端右上角 32px 浮动 Snackbar 消息层（`#message` / `.b3-snackbars`）与 Tooltip 浮层的绝对遮挡，保障交互区域无遮挡点击；
-    - **静默刷新防覆盖铁律 (Anti-Overwriting Guard)**：Dock 在改写操作后执行的后续静默刷新（`post_action`）若遇异常或返回空结果，绝对禁止冲刷或覆盖原有操作产生的成功统计文案；当待处理项降为 0 时必须干净收起抽屉并保留成功统计，杜绝悬挂假性“未找到引用”；
+    - **静默刷新防覆盖铁律 (Anti-Overwriting Guard)**：Dock 在改写操作后执行的后续静默刷新（`post_action`）若遇异常或返回空结果，绝对禁止冲刷或覆盖本次操作产生的成功统计文案；当待处理项降为 0 时必须干净收起抽屉并保留成功统计，杜绝悬挂假性“未找到引用”；
   - 依托 Svelte 5 `mount` / `unmount` 精准控制各 Feature 视图的装载与卸载。
 - **统一菜单路由器 (`MenuRouter` / `MenuRegistry`)** (`src/core/MenuRouter.ts` / `MenuRegistry.ts`)：
   - 集中拦截思源上下文菜单事件（`event-bus`）；
@@ -306,7 +306,7 @@ sequenceDiagram
 │ Feature 层 (ImageCompressorFeature.ts)                                  │
 │ - 负责思源宿主事件与菜单监听注册 (Protyle 事件 / 文档右键 / 图片右键)    │
 │ - 负责提取宿主上下文 (Protyle 实例、blockID、rootID 等) 并派发给 Controller │
-│ - 所有副作用与监听句柄统一由 FeatureScope (scope.own) 集中托管与清理   │
+│ - 所有副作用与监听句柄统一由 FeatureScope (scope.own) 集中托管与注销   │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │ 派发事件上下文
                                     ▼
@@ -331,7 +331,7 @@ sequenceDiagram
 
 | 子模块文件 | 核心类 / 单元 | 职责与技术边界 |
 |---|---|---|
-| `ImageCompressorFeature.ts` | `ImageCompressorFeature` | Feature 入口；注册菜单、事件监听；提取 Protyle 与 blockID 上下文后直接委托 `ImageController`；所有监听句柄由 `FeatureScope` 集中托管与清理，清理多余重复判断与死代码 |
+| `ImageCompressorFeature.ts` | `ImageCompressorFeature` | Feature 入口；注册菜单、事件监听；提取 Protyle 与 blockID 上下文后直接委托 `ImageController`；所有监听句柄由 `FeatureScope` 集中托管与注销 |
 | `ImageController.ts` | `ImageController` | 业务编排唯一门面；负责全局开关与白名单准入校验；调度 Action 与 `ImageTaskPanel` 进度模态框；负责统一结果通知与正常中止识别 |
 | `AutoUploadHandler.ts` | `AutoUploadHandler` | 监听 Protyle 编辑器上传完成事件；**未授权静默与轻量化规范**：若当前文档未开启自动压缩，立即无感静默退出（直接 `return`），严禁派发 notice 或弹出任何提示气泡；且在确认未授权时尽早退出，严禁挂载无意义的 MutationObserver |
 | `RemoteImageWatcher.ts` | `RemoteImageWatcher` | 监听新插入 HTTP/HTTPS 外链图片；**未授权低开销设防**：在入口及 `sweep()` 扫描入口设防，未授权文档中严禁向内核发起 `blockDOM` 网络请求与全量 DOM 解析；授权文档中直接按 URL 下载并通过内核 API 本地化，不解析或分类目标 IP |
@@ -375,8 +375,8 @@ export function withBlockWriteLease<T>(key: string, operation: () => Promise<T>)
 在获得写租约后，改写流程遵循以下严谨步骤：
 1. 调用 `/api/block/getBlockDOM` 获取内核当前落盘的真实 DOM；
 2. 解析 DOM，定位索引为 `target.imageOrdinal` 的图片节点；
-3. **基于 OccurrenceTarget 的精确节点核验（废除整块 HTML 字符串全等比对）**：
-   - 废除整块 HTML 字符串全等比对，消除 Protyle 运行时自动刷新 `updated` 时间戳或光标属性对改写比对的假性干扰；
+3. **基于 OccurrenceTarget 的精确节点核验**：
+   - 采用块内精确节点特征比对而非整块 HTML 字符串比对，消除 Protyle 运行时自动刷新 `updated` 时间戳或光标属性对改写比对的假性干扰；
    - 严格核验节点三要素：
      1. 块归属未变（`blockID` 归属于目标 `rootID`）；
      2. 块内第 `imageOrdinal` 个图片节点依然存在；
@@ -437,7 +437,7 @@ await this.safeWriter.replaceOccurrence(target, uploadedPath);
   1. **用户主动展开查询（用户意图：查找引用）**：
      - 用户点击“查找原图引用”或“恢复原图引用”，触发定位；
      - 若结果集为空（`occurrences.length === 0`），Dock 顶部 Banner 按模式渲染中性提示：查找原图为空提示“当前笔记中未找到原图引用”；恢复原图为空提示“当前笔记中未找到压缩图引用”；
-     - 彻底废除历史陈旧且负面混淆的“没有可安全确认的图片位置，无法恢复。”文案；
+     - 若当前无满足条件的引用，提示明确的中性语境文案（如“当前笔记中未找到压缩图引用”），禁止展示混淆性的报错文案；
   2. **执行替换/恢复后的静默刷新与防覆盖机制 (Post-Operation Silent Refresh & Anti-Overwriting Guard)**：
      - 用户点击“替换此处”、“恢复此处”、“替换所有处”或“恢复所有处”执行改写；
      - 写回完成后，首先生成操作统计文案（如 `已替换 ${replaced} 处为压缩图；跳过或冲突 ${conflicts} 处` 或 `已恢复 ${restored} 处为原图；跳过或冲突 ${conflicts} 处`），并写入顶部 Banner 与全局轻量提示（`showMessage`）；
@@ -464,7 +464,7 @@ sequenceDiagram
     alt 检索到引用位置 (count > 0)
         Dock->>Dock: expanded = { path, mode }, 展开显示引用列表
     else 无匹配引用 (count == 0)
-        Dock->>Dock: 展示中性客观提示：<br/>"当前笔记中未找到原图引用" 或 "当前笔记中未找到压缩图引用"<br/>(彻底废除负面混淆文案)
+        Dock->>Dock: 展示中性客观提示：<br/>"当前笔记中未找到原图引用" 或 "当前笔记中未找到压缩图引用"
     end
     end
 
@@ -496,7 +496,7 @@ sequenceDiagram
   - 当扫描当前文档发现合规可压缩图片数为 0 时，Controller 若向用户弹出提示气泡（如“当前文档未发现可压缩图片”），**必须同时联动自动关闭/销毁居中的 `ImageTaskPanel` 进度模态框**，杜绝模态框悬挂堆叠在屏幕中央打扰用户；
 - **Dock 静默刷新防覆盖铁律 (Post-Operation Anti-Overwriting Guard)**：
   - 用户在 Dock 执行单项或全部替换/恢复操作后，触发的后续引用重新定位属于辅助静默刷新；
-  - 遇到网络异常或返回剩余 0 处引用时，**绝对不得冲刷覆盖原有操作产生的成功统计文案**；
+  - 遇到网络异常或返回剩余 0 处引用时，**绝对不得冲刷覆盖本次操作产生的成功统计文案**；
   - 剩余引用数为 0 时干净收起抽屉列表，持续保留操作成功统计，杜绝向用户悬挂假性“未找到引用”或负面报错。
 
 ---
