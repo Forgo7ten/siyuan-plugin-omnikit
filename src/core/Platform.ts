@@ -1,5 +1,13 @@
 export type FrontendKind = "desktop" | "mobile" | "unknown";
 
+export type SiyuanFrontend =
+  | "desktop"
+  | "desktop-window"
+  | "mobile"
+  | "browser-desktop"
+  | "browser-mobile"
+  | "all";
+
 type FrontendResolver = () => string | undefined;
 
 let frontendResolver: FrontendResolver | undefined;
@@ -11,6 +19,44 @@ let frontendResolver: FrontendResolver | undefined;
  */
 export function setFrontendResolver(resolver?: FrontendResolver): void {
   frontendResolver = resolver;
+}
+
+export function getCurrentFrontend(): SiyuanFrontend {
+  const reported = safeResolve();
+  if (
+    reported === "desktop" ||
+    reported === "desktop-window" ||
+    reported === "mobile" ||
+    reported === "browser-desktop" ||
+    reported === "browser-mobile" ||
+    reported === "all"
+  ) {
+    return reported;
+  }
+  if (typeof document !== "undefined" && document.body.classList.contains("body--mobile")) return "mobile";
+  if (typeof navigator !== "undefined" && /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent)) return "mobile";
+  return "desktop";
+}
+
+/**
+ * Checks whether the declared platforms support the target frontend.
+ * Conforms strictly to SiYuan kernel's `IsTargetSupported` logic:
+ * an empty/omitted list permits all frontends.
+ */
+export function isFrontendSupported(
+  declared?: readonly SiyuanFrontend[] | null,
+  current?: string,
+): boolean {
+  if (!declared || declared.length === 0) {
+    return true;
+  }
+  const target = current ?? getCurrentFrontend();
+  for (const v of declared) {
+    if (v === target || v === "all") {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function getFrontendKind(frontend?: string): FrontendKind {

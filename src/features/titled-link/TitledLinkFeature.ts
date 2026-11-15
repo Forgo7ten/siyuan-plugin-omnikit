@@ -25,6 +25,7 @@ export class TitledLinkFeature extends BaseFeature {
       icon: "iconLink",
       defaultEnabled: true,
       minimumAppVersion: "3.8.0",
+      frontends: ["all"],
     });
     // Ensure the registered feature settings file stays aligned with its storage contract.
     settings.store(TitledLinkFeature.ID);

@@ -6,5 +6,8 @@
 export function translate(source: Record<string, unknown> | undefined, key: string, values: Record<string, string | number> = {}): string {
   const value = source?.[key];
   if (typeof value !== "string") return key;
-  return value.replace(/\$\{([a-zA-Z0-9_]+)\}/g, (_match, name: string) => String(values[name] ?? ""));
+  return value.replace(/\$\{([a-zA-Z0-9_]+)\}|\{([a-zA-Z0-9_]+)\}/g, (_match, name1: string | undefined, name2: string | undefined) => {
+    const key = name1 ?? name2 ?? "";
+    return String(values[key] ?? "");
+  });
 }

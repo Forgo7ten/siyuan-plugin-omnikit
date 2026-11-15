@@ -10,6 +10,7 @@ export const imageCompressorRegistration = defineFeature<ImageFeatureConfig>({
   titleKey: "feature.imageCompressor.title",
   descriptionKey: "feature.imageCompressor.description",
   defaultEnabled: false,
+  frontends: ["all"],
   file: featureConfigFile("imageCompressor"),
   codec: { defaults: defaultImageFeatureConfig, parse: parseImageConfig },
   create: (plugin, settings) => new ImageCompressorFeature(plugin, settings),

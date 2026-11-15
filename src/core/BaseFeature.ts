@@ -1,7 +1,8 @@
 import type { FeatureContext, FeatureMetadata } from "./FeatureContext.ts";
 import { FeatureScope } from "./FeatureScope.ts";
+import { isFrontendSupported } from "./Platform.ts";
 
-export type FeaturePhase = "disabled" | "enabling" | "enabled" | "disabling" | "error";
+export type FeaturePhase = "disabled" | "enabling" | "enabled" | "disabling" | "error" | "unsupported";
 
 /**
  * @design A reusable lifecycle class. Runtime registrations live in FeatureScope.
@@ -17,8 +18,13 @@ export abstract class BaseFeature {
   private shutdown?: Promise<void>;
 
   protected constructor(readonly meta: FeatureMetadata) {}
-  get status(): FeaturePhase { return this.phase; }
-  get enabled(): boolean { return this.phase === "enabled" && this.scope?.active === true; }
+  get status(): FeaturePhase {
+    if (!isFrontendSupported(this.meta.frontends)) {
+      return "unsupported";
+    }
+    return this.phase;
+  }
+  get enabled(): boolean { return this.status === "enabled" && this.scope?.active === true; }
   get error(): unknown { return this.failure; }
 
   protected abstract onEnable(context: FeatureContext, scope: FeatureScope): void | Promise<void>;
@@ -26,6 +32,9 @@ export abstract class BaseFeature {
   protected onSettingsChanged(): void | Promise<void> {}
 
   async activate(context: FeatureContext): Promise<void> {
+    if (!isFrontendSupported(this.meta.frontends)) {
+      throw new Error(`Cannot activate feature ${this.meta.id}: unsupported frontend`);
+    }
     if (this.enabled) return;
     if (this.phase !== "disabled" && this.phase !== "error") {
       throw new Error(`Invalid activate phase: ${this.phase}`);

@@ -13,7 +13,7 @@ export function createSettingsWindow(deps: {
   registrations: readonly FeatureRegistration<any>[];
   settings: SettingsManager;
   manager?: FeatureManager;
-  t: (key: string) => string;
+  t: (key: string, values?: Record<string, string | number>) => string;
 }) {
   let current: Dialog | undefined;
   let teardown: (() => void) | undefined;

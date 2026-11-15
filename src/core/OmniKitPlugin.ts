@@ -106,7 +106,7 @@ export class OmniKitPlugin extends Plugin {
       context: featureContext!,
       views: () => registrations.flatMap(registration =>
         registration.dockView && this.manager?.isRunning(registration.id)
-          ? [{ id: registration.id, title: this.t(registration.titleKey), component: registration.dockView }]
+          ? [{ id: registration.id, title: this.t(registration.titleKey), component: registration.dockView, frontends: registration.frontends }]
           : []),
       t: (key, values) => this.t(key, values),
       openSettings: () => this.openSetting(),

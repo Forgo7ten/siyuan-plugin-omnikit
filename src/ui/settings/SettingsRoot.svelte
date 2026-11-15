@@ -4,12 +4,13 @@
   import type { SettingsManager, CoreSettings } from "../../core/SettingsManager.ts";
   import type { FeatureManager } from "../../core/FeatureManager.ts";
   import type { FeatureStatus } from "../../core/FeatureManager.ts";
+  import { isFrontendSupported, type SiyuanFrontend } from "../../core/Platform.ts";
 
   interface Props {
     registrations: readonly FeatureRegistration<any>[];
     settings: SettingsManager;
     manager?: FeatureManager;
-    t: (key: string) => string;
+    t: (key: string, values?: Record<string, string | number>) => string;
   }
 
   let { registrations, settings, manager, t }: Props = $props();
@@ -141,6 +142,24 @@
     } catch (cause) { error = String(cause); }
     finally { busy = false; }
   }
+
+  function formatPlatformName(frontend: SiyuanFrontend): string {
+    switch (frontend) {
+      case "desktop": return t("platform.desktop");
+      case "desktop-window": return t("platform.desktopWindow");
+      case "mobile": return t("platform.mobile");
+      case "browser-desktop": return t("platform.browserDesktop");
+      case "browser-mobile": return t("platform.browserMobile");
+      case "all": return t("platform.all");
+      default: return String(frontend);
+    }
+  }
+
+  function formatUnsupportedHint(frontends?: readonly SiyuanFrontend[]): string {
+    const list: readonly SiyuanFrontend[] = frontends && frontends.length > 0 ? frontends : ["all"];
+    const platforms = list.map(formatPlatformName).join(" / ");
+    return t("feature.unsupportedFrontend", { platforms });
+  }
 </script>
 
 <div class="omnikit-settings-root">
@@ -178,18 +197,29 @@
       {#each registrations as entry (entry.id)}
         {@const enabled = core.featureStates[entry.id]?.enabled ?? entry.defaultEnabled}
         {@const runtime = runtimeStatuses.find(status => status.id === entry.id)}
-        {@const isRunning = enabled && runtime?.status === "enabled"}
-        {@const isError = runtime?.status === "error"}
+        {@const isSupported = isFrontendSupported(entry.frontends)}
+        {@const isRunning = isSupported && enabled && runtime?.status === "enabled"}
+        {@const isError = isSupported && runtime?.status === "error"}
 
         <button
           class="nav-item"
           class:active={activeId === entry.id}
+          class:unsupported={!isSupported}
           onclick={() => scrollToSection(entry.id)}>
           <div class="nav-item-content">
-            <span class="status-indicator" class:running={isRunning} class:error={isError} class:disabled={!enabled}></span>
+            <span
+              class="status-indicator"
+              class:running={isRunning}
+              class:error={isError}
+              class:unsupported={!isSupported}
+              class:disabled={!enabled && isSupported}></span>
             <span class="item-label">{t(entry.titleKey)}</span>
           </div>
-          {#if enabled}
+          {#if !isSupported}
+            <span class="item-badge unsupported">
+              N/A
+            </span>
+          {:else if enabled}
             <span class="item-badge" class:error={isError}>
               {isError ? "!" : "ON"}
             </span>
@@ -264,30 +294,40 @@
         {@const needsFeatureRecovery = featureRecovery[entry.id] ?? settings.store(entry.id).needsRecovery}
         {@const enabled = core.featureStates[entry.id]?.enabled ?? entry.defaultEnabled}
         {@const runtime = runtimeStatuses.find(status => status.id === entry.id)}
-        {@const isRunning = enabled && runtime?.status === "enabled"}
+        {@const isSupported = isFrontendSupported(entry.frontends)}
+        {@const isRunning = isSupported && enabled && runtime?.status === "enabled"}
 
         <section
           id="section-{entry.id}"
           class="feature-card"
-          class:disabled-card={!enabled}
+          class:disabled-card={!enabled || !isSupported}
           bind:this={sectionMap[entry.id]}>
           <header class="card-header">
             <div class="card-title-group">
               <div class="title-with-badge">
                 <h2 class="card-title">{t(entry.titleKey)}</h2>
-                <span class="pill-badge" class:pill-active={isRunning} class:pill-error={runtime?.status === "error"} class:pill-muted={!enabled}>
-                  {t(`runtime.${runtime?.status ?? "disabled"}`)}
-                </span>
+                {#if !isSupported}
+                  <span class="pill-badge pill-unsupported">
+                    {t("runtime.unsupported")}
+                  </span>
+                {:else}
+                  <span class="pill-badge" class:pill-active={isRunning} class:pill-error={runtime?.status === "error"} class:pill-muted={!enabled}>
+                    {t(`runtime.${runtime?.status ?? "disabled"}`)}
+                  </span>
+                {/if}
               </div>
               <p class="card-desc">{t(entry.descriptionKey)}</p>
+              {#if !isSupported}
+                <p class="card-unsupported-hint">{formatUnsupportedHint(entry.frontends)}</p>
+              {/if}
             </div>
 
-            <label class="toggle-wrapper" title={t("feature.enabled")}>
+            <label class="toggle-wrapper" title={!isSupported ? t("runtime.unsupported") : t("feature.enabled")}>
               <input
                 class="b3-switch"
                 type="checkbox"
                 checked={enabled}
-                disabled={busy || coreRecovery || needsFeatureRecovery}
+                disabled={busy || coreRecovery || needsFeatureRecovery || !isSupported}
                 onchange={e => toggle(entry.id, e.currentTarget.checked)} />
             </label>
           </header>
@@ -304,8 +344,8 @@
               {/if}
             {/if}
 
-            <div class="view-wrapper" class:view-dimmed={!enabled}>
-              <View store={settings.store(entry.id)} runtimePhase={runtime?.status ?? "disabled"} {t} />
+            <div class="view-wrapper" class:view-dimmed={!enabled || !isSupported}>
+              <View store={settings.store(entry.id)} runtimePhase={runtime?.status ?? (!isSupported ? "unsupported" : "disabled")} {t} />
             </div>
           </div>
         </section>
@@ -451,6 +491,11 @@
     &.disabled {
       opacity: 0.4;
     }
+
+    &.unsupported {
+      opacity: 0.25;
+      background: var(--b3-theme-on-surface-light);
+    }
   }
 
   .item-badge {
@@ -464,6 +509,12 @@
     &.error {
       background: var(--b3-theme-error);
       color: #fff;
+    }
+
+    &.unsupported {
+      background: var(--b3-theme-surface-lighter);
+      color: var(--b3-theme-on-surface-light);
+      opacity: 0.7;
     }
   }
 
@@ -577,6 +628,18 @@
       background: var(--b3-theme-surface-lighter);
       color: var(--b3-theme-on-surface-light);
     }
+    &.pill-unsupported {
+      background: var(--b3-theme-surface-lighter);
+      color: var(--b3-theme-on-surface-light);
+      border: 1px dashed var(--b3-theme-on-surface-light);
+    }
+  }
+
+  .card-unsupported-hint {
+    margin: 0.35rem 0 0;
+    font-size: 0.8rem;
+    color: var(--b3-theme-on-surface-light);
+    line-height: 1.4;
   }
 
   .toggle-wrapper {

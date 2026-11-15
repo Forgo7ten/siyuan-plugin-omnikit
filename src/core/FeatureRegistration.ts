@@ -4,6 +4,7 @@ import type { BaseFeature } from "./BaseFeature.ts";
 import type { FeatureContext } from "./FeatureContext.ts";
 import type { JsonStore, StoreCodec } from "./JsonStore.ts";
 import type { SettingsManager } from "./SettingsManager.ts";
+import type { SiyuanFrontend } from "./Platform.ts";
 
 /**
  * @design Metadata remains available even when the feature runtime is stopped.
@@ -25,6 +26,7 @@ export interface FeatureRegistration<T> {
   }>;
   /** Optional feature-owned content for the shared OmniKit dock container. */
   dockView?: Component<{ context: FeatureContext; t: (key: string, values?: Record<string, string | number>) => string }>;
+  readonly frontends?: readonly SiyuanFrontend[];
 }
 
 function featureSlug(id: string): string {

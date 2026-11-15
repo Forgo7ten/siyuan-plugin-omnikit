@@ -2,12 +2,14 @@ import type { Component } from "svelte";
 import { mount, unmount } from "svelte";
 import type { Plugin } from "siyuan";
 import type { FeatureContext } from "../../core/FeatureContext.ts";
+import { isFrontendSupported, type SiyuanFrontend } from "../../core/Platform.ts";
 import { button, el } from "../common/dom.ts";
 
 export interface FeatureDockView {
   id: string;
   title: string;
   component: Component<{ context: FeatureContext; t: (key: string, values?: Record<string, string | number>) => string }>;
+  frontends?: readonly SiyuanFrontend[];
 }
 
 export interface RegisterDockOptions {
@@ -18,6 +20,13 @@ export interface RegisterDockOptions {
   views: () => FeatureDockView[];
   t: (key: string, values?: Record<string, string | number>) => string;
   openSettings: () => void;
+}
+
+export function filterSupportedDockViews<T extends { frontends?: readonly SiyuanFrontend[] }>(
+  views: readonly T[],
+  currentFrontend?: string,
+): T[] {
+  return views.filter(view => isFrontendSupported(view.frontends, currentFrontend));
 }
 
 /** Stable selection across enable/disable while keeping one-view and empty states explicit. */
@@ -44,7 +53,7 @@ export function registerDock(plugin: Plugin, options: RegisterDockOptions): () =
     element.replaceChildren();
     element.append(el("h2", "omnikit-heading", options.title));
 
-    const views = options.views();
+    const views = filterSupportedDockViews(options.views());
     const state = dockViewState(views, selectedID);
     selectedID = state.selected?.id;
     if (state.showTabs) {

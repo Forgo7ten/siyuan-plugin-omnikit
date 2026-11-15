@@ -40,8 +40,8 @@ flowchart TD
 
     subgraph Core["OmniKit Core 平台层 (src/core/ & src/ui/)"]
         PluginEntry["OmniKitPlugin (插件主入口)"]
-        Catalog["FeatureCatalog (元数据仓库)"]
-        Manager["FeatureManager (串行生命周期状态机)"]
+        Catalog["FeatureCatalog (元数据仓库 & frontends 契约)"]
+        Manager["FeatureManager (平台兼容设防与串行状态机)"]
         Scope["FeatureScope (AbortSignal & 资源作用域)"]
         
         subgraph CoreInfra["基础设施与驱动"]
@@ -49,7 +49,7 @@ flowchart TD
             SettingsMgr["SettingsManager (多文件配置协调器)"]
             JsonStore["JsonStore (并发队列/超时/容灾)"]
             Logger["Logger (动态等级日志)"]
-            Platform["Platform (环境与端类型探测)"]
+            Platform["Platform (环境探测 & IsTargetSupported 判定)"]
         end
         
         subgraph CoreUI["统一宿主 UI 容器"]
@@ -145,9 +145,37 @@ flowchart TD
 ### 3.2 `FeatureCatalog` 与 `FeatureManager` (生命周期与状态机)
 - **文件位置**：`src/core/FeatureCatalog.ts`、`src/core/FeatureManager.ts`
 - **主要职责**：
-  - `FeatureCatalog` 集中持有所有 Feature 的声明式元数据（`FeatureRegistration<T>`），对外暴露只读索引；
-  - `FeatureManager` 维护每个 Feature 的严格串行化启停队列（Promise Queue）；
-  - **四阶段状态机**：`disabled` $\to$ `enabling` $\to$ `enabled` $\to$ `disabling` $\to$ `disabled`（异常流转为 `error`）；
+  - `FeatureCatalog` 集中持有所有 Feature 的声明式元数据（`FeatureRegistration<T>`），包含 `id`、`defaultEnabled` 及支持端声明 `frontends` 等，对外暴露只读索引与存储文件命名合法性校验；
+  - `FeatureManager` 维护每个 Feature 的严格串行化启停队列（Promise Queue），提供跨端安全的生命周期调度；
+  - **六状态机模型 (`FeaturePhase`)**：
+    - `disabled`：未激活停用状态；
+    - `unsupported`：宿主前端平台不兼容状态；
+    - `enabling`：正在分配 Scope 与执行异步初始化；
+    - `enabled`：已成功激活并正常运行；
+    - `disabling`：正在广播中止信号与安全注销资源；
+    - `error`：启停或执行遭遇未捕获异常；
+
+```mermaid
+stateDiagram-v2
+    [*] --> Disabled
+    Disabled --> Unsupported: 平台兼容性核验不满足 (Platform.isFrontendSupported)
+    Disabled --> Enabling: enable() [进入串行队列 & 平台兼容]
+    Enabling --> Enabled: onEnable() 成功完成
+    Enabling --> Error: onEnable() 抛出异常
+    
+    Enabled --> Disabling: disable() [进入串行队列]
+    Disabling --> Disabled: onDisable() 成功完成
+    Disabling --> Error: onDisable() 抛出异常
+    
+    Unsupported --> Disabled: 运行环境切换为兼容平台
+    Error --> Enabling: 重试启用
+    Error --> Disabling: 强制重置
+```
+
+  - **平台兼容性设防与云同步偏好保护 (Platform Compatibility Guard)**：
+    1. **启动与热重载设防**：在 `initialize()` 与 `reconcileFromLoadedSettings()` 阶段，`FeatureManager` 调用 `Platform.isFrontendSupported(feature.frontends)` 核验当前运行环境。若环境不支持，立即跳过生命周期激活（不调用 `feature.activate()` 与 `onEnable()`，不分配 `FeatureScope`，不占用任何常驻定时器、DOM 节点或事件总线），将运行时状态置为 `"unsupported"`；
+    2. **`setEnabled` 安全拦截机制**：当外界或 API 尝试显式调用 `setEnabled(id, true)` 或 `enable(id)` 时，若当前平台不支持该功能，`FeatureManager` 直接拒绝状态变更（返回 `false`），且**绝对不调用 `settings.setFeatureEnabled(id, true)`**；
+    3. **跨端同步状态保全**：严格保护底层 `omnikit-core.json` 中用户的期望启用偏好。在多端云同步架构中，轻量端（如移动端）因平台受限进入 `unsupported` 状态绝不反向冲刷用户的开启偏好，确保在主力设备（如桌面端）上始终维持预期的开启状态；
   - 当 Feature 启动失败时，置状态为 `error` 并记录异常，保持用户在 `omnikit-core.json` 中配置的期望偏好不变。
 
 ### 3.3 `BaseFeature` 与 `FeatureScope` (资源作用域与中止信号)
@@ -183,14 +211,23 @@ flowchart TD
 - **统一 Dock 容器** (`src/ui/dock/`)：
   - 仅占用思源侧边栏 **1 个图标位置**；
   - 内部实现 Svelte 5 驱动的 Tab 路由管理器：当多个 Feature 启用 Dock 视图时展示 Tab 头；仅单个 Feature 启用时独占主视图；全停用时呈现空状态指引；
+  - **平台兼容性排除**：Dock 动态视图提取函数（`views()`）严格筛选 `this.manager?.isRunning(id)` 的 Feature。处于 `unsupported` 状态的功能不被视作运行中，自动排除在 Dock Tab 之外，不产生多余标签页与空 DOM 挂载；
   - **Dock 顶部视觉与防遮挡规范 (Brand Hero Card)**：
     - 在 Dock 视图顶部常驻渲染约 52px~56px 高度的品牌展示区，包含 OmniKit 图标、粗体大标题（如「OmniKit / 图片记录」）与轻量模式徽章，背景采用思源原生主题微渐变浅背景（`var(--b3-theme-primary)` 8% 透明度）；
     - **几何防遮挡下移 (50px+)**：使下方操作栏（刷新记录、搜索筛选等按钮）整体平滑下移 50px 以上，彻底避开思源桌面端（Windows）及网页端右上角 32px 浮动 Snackbar 消息层（`#message` / `.b3-snackbars`）与 Tooltip 浮层的绝对遮挡，保障交互区域无遮挡点击；
     - **静默刷新防覆盖铁律 (Anti-Overwriting Guard)**：Dock 在改写操作后执行的后续静默刷新（`post_action`）若遇异常或返回空结果，绝对禁止冲刷或覆盖本次操作产生的成功统计文案；当待处理项降为 0 时必须干净收起抽屉并保留成功统计，杜绝悬挂假性“未找到引用”；
   - 依托 Svelte 5 `mount` / `unmount` 精准控制各 Feature 视图的装载与卸载。
+- **统一设置面板 (`SettingsRoot.svelte`)** (`src/ui/settings/`)：
+  - 采用 iPad 风格双栏联动布局（左侧导航分组 + 右侧单页平滑滚动卡片）；
+  - **平台兼容性设防架构 (方案 A：卡片保持展示，总开关置灰禁用，专属设置可预先调整)**：
+    - 针对 `runtime.status === "unsupported"` 的 Feature，设置卡片在右侧正常排布渲染，左侧导航正常提供平滑定位，维持全端 UI 结构与视觉一致性；
+    - **总开关置灰禁用（Disabled Guard）**：卡片头部总开关设置 `disabled` 属性置灰禁用，不可点击切换，彻底阻止非法生命周期触发；
+    - **状态 Badge 与平台说明**：卡片顶部 Badge 渲染 `runtime.unsupported`（「当前平台暂不支持」），并展示友好的支持平台列表说明（如“仅支持：桌面端、桌面窗口”）；
+    - **专属设置项允许预调**：卡片主体内的专属设置组件（`settingsView`）保持挂载并允许交互调整，满足跨端云同步场景下提前配置参数的诉求；修改保存仅局限于其专属配置文件 `feature-{id}-settings.json`，绝对不触碰 `omnikit-core.json`；
 - **统一菜单路由器 (`MenuRouter` / `MenuRegistry`)** (`src/core/MenuRouter.ts` / `MenuRegistry.ts`)：
   - 集中拦截思源上下文菜单事件（`event-bus`）；
   - 严格校验菜单所属 Feature 的运行态（`phase === "enabled"`）；
+  - **平台兼容性排除**：处于 `unsupported` 状态的功能未被激活且无 `FeatureScope`，不向 `MenuRegistry` 注入任何菜单动作项；`isFeatureRunning` 核验天然拦截，外部宿主上下文菜单与顶栏快捷菜单自动跳过渲染，无冗余开销；
   - **顶栏菜单与分隔线规范**：
     - OmniKit 顶栏下拉菜单顶部为 Core 平台项：包含「OmniKit 设置」（Dock 栏已有常驻图标，顶栏不设立重复的 Dock 菜单项）；
     - Core 平台项与下方各 Feature 贡献的选项之间，**必须使用视觉分隔线 (`separator`) 进行物理隔离**；
@@ -509,7 +546,7 @@ sequenceDiagram
 1. **需求规范先行**：在 `docs/features/<feature-name>.md` 编写完整的业务需求与约束规范，获得评审冻结；
 2. **建立特性目录**：在 `src/features/<feature-name>/` 下创建特性包，包括：
    - `settings.ts`：定义配置 TypeScript 类型与默认值；
-   - `registration.ts`：定义 `FeatureRegistration<T>` 元数据，指定配置文件为 `feature-{id}-settings.json`；
+   - `registration.ts`：定义 `FeatureRegistration<T>` 元数据，声明支持端列表 `frontends`（可选，5+1 取值集合，省略或空数组时默认为全端支持），指定配置文件为 `feature-{id}-settings.json`；
    - `<FeatureName>Feature.ts`：派生自 `BaseFeature`，重写 `onEnable()` 与 `onDisable()`；
    - `<FeatureName>SettingsPanel.svelte`：Svelte 5 实现的专属设置组件；
    - 可选：若有 Dock 需求，提供 Svelte 5 Dock 视图组件。
@@ -520,6 +557,7 @@ sequenceDiagram
 ### 6.2 技术契约自查清单 (Contract Checklist)
 - [ ] Feature 是否纯粹面向 `BaseFeature` 和 `FeatureContext` 编程？
 - [ ] 是否不存在任何跨 Feature 的直接代码引用（`import`）？
+- [ ] 是否按需声明了平台兼容性列表 `frontends`（5+1 取值集合，缺失或空数组时默认为全端支持）？在不受支持的环境下是否平稳保持在 `unsupported` 状态，不挂载任何资源与菜单，且不破坏跨端云同步中的启用偏好？
 - [ ] 设置文件命名是否严格为 `feature-${id}-settings.json`？
 - [ ] 业务数据文件命名是否严格为 `feature-${id}-{dataname}.json`？
 - [ ] 长时间异步任务是否传递并感知了 `context.scope.signal`？

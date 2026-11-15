@@ -9,6 +9,7 @@ export const titledLinkRegistration = defineFeature<TitledLinkConfig>({
   titleKey: "feature.titledLink.title",
   descriptionKey: "feature.titledLink.description",
   defaultEnabled: true,
+  frontends: ["all"],
   file: featureConfigFile("titled-link"),
   codec: titledLinkSettingsCodec,
   create: (plugin, settings) => new TitledLinkFeature(plugin, settings),

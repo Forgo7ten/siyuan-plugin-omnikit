@@ -4,12 +4,14 @@ import type { SettingsManager } from "./SettingsManager.ts";
 import type { MenuRegistry } from "./MenuRegistry.ts";
 import type { Logger } from "./Logger.ts";
 import type { Compatibility } from "./Compatibility.ts";
+import type { SiyuanFrontend } from "./Platform.ts";
 
 export type FeatureId = string;
 export interface FeatureMetadata {
   id: FeatureId; title: string; description: string;
   category: "media" | "document" | "text" | "workspace" | "other";
   icon: string; defaultEnabled: boolean; minimumAppVersion?: string;
+  readonly frontends?: readonly SiyuanFrontend[];
 }
 /**
  * @design The context exposes core capabilities only. It never carries resolved settings

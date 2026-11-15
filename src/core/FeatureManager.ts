@@ -1,6 +1,7 @@
 import type { BaseFeature } from "./BaseFeature.ts";
 import type { FeatureContext } from "./FeatureContext.ts";
 import { FeatureCatalog } from "./FeatureCatalog.ts";
+import { isFrontendSupported } from "./Platform.ts";
 
 export interface FeatureStatus {
   id: string;
@@ -33,6 +34,10 @@ export class FeatureManager {
   async initialize(): Promise<void> {
     for (const feature of this.catalog.all()) {
       if (this.frozen) return;
+      if (!isFrontendSupported(feature.meta.frontends)) {
+        this.context.logger.debug(`跳过不支持当前平台的功能：${feature.meta.id}`);
+        continue;
+      }
       const shouldEnable = this.context.settings.getFeatureEnabled(feature.meta.id, feature.meta.defaultEnabled);
       this.context.logger.debug(`启动功能：${feature.meta.id}`, { 期望启用: shouldEnable });
       if (!shouldEnable) continue;
@@ -67,6 +72,11 @@ export class FeatureManager {
   setEnabled(id: string, desired: boolean, persist = true): Promise<boolean> {
     const feature = this.catalog.get(id);
     if (!feature) return Promise.resolve(false);
+
+    if (!isFrontendSupported(feature.meta.frontends)) {
+      this.context.logger.warn(`功能 ${id} 在当前平台不支持，已安全忽略切换请求`);
+      return Promise.resolve(false);
+    }
 
     return this.enqueue(id, async current => {
       if (this.frozen) return false;
@@ -133,6 +143,10 @@ export class FeatureManager {
   async reconcileFromLoadedSettings(): Promise<void> {
     for (const feature of this.catalog.all()) {
       if (this.frozen) return;
+      if (!isFrontendSupported(feature.meta.frontends)) {
+        this.context.logger.debug(`跳过不支持当前平台的功能：${feature.meta.id}`);
+        continue;
+      }
       const desired = this.context.settings.getFeatureEnabled(feature.meta.id, feature.meta.defaultEnabled);
       await this.enqueue(feature.meta.id, async current => {
         if (this.frozen) return false;
@@ -182,7 +196,7 @@ export class FeatureManager {
       id: feature.meta.id,
       title: feature.meta.title,
       description: feature.meta.description,
-      status: feature.status,
+      status: !isFrontendSupported(feature.meta.frontends) ? "unsupported" : feature.status,
       error: describeError(this.getStartupError(feature.meta.id)),
     }));
   }

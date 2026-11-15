@@ -59,14 +59,14 @@ stateDiagram-v2
   - 初始化平台环境适配器 `Platform` 与日志管理器 `Logger`；
   - 初始化核心配置存储 `SettingsManager` 并加载 `omnikit-core.json`；
   - 注册 Feature 元数据到 `FeatureCatalog`；
-  - 启动默认启用且配置声明开启的 Feature；
+  - 依据配置声明与平台兼容性契约串行启动 Feature：受支持且配置开启的 Feature 进入激活流程；不受当前平台支持的 Feature 保持休眠并标记状态为 `unsupported`；
   - 注册 Unified Dock、TopBar 入口及全局设置窗口实例。
 - **`onLayoutReady(): void`**：
   - 思源主界面 DOM 与编辑器完全渲染就绪；
   - 触发已启用 Feature 的 `onLayoutReady` 钩子，执行依赖编辑器 DOM 的初始化检测。
 - **`onDataChanged(): void`**：
   - 当外部环境或独立设置窗口修改并持久化了配置文件时触发；
-  - 重新从磁盘加载相关 JSON 配置，刷新内存缓存，并触发受影响 Feature 的动态状态切换（热启用/热停用/参数热更新）；重新读取的数据不触发二次写盘操作。
+  - 重新从磁盘加载相关 JSON 配置，刷新内存缓存，并触发受影响 Feature 的动态状态切换（受支持环境下的热启用/热停用/参数热更新；不受支持平台持续保持 `unsupported` 阻断）；重新读取的数据不触发二次写盘操作。
 - **`onunload(): void`**：
   - 触发全系统注销流程；
   - 标记 `unloading = true`，停止接收并拒绝调度新任务；
@@ -92,6 +92,23 @@ stateDiagram-v2
 每个 Feature 在 `src/features/<feature-name>/registration.ts` 中声明标准元数据，Core 不硬编码具体 Feature 的配置字段。
 
 ```typescript
+/**
+ * 思源笔记支持的前端平台运行环境契约（5+1 取值集合）
+ * - "desktop": 桌面客户端主窗口 (Electron)
+ * - "desktop-window": 桌面端独立拆分窗口
+ * - "mobile": 移动端原生 App (Android / iOS)
+ * - "browser-desktop": 桌面端浏览器访问
+ * - "browser-mobile": 移动端浏览器访问
+ * - "all": 全端通用支持（通配符）
+ */
+export type SiyuanFrontend =
+  | "desktop"
+  | "desktop-window"
+  | "mobile"
+  | "browser-desktop"
+  | "browser-mobile"
+  | "all";
+
 export interface FeatureRegistration<T> {
   /** 唯一功能标识符（小写驼峰或 kebab-case，如 "image-compressor"） */
   readonly id: string;
@@ -104,6 +121,13 @@ export interface FeatureRegistration<T> {
   
   /** 功能首次安装或无持久化配置时的默认开关状态（由 Feature 自行声明） */
   readonly defaultEnabled: boolean;
+
+  /**
+   * 功能支持的前端平台环境白名单列表（可选）
+   * 采用 5+1 取值集合：desktop, desktop-window, mobile, browser-desktop, browser-mobile, all
+   * 省略或为空数组时默认为全端通用支持 (即 ["all"])
+   */
+  readonly frontends?: readonly SiyuanFrontend[];
   
   /** 
    * Feature 用户配置文件名，严格遵循命名约束：
@@ -139,7 +163,8 @@ export interface FeatureRegistration<T> {
 ```mermaid
 stateDiagram-v2
     [*] --> Disabled
-    Disabled --> Enabling: enable() [进入串行队列]
+    Disabled --> Unsupported: 平台兼容性核验不满足
+    Disabled --> Enabling: enable() [进入串行队列 & 平台兼容]
     Enabling --> Enabled: onEnable() 成功完成
     Enabling --> Error: onEnable() 抛出异常
     
@@ -147,18 +172,32 @@ stateDiagram-v2
     Disabling --> Disabled: onDisable() 成功完成
     Disabling --> Error: onDisable() 抛出异常
     
+    Unsupported --> Disabled: 运行环境切换为受支持平台
     Error --> Enabling: 重试启用
     Error --> Disabling: 强制重置
 ```
 
 - **状态定义 (`FeaturePhase`)**：
   - `disabled`：功能已停用，不占用任何常驻定时器、DOM 节点或事件总线。
+  - `unsupported`：功能在当前宿主前端平台不受支持。功能保持静态休眠，不创建 `FeatureScope`，不挂载任何事件监听、DOM 节点或定时器，不注册 Dock 视图与菜单动作。
   - `enabling`：初始化与启用中，正在创建 Scope、加载数据与挂载监听。
   - `enabled`：正常运行状态。
   - `disabling`：正在安全停止业务、触发 AbortSignal、注销菜单与释放资源。
   - `error`：启停过程中遭遇未捕获异常。错误信息记录至日志并在设置面板展示告警，系统保留用户在 `omnikit-core.json` 中配置的期望启用状态不变。
 
-### 3.3 `FeatureScope` 与任务安全中止机制
+### 3.3 平台兼容性生命周期设防与云同步偏好保护 (Platform Compatibility Guard)
+
+OmniKit 运行于思源笔记丰富的跨端环境（桌面客户端、移动端 App、浏览器 Web 端等）。针对不同平台能力差异（如桌面专属算力或原生系统调用限制），系统确立平台兼容性前置设防机制：
+
+1. **环境前置设防准入**：
+   - 在系统启动（`initialize`）与外部配置变更（`reconcileFromLoadedSettings`）时，`FeatureManager` 调用 `Platform.isFrontendSupported(feature.frontends)` 检查当前环境是否匹配；
+   - 若当前前端环境不受支持，系统直接跳过生命周期激活，不调用 `feature.activate()` 与 `onEnable()`，不分配 `FeatureScope`，将运行时状态标记为 `"unsupported"`；
+2. **`setEnabled` 安全拦截与云同步防污染铁律**：
+   - 当外部或 API 尝试显式调用 `setEnabled(id, true)` 或 `enable(id)` 时，若当前平台不支持该 Feature，Core 必须执行安全拦截，直接拒绝激活并返回失败；
+   - **绝对不调用 `settings.setFeatureEnabled`**：系统严格禁止修改 `omnikit-core.json` 中的 `featureStates[id].enabled` 偏好状态；
+   - **跨端偏好保全机制**：该机制保障思源多端云同步环境下的偏好纯洁性。当用户在桌面端启用了某特性，配置通过云同步流转至移动端后，移动端因平台能力受限将该特性标记为 `unsupported` 并阻断运行，但绝不反向冲刷或覆盖用户在桌面端的开启意图；当用户重新在桌面端打开思源时，该特性依然自动正常启用。
+
+### 3.4 `FeatureScope` 与任务安全中止机制
 
 每个处于 `enabled` 状态的 Feature 拥有一个独立的 `FeatureScope` 实例：
 1. **统一副作用所有权 (`scope.own`)**：所有事件监听（Protyle 监听、总线事件）、DOM 事件、定时器、Svelte 挂载句柄必须通过 `scope.own(disposer)` 托管。
@@ -269,7 +308,8 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 - **容器交互规则**：
   1. **多视图切换**：当有 2 个及以上已启用的 Feature 注册了 `dockView` 时，容器顶部渲染轻量 Tab 切换栏；
   2. **单视图独占**：当仅有 1 个启用的 Feature 注册了 `dockView` 时，自动隐藏 Tab 栏，该 Feature 独占整个 Dock 主视图；
-  3. **空状态引导**：当所有 Feature 被禁用或没有启用的 Feature 提供 `dockView` 时，Dock 渲染“空状态”引导页，展示各 Feature 概览并提供“进入设置开启功能”的跳转按钮。
+  3. **空状态引导**：当所有 Feature 被禁用或没有启用的 Feature 提供 `dockView` 时，Dock 渲染“空状态”引导页，展示各 Feature 概览并提供“进入设置开启功能”的跳转按钮；
+  4. **平台兼容性联动**：不支持当前平台的 Feature（`runtime.status === "unsupported"`）自动跳过 Dock Tab 注册。即使该 Feature 注册了 `dockView` 且在 `omnikit-core.json` 中配置为期望开启，因其未实际激活运行，Unified Dock 容器绝不为其渲染 Tab 标签或独占视图。
 - **Dock 顶部视觉与防遮挡规范 (Brand Hero Card)**：
   - **Hero 品牌卡片区**：在 Dock 视图顶部常驻渲染约 52px~56px 高度的品牌展示区，包含 OmniKit 图标、粗体大标题（如「OmniKit / 图片记录」）与轻量模式徽章，背景采用思源原生主题微渐变浅背景（`var(--b3-theme-primary)` 8% 透明度）；
   - **几何空间防遮挡下移 (50px+)**：通过 Hero 卡片使下方操作栏（刷新记录、搜索筛选等按钮）整体平滑下移 50px 以上，彻底避开思源桌面端（Windows）及网页端右上角 32px 浮动 Snackbar 消息层（`#message` / `.b3-snackbars`）与 Tooltip 浮层的绝对遮挡，保障交互区域无遮挡点击；
@@ -286,6 +326,16 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 - **特性重置文案规范**：
   - 各 Feature 设置卡片头部的重置操作按钮文案统一为**“重置为默认设置”**；
   - 点击后仅将该 Feature 的当前配置重置为声明的初始默认值，不影响任何业务数据文件。
+- **平台兼容性设防呈现与交互规范 (方案 A：卡片保持展示，总开关置灰禁用，专属设置可预先调整)**：
+  针对在当前宿主平台中不受支持的 Feature（`runtime.status === "unsupported"`），设置中心遵循以下交互契约：
+  1. **卡片保持展示与导航可达**：左侧导航栏与右侧滚动区域均完整展示该 Feature 对应的卡片分区，用户可通过点击左侧导航平滑滚动定位，保持全平台设置界面的完整性与视觉一致性；
+  2. **总开关置灰禁用（Disabled Guard）**：卡片头部的总开关控件设置 `disabled` 属性置灰禁用，不允许用户点击或切换，防止向底层派发非法的生命周期流转；
+  3. **明确的平台兼容性提示（Platform Badge & Hint）**：
+     - 卡片顶部状态 Badge 渲染**「当前平台暂不支持」**（国际化键 `runtime.unsupported`），视觉呈现采用原生主题警告/中性状态色；
+     - Badge 附带或卡片头部清晰展示该功能实际支持的前端平台说明（例如：“仅支持：桌面端、桌面窗口”）；
+  4. **专属设置项允许预先调整（Ahead-of-Time Configuration）**：
+     - 卡片主体区域的 Feature 专属设置组件（`settingsView`）保持挂载并允许用户交互浏览与修改参数；
+     - 专属设置的保存严格写入对应的 `feature-{id}-settings.json` 文件，满足用户在轻量端（如移动端、Web 端）提前配置复杂参数并依托思源多端云同步无缝流转至主力端（如桌面端）的合理诉求，且改动绝不破坏 `omnikit-core.json` 的总开关状态。
 
 ### 5.3 统一菜单系统 (Unified Menu System)
 
@@ -297,6 +347,9 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
   - 通过 `MenuRouter` 与 `MenuRegistry` 集中管理菜单派发；
   - 菜单触发时，`MenuRouter` 首先核验对应 Feature 的运行状态（`phase === "enabled"`）；
   - 若在右键菜单打开期间 Feature 处于禁用状态，系统调用思源原生 `showMessage` 提示功能已停用，不展示模态错误弹窗，且不执行失效回调。
+- **平台兼容性菜单联动**：
+  - 不支持当前平台的 Feature 处于 `unsupported` 状态，未被激活且不分配 `FeatureScope`；
+  - `MenuRegistry` 在渲染宿主上下文菜单与顶栏快捷菜单时，严格校验 `isFeatureRunning(entry.owner)`；不支持当前平台的 Feature 自动排除在外部宿主上下文菜单与顶栏快捷菜单之外，宿主菜单保持纯粹清爽，不响应也不渲染任何无效菜单项。
 
 ### 5.4 统一 TopBar 快捷入口与顶栏下拉菜单
 
@@ -319,11 +372,19 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 - **响应错误归一化**：自动检查 HTTP 状态码与思源返回体中的 `code !== 0`，提取并包装为标准 `KernelError`；
 - **网络异常容灾**：网络断开或内核异常时不针对非幂等修改请求执行自动重试，避免向内核制造重复提交。
 
-### 6.2 `Platform` 运行环境判断
+### 6.2 `Platform` 运行环境判断与平台兼容性判定算法
 
-统一导出跨平台环境识别工具：
-- 识别桌面端（Windows / macOS / Linux）与移动/平板/Web 前端；
-- 为特性提供差异化能力前置检查（例如：仅桌面端支持本地大图 Worker 多线程加速转码等）。
+统一导出跨平台环境识别工具与平台兼容性判定算法：
+- **宿主前端类型探测**：
+  - 调用思源官方 `getFrontend()` 接口获取当前宿主前端类型（`SiyuanFrontend`）：`"desktop"`、`"desktop-window"`、`"mobile"`、`"browser-desktop"`、`"browser-mobile"`；
+  - 辅助识别操作系统平台（Windows / macOS / Linux / Android / iOS）；
+- **对齐思源内核 `IsTargetSupported` 算法**：
+  - 核心判定算法 `isFrontendSupported(frontends?: readonly SiyuanFrontend[], current?: SiyuanFrontend): boolean` 在逻辑上与思源内核 Go 实现（`kernel/bazaar/plugin.go` 中 `IsTargetSupported`）保持严格对齐：
+    1. **缺省与空列表全端兼容**：当 `frontends` 字段缺失、未定义或为空数组 `[]` 时，跳过平台检查，直接判定为全端支持（返回 `true`，等价于 `["all"]`）；
+    2. **目标匹配与通配符支持**：若列表包含通配符 `"all"` 或包含当前宿主前端类型 `current`，判定为受支持（返回 `true`）；
+    3. **不匹配拦截**：若以上条件均不满足，判定为不受支持（返回 `false`）；
+- **前端平台友好标签格式化**：
+  - 提供 `formatFrontendLabel(frontend: SiyuanFrontend, t: (key: string) => string): string` 工具函数，用于将前端标识符格式化为人类可读的多语言标签（例如：桌面端、桌面拆分窗口、移动端 App、桌面浏览器、移动浏览器、全端通用），供统一设置面板 Badge 及说明文本展示。
 
 ### 6.3 `Logger` 动态日志体系
 
@@ -335,9 +396,9 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 
 ## 7. 已纳管 Feature 索引
 
-| Feature ID | 中文名称 | 业务规范文档 | 默认状态 | 说明 |
-|---|---|---|---|---|
-| `image-compressor` | 图片压缩 | [features/image-compressor.md](features/image-compressor.md) | 关闭 (`false`) | 针对思源新插入图片与文档已有图片的无损/高质 WebP 压缩，含统一 Dock 记录与引用回溯 |
-| `titled-link` | 自动标题链接 | [features/titled-link.md](features/titled-link.md) | 开启 (`true`) | 针对思源行内超链接异步获取并填充网页标题，支持非网页文件免抓取、单链右键菜单与块级批量提取，具备双轨网络、流式截断、万国码嗅探与并发冲突保护 |
+| Feature ID | 中文名称 | 支持端 (Frontends) | 业务规范文档 | 默认状态 | 说明 |
+|---|---|---|---|---|---|
+| `image-compressor` | 图片压缩 | 全端通用 (`all`) | [features/image-compressor.md](features/image-compressor.md) | 关闭 (`false`) | 针对思源新插入图片与文档已有图片的无损/高质 WebP 压缩，含统一 Dock 记录与引用回溯 |
+| `titled-link` | 自动标题链接 | 全端通用 (`all`) | [features/titled-link.md](features/titled-link.md) | 开启 (`true`) | 针对思源行内超链接异步获取并填充网页标题，支持非网页文件免抓取、单链右键菜单与块级批量提取，具备双轨网络、流式截断、万国码嗅探与并发冲突保护 |
 
 *(后续新增 Feature 需在完成需求规范编写与冻结后，补充更新至本索引表)*

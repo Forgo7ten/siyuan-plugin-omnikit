@@ -44,6 +44,7 @@ export class ImageCompressorFeature extends BaseFeature {
       icon: "iconOmnikitMenu",
       defaultEnabled: false,
       minimumAppVersion: "3.8.0",
+      frontends: ["all"],
     });
     this.pages = new PageAllowlist(settings);
   }
