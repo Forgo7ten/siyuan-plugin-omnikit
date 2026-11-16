@@ -49,14 +49,20 @@ test("settles cancellation even when SDK swallows AbortError", async () => {
   });
   const controller = new AbortController();
   const pending = client.post("/write", {}, { signal: controller.signal });
-  assert.equal(forwardedSignal, controller.signal);
+  assert.equal(forwardedSignal.aborted, false);
   controller.abort();
+  assert.equal(forwardedSignal.aborted, true);
   await assert.rejects(pending, error => error.name === "AbortError" && error.outcome === "unknown");
 });
 
 test("settles timeout even when no SDK response occurs and marks write result unknown", async () => {
-  const client = new KernelClient(() => new Promise(() => {}));
+  let forwardedSignal;
+  const client = new KernelClient((_path, _body, _headers, _process, signal) => {
+    forwardedSignal = signal;
+    return new Promise(() => {});
+  });
   await assert.rejects(client.post("/write", {}, { timeout: 5 }), error => error.name === "TimeoutError" && error.outcome === "unknown");
+  assert.equal(forwardedSignal.aborted, true);
 });
 
 test("settles immediately if already aborted before request", async () => {

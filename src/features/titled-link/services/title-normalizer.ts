@@ -46,6 +46,11 @@ export function truncateGraphemes(value: string, maxLength: number): string {
 }
 
 function extractTagContent(html: string, tagName: string): string | null {
+  if (tagName.toLowerCase() === "title") {
+    const headMatch = html.match(/<head\b[^>]*>([\s\S]*?)<\/head\s*>/i);
+    const scope = headMatch ? headMatch[1] : html;
+    return scope.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1] ?? null;
+  }
   return html.match(new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}\\s*>`, "i"))?.[1] ?? null;
 }
 

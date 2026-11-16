@@ -55,6 +55,8 @@
     });
   }
 
+  let dockAbort: AbortController | undefined;
+
   onMount(() => {
     const unsubscribe = store.store.subscribe(next => {
       const prevKeys = new Set(Object.keys(assetStatuses));
@@ -71,7 +73,7 @@
       }
       assetStatuses = nextStatuses;
       if (mounted && hasNew) {
-        void verifyRecords(next.records.filter(r => !prevKeys.has(r.originalPath)));
+        void verifyRecords(next.records.filter(r => !prevKeys.has(r.originalPath)), dockAbort?.signal);
       }
     });
     mounted = true;
@@ -79,36 +81,32 @@
     window.addEventListener("omnikit-dock-tab-activated", handleTabActivate);
     void refresh();
     return () => {
+      dockAbort?.abort();
       unsubscribe();
       window.removeEventListener("omnikit-dock-tab-activated", handleTabActivate);
     };
   });
 
-  async function checkAsset(path: string): Promise<"present" | "missing" | "unknown"> {
+  async function checkAsset(path: string, signal?: AbortSignal): Promise<"present" | "missing" | "unknown"> {
     try {
-      const res = await kernel.post<unknown>("/api/asset/statAsset", { path });
-      return res.code === 0 ? "present" : "missing";
-    } catch (error) {
-      if (error instanceof KernelRequestError && error.code === 1) {
-        return "missing";
-      }
+      const res = await kernel.post<unknown>("/api/asset/statAsset", { path }, { signal });
+      return res.code === 0 ? "present" : "unknown";
+    } catch {
       return "unknown";
     }
   }
 
-  async function verifyRecords(recordsToCheck: CompressionRecord[]): Promise<void> {
+  async function verifyRecords(recordsToCheck: CompressionRecord[], signal?: AbortSignal): Promise<void> {
     for (let offset = 0; offset < recordsToCheck.length; offset += 3) {
+      if (signal?.aborted) return;
       await Promise.all(recordsToCheck.slice(offset, offset + 3).map(async record => {
         try {
           const [origStatus, compStatus] = await Promise.all([
-            checkAsset(record.originalPath),
-            checkAsset(record.compressedPath),
+            checkAsset(record.originalPath, signal),
+            checkAsset(record.compressedPath, signal),
           ]);
           assetStatuses[record.originalPath] = origStatus;
           assetStatuses[record.compressedPath] = compStatus;
-          if (origStatus === "missing" || compStatus === "missing") {
-            await store.removeRecord(record.originalPath);
-          }
         } catch {
           assetStatuses[record.originalPath] = "unknown";
           assetStatuses[record.compressedPath] = "unknown";
@@ -118,45 +116,44 @@
   }
 
   async function refresh(): Promise<void> {
+    dockAbort?.abort();
+    dockAbort = new AbortController();
+    const signal = dockAbort.signal;
     loading = true;
     message = "";
     try {
       await ready;
+      if (signal.aborted) return;
       records = [...store.snapshot()];
       const snapshot = [...records];
       for (const record of snapshot) {
         assetStatuses[record.originalPath] = "checking";
         assetStatuses[record.compressedPath] = "checking";
       }
-      let prunedCount = 0;
       for (let offset = 0; offset < snapshot.length; offset += 3) {
+        if (signal.aborted) return;
         await Promise.all(snapshot.slice(offset, offset + 3).map(async record => {
           try {
             const [origStatus, compStatus] = await Promise.all([
-              checkAsset(record.originalPath),
-              checkAsset(record.compressedPath),
+              checkAsset(record.originalPath, signal),
+              checkAsset(record.compressedPath, signal),
             ]);
             assetStatuses[record.originalPath] = origStatus;
             assetStatuses[record.compressedPath] = compStatus;
-
-            if (origStatus === "missing" || compStatus === "missing") {
-              await store.removeRecord(record.originalPath);
-              prunedCount++;
-            }
           } catch {
             assetStatuses[record.originalPath] = "unknown";
             assetStatuses[record.compressedPath] = "unknown";
           }
         }));
       }
-      if (prunedCount > 0) {
-        records = [...store.snapshot()];
-        message = format("image.records.prunedNotice", { count: prunedCount });
-      }
     } catch {
-      message = t("image.records.loadFailed");
+      if (!signal.aborted) {
+        message = t("image.records.loadFailed");
+      }
     } finally {
-      loading = false;
+      if (!signal.aborted) {
+        loading = false;
+      }
     }
   }
 

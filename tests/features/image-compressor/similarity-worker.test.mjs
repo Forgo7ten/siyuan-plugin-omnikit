@@ -108,3 +108,39 @@ test("SimilarityWorkerSession terminates worker and rejects pending on AbortSign
   });
   assert.equal(createdWorker.terminated, true);
 });
+
+test("AdaptiveImageCompressor skips below-threshold files without creating worker", async () => {
+  const { AdaptiveImageCompressor } = await import("../../../src/features/image-compressor/similarity/AdaptiveImageCompressor.ts");
+  let workerCreated = false;
+  const mockCodec = {
+    name: "mock-codec",
+    encode: async () => ({ kind: "skipped", reason: "mock" }),
+  };
+  const compressor = new AdaptiveImageCompressor(mockCodec, {
+    workerFactory: () => {
+      workerCreated = true;
+      return createMockWorker();
+    },
+  });
+
+  const smallBlob = new Blob(["tiny"]);
+  const config = {
+    compression: {
+      smartEnabled: true,
+      minInputBytes: 1024,
+      maxInputBytes: 10 * 1024 * 1024,
+      excludedExtensions: [],
+      initialQuality: 0.8,
+      manualMaxEdge: 4096,
+      minSavingBytes: 0,
+      minSavingRatio: 0,
+      maxPixels: 1000000,
+      maxEncodeMs: 10000,
+    },
+  };
+
+  const result = await compressor.encode(smallBlob, "photo.jpg", config, undefined, undefined, "auto");
+  assert.equal(result.kind, "skipped");
+  assert.equal(result.reason, "below_threshold");
+  assert.equal(workerCreated, false);
+});

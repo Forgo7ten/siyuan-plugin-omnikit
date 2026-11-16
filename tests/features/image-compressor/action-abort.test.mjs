@@ -25,11 +25,11 @@ test("DocumentBatchAction returns cancelled quietly without showing invalidDocum
 test("RemoteImageWatcher guards against unauthorized documents before taking snapshot or HTTP calls", async () => {
   const watcher = await read("../../../src/features/image-compressor/actions/RemoteImageWatcher.ts");
 
-  // Entry guard in watchRemoteImages
-  assert.match(watcher, /export async function watchRemoteImages\([\s\S]*?\): Promise<RemoteWatcherHandle> \{\s*if \(!autoAllowed\(services\.config\(\), doc\.id\)\) \{\s*return \{ dispose\(\) \{\}, pause\(\) \{\}, resume\(\) \{\} \};\s*\}/);
+  // Entry guard in watchRemoteImages before initial snapshot
+  assert.match(watcher, /if \(autoAllowed\(services\.config\(\), doc\.id\)\) \{\s*try \{\s*previous = await snapshot\(\);/);
 
   // Entry guard in sweep() before snapshot
-  assert.match(watcher, /async function sweep\(\): Promise<void> \{\s*if \(disposed \|\| paused \|\| !scope\.active \|\| signal\.aborted\) return;\s*if \(!autoAllowed\(services\.config\(\), doc\.id\)\) return;\s*if \(reading\)/);
+  assert.match(watcher, /async function sweep\(\): Promise<void> \{\s*if \([\s\S]*?\) return;\s*if \(!autoAllowed\(services\.config\(\), doc\.id\)\) return;\s*if \(reading\)/);
 });
 
 test("ImageController guards inactive scope and auto-closes progress modal on zero scanned images", async () => {
@@ -46,4 +46,13 @@ test("ImageController guards inactive scope and auto-closes progress modal on ze
 
   // Duplicate cancelAll removed in ImageCompressorFeature
   assert.doesNotMatch(feature, /protected onDisable\(\): void \{\s*this\.tasks\.cancelAll\("Feature disabled"\);\s*\}/);
+
+  // activeDocuments tracking prevents duplicate concurrent batches on the same document
+  assert.match(controller, /activeDocuments\.has\(rootID\)/);
+  assert.match(controller, /activeDocuments\.add\(rootID\)/);
+  assert.match(controller, /activeDocuments\.delete\(rootID\)/);
+
+  // modal dismissal and editor switch trigger abort
+  assert.match(controller, /modalAbortController\.abort\(new DOMException\("Task modal dismissed", "AbortError"\)\)/);
+  assert.match(controller, /modalAbortController\.abort\(new DOMException\("Editor switched", "AbortError"\)\)/);
 });

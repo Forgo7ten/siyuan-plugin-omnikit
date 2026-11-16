@@ -42,7 +42,7 @@ export interface ImageUI {
     save(preview: ManualCompressionPreview, replace: boolean): Promise<void>;
     onClose(): void;
   }): void;
-  progress(state: ImageTaskStateStore): { close(): void };
+  progress(state: ImageTaskStateStore, onClose?: () => void): { close(): void };
   notify(message: string): void;
   copyablePath(path: string, messageKey?: string): void;
 }
@@ -112,8 +112,8 @@ export function createImageUI(scope: ImageTaskScope, t: (key: string) => string)
       }
     },
 
-    progress(state) {
-      return mountDialog(scope, t("image.task.title"), ImageTaskPanel, { job: state, t }, () => undefined);
+    progress(state, onClose) {
+      return mountDialog(scope, t("image.task.title"), ImageTaskPanel, { job: state, t }, () => onClose?.());
     },
 
     confirm(title, message, signal) {

@@ -60,3 +60,36 @@ test("manual dialog scales proportionally and rejects wrong output dimensions", 
   await assert.rejects(bad.encode(png(5000, 2500), "photo.png", config(), undefined, undefined, "manual-dialog"),
     /Unexpected output dimensions/);
 });
+
+test("inspectImage extracts EXIF orientation and swaps dimensions correctly", async () => {
+  const { inspectImage } = await import("../../../src/features/image-compressor/services/image.ts");
+  const bytes = new Uint8Array([
+    0xFF, 0xD8, // SOI
+    // APP1 Exif segment
+    0xFF, 0xE1, 0x00, 0x22, // Length: 34
+    0x45, 0x78, 0x69, 0x66, 0x00, 0x00, // Exif\0\0
+    0x49, 0x49, // Little endian
+    0x2A, 0x00, // 42
+    0x08, 0x00, 0x00, 0x00, // Offset to 0th IFD (8)
+    0x01, 0x00, // 1 entry
+    0x12, 0x01, // Tag: 0x0112 (Orientation)
+    0x03, 0x00, // Type: SHORT (3)
+    0x01, 0x00, 0x00, 0x00, // Count: 1
+    0x06, 0x00, 0x00, 0x00, // Value: 6 (rotate 90 CW)
+    0x00, 0x00, 0x00, 0x00, // Next IFD: 0
+    // SOF0 (Baseline DCT)
+    0xFF, 0xC0, 0x00, 0x0B,
+    0x08, // 8-bit precision
+    0x05, 0xDC, // Height: 1500
+    0x0B, 0xB8, // Width: 3000
+    0x01, // 1 component
+    0x01, 0x11, 0x00,
+    // EOI
+    0xFF, 0xD9,
+  ]);
+  const info = inspectImage(bytes);
+  assert.equal(info.mime, "image/jpeg");
+  // Due to orientation 6, effective width and height are swapped
+  assert.equal(info.width, 1500);
+  assert.equal(info.height, 3000);
+});

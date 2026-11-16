@@ -4,7 +4,8 @@
 > **状态**：已冻结（Approved & Frozen）  
 > **适用模块**：`src/features/titled-link/`  
 > **所属平台规范**：[CORE-PRD.md](../CORE-PRD.md)  
-> **最高设计准则**：[AGENTS.md](../../AGENTS.md)
+> **最高设计准则**：[AGENTS.md](../../AGENTS.md)  
+> **最低思源版本约束**：v3.8.4
 
 ---
 
@@ -95,11 +96,12 @@ flowchart TD
 ### 3.1 双轨网络模型与平台适配
 为了彻底解决跨端网络限制（浏览器跨域 CORS、移动端混合环境及系统代理兼容性），系统实施双轨分流：
 1. **桌面端环境 (`desktop`)**：
-   - 优先直接使用 `window.fetch` 发起网络请求；
+   - 默认直接使用 `window.fetch` 发起流式网络请求；
    - 完整遵循宿主系统的系统代理与网络栈配置（兼容 Fake-IP 等透明代理模式）；
    - 支持内网地址与 `localhost` 访问，不强加额外 SSRF 阻断；
+   - **自定义 User-Agent 转发保护**：当用户在 Core 平台全局配置 `omnikit-core.json` 中配置了非空自定义 `userAgent` 时，为了确保自定义 User-Agent 能够被远端目标服务器如实接收（避免 Chromium 渲染进程静默丢弃自定义 User-Agent 请求头），桌面端自动切换至思源内核 REST API `/api/network/forwardProxy` 代理链路执行请求；
 2. **Web 与移动端环境 (`browser-desktop` / `mobile` / `browser-mobile`)**：
-   - 通过调用思源内核 REST API `/api/network/forwardProxy` 进行转发请求，彻底绕过前端浏览器跨域（CORS）与移动端沙盒限制；
+   - 统一通过调用思源内核 REST API `/api/network/forwardProxy` 进行转发请求，彻底绕过前端浏览器跨域（CORS）与移动端沙盒限制；
    - **二进制原始字节保护契约**：向内核显式传递 `"responseEncoding": "base64"`，指示 Go 内核执行 `client.DisableAutoDecode()`，直接返回原始字节的 Base64 编码，避免 Go 端 UTF-8 自动强转造成的非 UTF-8 字符损坏；
 3. **Core 平台 User-Agent 统一复用**：
    - 网络请求读取 Core 平台全局配置 `omnikit-core.json` 中的 `general.userAgent`；
@@ -127,7 +129,8 @@ flowchart TD
    - 原生不支持或异常编码安全回退至 `utf-8`，避免标题解析呈现乱码。
 
 ### 3.4 标题优先级、反爬挑战页过滤与降级策略
-1. **标题选取优先级**：
+1. **标题选取优先级与区域限制**：
+   - 标题元数据解析严格限定在 `<head>...</head>` 头部区域内进行匹配；若无闭合标签则截止至 `<body>` 出现前，杜绝正文内联 SVG 中的 `<title>` 等无障碍文本误伤篡改网页标题；
    - **第一优先级**：`<head><title>` 标签内的文本内容；
    - **第二优先级**：`<meta property="og:title" content="...">` 属性值；
    - **第三优先级**：`<meta name="twitter:title" content="...">` 属性值；
@@ -280,7 +283,8 @@ export interface LinkOccurrenceTarget {
 
 ### 6.3 输入法 (IME) 与光标安全防护
 - **输入法安全等待**：若请求返回时当前编辑器正处于 IME 中文输入法组合状态（`isComposing === true`），系统进入有界延后等待队列，最多等待 **3 秒**；
-- **超时安全放弃**：若 3 秒后用户仍在组合输入，或当前编辑光标正停留在目标链接内部且无法安全恢复选区，系统立即安全放弃本次回填，绝不打断用户输入流。
+- **超时安全放弃**：若 3 秒后用户仍在组合输入，或当前编辑光标正停留在目标链接内部且无法安全恢复选区，系统立即安全放弃本次回填，绝不打断用户输入流；
+- **编辑器销毁安全清理契约 (`destroy-protyle`)**：系统通过思源 EventBus 监听 `destroy-protyle` 生命周期事件。当某个 Protyle 编辑器实例被关闭或销毁时，立即触发其对应的清理释放回调，从 `composingEditors` 集合中彻底移除，并注销挂载在其 DOM 上的 `compositionstart` 与 `compositionend` 事件监听器，彻底阻断闭包强引用造成的内存泄漏，避免已销毁编辑器的残留状态干扰其他活跃编辑器的标题写入。
 
 ---
 
@@ -354,8 +358,9 @@ export interface LinkOccurrenceTarget {
 
 ### 9.1 单向职责与分工边界
 1. **Feature 层 (`TitledLinkFeature.ts`)**：
-   - 专职负责思源宿主环境的事件监听（Protyle 菜单监听、`open-menu-link`、`click-blockicon` 与编辑器 `paste` 事件挂载）；
+   - 专职负责思源宿主环境的事件监听（Protyle 菜单监听、`open-menu-link`、`click-blockicon`、`destroy-protyle` 与编辑器 `paste` 事件挂载）；
    - 提取宿主上下文信息（`Protyle` 实例、`linkElement`、`blockElement` 等），将业务直接委托给 `TitledLinkController`；
+   - 监听 `destroy-protyle` 及时移除编辑器输入法监听器并清理 `composingEditors` 缓存句柄；
    - 严禁在 Feature 层直接编写复杂的网络抓取逻辑与 UI 弹窗；
    - 所有副作用与事件监听句柄由 `FeatureScope`（`context.scope.own`）集中托管与自动注销；
 2. **Controller 门面层 (`TitledLinkController.ts`)**：

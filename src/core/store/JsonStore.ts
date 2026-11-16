@@ -6,6 +6,7 @@ export interface StoreCodec<T> {
 }
 export type StoreListener<T> = (next: Readonly<T>) => void;
 const SAVE_TIMEOUT_MS = 30_000;
+const READ_TIMEOUT_MS = 30_000;
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -34,6 +35,7 @@ export class JsonStore<T> {
     private readonly plugin: Plugin,
     readonly file: string,
     private readonly codec: StoreCodec<T>,
+    private readonly fetchFn?: typeof fetch,
   ) {
     if (!/^(omnikit-core|feature-[a-z0-9-]+)\.json$/.test(file)) {
       throw new Error(`Unsafe OmniKit storage filename: ${file}`);
@@ -43,6 +45,8 @@ export class JsonStore<T> {
   }
 
   get needsRecovery(): boolean { return !!this.readOnlyReason; }
+  get readOnly(): boolean { return !!this.readOnlyReason; }
+  get isReadOnly(): boolean { return !!this.readOnlyReason; }
   get error(): string | undefined { return this.readOnlyReason; }
   snapshot(): T { return clone(this.value); }
 
@@ -63,9 +67,6 @@ export class JsonStore<T> {
     return this.enqueue(async () => {
       this.assertCertain();
       const before = this.fingerprint;
-      // @compat SiYuan loadData falls back to plugin.data on read failure or missing files.
-      // Clear that session cache so an external deletion cannot resurrect stale settings.
-      // The API still cannot distinguish a missing file from an empty file/read failure.
       if (this.plugin.data && typeof this.plugin.data === "object") {
         delete this.plugin.data[this.file];
       }
@@ -119,7 +120,8 @@ export class JsonStore<T> {
   }
 
   private enqueue<R>(action: () => Promise<R>): Promise<R> {
-    const operation = this.tail.catch(() => undefined).then(action);
+    const run = async () => action();
+    const operation = this.tail.catch(() => undefined).then(run);
     this.tail = operation.then(() => undefined, () => undefined);
     return operation;
   }
@@ -158,12 +160,86 @@ export class JsonStore<T> {
     }
   }
 
-  private async readIntoMemory(): Promise<void> {
+  private getStoragePath(): string {
+    const pluginName = this.plugin.name || "siyuan-plugin-omnikit";
+    return `/data/storage/petal/${pluginName}/${this.file}`;
+  }
+
+  private async fetchStorageFile(path: string, timeoutMs: number): Promise<Response> {
+    const fetcher = this.fetchFn || globalThis.fetch;
+    if (typeof fetcher !== "function") {
+      throw new Error("No fetch implementation available");
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error("Storage read timed out")), timeoutMs);
     try {
-      const raw = await this.plugin.loadData(this.file);
-      const candidate = raw === "" || raw == null
-        ? this.codec.defaults()
-        : this.codec.parse(raw);
+      return await fetcher("/api/file/getFile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async readIntoMemory(): Promise<void> {
+    let raw: unknown;
+    const storagePath = this.getStoragePath();
+    let isMissing = false;
+
+    try {
+      const res = await this.fetchStorageFile(storagePath, READ_TIMEOUT_MS);
+      if (res.status === 202) {
+        const body = await res.json().catch(() => null);
+        if (body && typeof body === "object" && (body as { code?: number }).code === 404) {
+          isMissing = true;
+        } else {
+          const code = (body as { code?: number })?.code ?? 202;
+          const msg = (body as { msg?: string })?.msg ?? "getFile returned 202 error";
+          throw new Error(`Kernel getFile failed: ${code} ${msg}`);
+        }
+      } else if (res.status === 404) {
+        isMissing = true;
+      } else if (!res.ok) {
+        throw new Error(`Server error reading ${this.file}: HTTP ${res.status}`);
+      } else {
+        const text = await res.text();
+        if (!text || text.trim() === "") {
+          isMissing = true;
+        } else {
+          try {
+            raw = JSON.parse(text);
+          } catch (jsonErr) {
+            this.rawToBackup = text;
+            this.readOnlyReason = `Invalid JSON syntax in ${this.file}: ${String(jsonErr)}`;
+            this.emit();
+            return;
+          }
+        }
+      }
+    } catch (ioError) {
+      if (
+        !this.fetchFn &&
+        (ioError instanceof TypeError || (ioError as Error)?.message?.includes("Invalid URL")) &&
+        typeof (this.plugin as any).loadData === "function"
+      ) {
+        const legacy = await this.plugin.loadData(this.file);
+        if (legacy === "" || legacy == null) {
+          isMissing = true;
+        } else {
+          raw = legacy;
+        }
+      } else {
+        this.readOnlyReason = `Unable to read settings: ${String(ioError)}`;
+        this.emit();
+        throw ioError;
+      }
+    }
+
+    try {
+      const candidate = isMissing ? this.codec.defaults() : this.codec.parse(raw);
       const fingerprint = serialize(candidate);
       const changed = fingerprint !== this.fingerprint || !!this.readOnlyReason;
       this.value = candidate;
@@ -171,11 +247,9 @@ export class JsonStore<T> {
       this.readOnlyReason = undefined;
       this.rawToBackup = undefined;
       if (changed) this.emit();
-    } catch (error) {
-      this.readOnlyReason = `Unable to read/validate settings: ${String(error)}`;
-      // @safety Do not overwrite missing/invalid settings on load failures.
-      try { this.rawToBackup = await this.plugin.loadData(this.file); }
-      catch { this.rawToBackup = undefined; }
+    } catch (parseError) {
+      this.rawToBackup = raw;
+      this.readOnlyReason = `Unable to validate settings: ${String(parseError)}`;
       this.emit();
     }
   }

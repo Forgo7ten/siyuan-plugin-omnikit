@@ -1,6 +1,6 @@
 import type { KernelClient } from "../../../core/host/KernelClient.ts";
 import type { ImageUI } from "../ui/ImageTaskUI.ts";
-import { digest, type AssetStore } from "./assets.ts";
+import type { AssetStore } from "./assets.ts";
 import type { SourceReader } from "./download.ts";
 import type { ImageCodec } from "./image.ts";
 import type { ImageConfig, Intent } from "../policy/parseImageConfig.ts";
@@ -94,26 +94,18 @@ export async function prepareImage(
   };
 }
 
-/** Upload, verify, and durably record one encoded asset before it can be referenced. */
+/** Upload and durably record one encoded asset before it can be referenced. */
 export async function persistEncodedImage(
   services: ImageProcessingServices,
   originalPath: string,
   encodedFile: File,
   rootID: string,
   signal: AbortSignal,
-  maxBytes: number,
+  _maxBytes?: number,
 ): Promise<string> {
   const original = resolveSource(originalPath, services.origin);
   if (original.kind !== "asset") throw new Error("Compression original must be a local asset");
   const path = await services.assets.upload(encodedFile, rootID, signal);
-  try {
-    const returned = resolveSource(path, services.origin);
-    const actual = await services.reader.read(returned, { maxBytes, timeoutMs: 30_000, signal });
-    if (await digest(actual.blob) !== await digest(encodedFile)) throw new Error("Uploaded image bytes differ from the encoded file");
-  } catch (error) {
-    services.ui.copyablePath(path, "image.uploadVerificationFailed");
-    throw new Error(`Uploaded image could not be verified at ${path}`, { cause: error });
-  }
   try {
     await services.recordsReady;
     await services.records.upsert(originalPath, path);

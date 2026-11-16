@@ -12,6 +12,11 @@ test("uses title before OpenGraph and Twitter metadata and normalizes entities a
   assert.deepEqual(extractNormalizedTitle(html, "https://example.com", defaults), { title: "Main & Title", source: "title" });
 });
 
+test("ignores SVG title in body and extracts title from head", () => {
+  const html = '<html><head><title>Actual Page Title</title></head><body><svg><title>Close Button</title></svg></body></html>';
+  assert.deepEqual(extractNormalizedTitle(html, "https://example.com", defaults), { title: "Actual Page Title", source: "title" });
+});
+
 test("supports metadata attribute order variations and fallback priority", () => {
   const html = '<meta content="Open Graph" property="og:title"><meta content="Tweet" name="twitter:title">';
   assert.deepEqual(extractNormalizedTitle(html, "https://example.com", defaults), { title: "Open Graph", source: "og:title" });

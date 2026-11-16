@@ -9,7 +9,12 @@ import { classifyImageCandidate } from "../policy/ImageCandidateClassifier.ts";
 
 interface Candidate { blockID: string; source: ImageSource; count: number }
 export type RemoteWatcherLogger = Pick<Console, "warn">;
-export interface RemoteWatcherHandle { dispose(): void; pause(): void; resume(): void }
+export interface RemoteWatcherHandle {
+  dispose(): void;
+  pause(): void;
+  resume(): void;
+  reconcile(): Promise<void>;
+}
 
 /** Only a newly persisted, authorized HTTP(S) image may be localized. */
 export function addedRemoteCandidates(
@@ -37,9 +42,6 @@ export async function watchRemoteImages(
   editor: HTMLElement, doc: DocumentRow, scope: FeatureScope,
   services: ImageProcessingServices, logger: RemoteWatcherLogger = console,
 ): Promise<RemoteWatcherHandle> {
-  if (!autoAllowed(services.config(), doc.id)) {
-    return { dispose() {}, pause() {}, resume() {} };
-  }
   const owned = new AbortController();
   const abortFromScope = () => owned.abort(scope.signal.reason);
   if (scope.signal.aborted) abortFromScope();
@@ -47,7 +49,8 @@ export async function watchRemoteImages(
   const signal = owned.signal;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false, paused = false, rebasing = false, reading = false, rerun = false;
-  let previous: Map<string, Candidate>;
+  let observing = false;
+  let previous: Map<string, Candidate> = new Map();
   const inFlight = new Set<string>();
   const tasks = new Set<AbortController>();
   const hasPersistedTarget = new Map<AbortController, boolean>();
@@ -65,13 +68,19 @@ export async function watchRemoteImages(
     return result;
   };
 
-  previous = await snapshot();
-  if (!scope.active || signal.aborted) {
-    scope.signal.removeEventListener("abort", abortFromScope);
-    return { dispose() {}, pause() {}, resume() {} };
-  }
+  const hasImage = (node: Node): boolean => node instanceof Element && (node.matches("img") || !!node.querySelector("img"));
+  const observer = new MutationObserver(records => {
+    if (records.some(record => record.type === "attributes" && record.target instanceof HTMLImageElement
+      || [...record.addedNodes, ...record.removedNodes].some(hasImage))) schedule();
+  });
+  const observe = () => {
+    if (observing || disposed || paused || !scope.active || signal.aborted) return;
+    observing = true;
+    observer.observe(editor, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "data-src"] });
+  };
 
   const stopWatching = () => {
+    observing = false;
     observer.disconnect();
     if (timer !== undefined) clearTimeout(timer);
     timer = undefined;
@@ -89,6 +98,19 @@ export async function watchRemoteImages(
   };
   const release = scope.own(dispose);
   signal.addEventListener("abort", stopWatching, { once: true });
+
+  if (autoAllowed(services.config(), doc.id)) {
+    try {
+      previous = await snapshot();
+      if (!scope.active || signal.aborted) {
+        scope.signal.removeEventListener("abort", abortFromScope);
+        return { dispose() {}, pause() {}, resume() {}, async reconcile() {} };
+      }
+      observe();
+    } catch (error) {
+      if (!signal.aborted && scope.active) logger.warn("读取初始图片状态失败", error);
+    }
+  }
 
   async function process(candidate: Candidate, oldCount: number): Promise<void> {
     // Duplicate identical remote references cannot be mapped to one physical image safely.
@@ -187,7 +209,7 @@ export async function watchRemoteImages(
   }
 
   async function sweep(): Promise<void> {
-    if (disposed || paused || !scope.active || signal.aborted) return;
+    if (disposed || paused || !scope.active || signal.aborted || !observing) return;
     if (!autoAllowed(services.config(), doc.id)) return;
     if (reading) { rerun = true; return; }
     reading = true;
@@ -207,11 +229,11 @@ export async function watchRemoteImages(
       if (!signal.aborted && scope.active) logger.warn("读取持久化图片状态失败", error);
     } finally {
       reading = false;
-      if (rerun && !paused && !disposed) { rerun = false; schedule(350); }
+      if (rerun && !paused && !disposed && observing) { rerun = false; schedule(350); }
     }
   }
   function schedule(delay = 450): void {
-    if (paused || disposed) return;
+    if (paused || disposed || !observing) return;
     if (timer !== undefined) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = undefined;
@@ -219,13 +241,8 @@ export async function watchRemoteImages(
       timer = setTimeout(() => { timer = undefined; void sweep(); }, 900);
     }, delay);
   }
-  const hasImage = (node: Node): boolean => node instanceof Element && (node.matches("img") || !!node.querySelector("img"));
-  const observer = new MutationObserver(records => {
-    if (records.some(record => record.type === "attributes" && record.target instanceof HTMLImageElement
-      || [...record.addedNodes, ...record.removedNodes].some(hasImage))) schedule();
-  });
-  const observe = () => observer.observe(editor, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "data-src"] });
   const onUndo = (event: Event) => {
+    if (!observing || paused || disposed) return;
     const type = (event as InputEvent).inputType;
     if (type === "historyUndo" || type === "historyRedo") { rebasing = true; schedule(200); }
   };
@@ -235,13 +252,39 @@ export async function watchRemoteImages(
     tasks.clear();
   };
   const onSyncEnd = () => {
+    paused = false;
+    if (disposed || !scope.active || signal.aborted) return;
+    if (!autoAllowed(services.config(), doc.id)) { observing = false; return; }
     void snapshot().then(value => {
-      if (!disposed && scope.active) { previous = value; paused = false; observe(); }
+      if (!disposed && scope.active && !paused) { previous = value; observe(); }
     }).catch(error => { if (!signal.aborted) logger.warn("同步后重建图片基线失败", error); });
   };
+  const reconcile = async (): Promise<void> => {
+    if (disposed || !scope.active || signal.aborted) return;
+    const allowed = autoAllowed(services.config(), doc.id);
+    if (!allowed) {
+      if (observing) {
+        stopWatching();
+        for (const task of tasks) {
+          if (!hasPersistedTarget.get(task)) task.abort("Document permission revoked");
+        }
+      }
+      return;
+    }
+    if (!observing) {
+      try {
+        previous = await snapshot();
+        if (disposed || !scope.active || signal.aborted) return;
+        observe();
+      } catch (error) {
+        if (!signal.aborted && scope.active) logger.warn("重建图片基线失败", error);
+      }
+    } else {
+      schedule(200);
+    }
+  };
   editor.addEventListener("beforeinput", onUndo, true);
-  observe();
-  return { dispose: release, pause: onSyncStart, resume: onSyncEnd };
+  return { dispose: release, pause: onSyncStart, resume: onSyncEnd, reconcile };
 }
 
 export function safeFileName(name: string): string {

@@ -24,7 +24,7 @@ export class TitledLinkFeature extends BaseFeature {
       category: "text",
       icon: "iconLink",
       defaultEnabled: true,
-      minimumAppVersion: "3.8.0",
+      minimumAppVersion: "3.8.4",
       frontends: ["all"],
     });
     // Ensure the registered feature settings file stays aligned with its storage contract.
@@ -124,6 +124,17 @@ export class TitledLinkFeature extends BaseFeature {
       context.plugin.eventBus.on(name, onEditor);
       scope.own(() => context.plugin.eventBus.off(name, onEditor));
     }
+
+    const onDestroyProtyle = (event: CustomEvent<any>) => {
+      const editor = event.detail?.protyle?.element;
+      if (editor instanceof HTMLElement && this.composingEditors.has(editor)) {
+        editor.removeEventListener("compositionstart", this.onCompositionStart);
+        editor.removeEventListener("compositionend", this.onCompositionEnd);
+        this.composingEditors.delete(editor);
+      }
+    };
+    context.plugin.eventBus.on("destroy-protyle", onDestroyProtyle);
+    scope.own(() => context.plugin.eventBus.off("destroy-protyle", onDestroyProtyle));
   }
 
   protected onDisable(): void {

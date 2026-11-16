@@ -67,7 +67,8 @@ stateDiagram-v2
   - 触发已启用 Feature 的 `onLayoutReady` 钩子，执行依赖编辑器 DOM 的初始化检测。
 - **`onDataChanged(): void`**：
   - 当外部环境或独立设置窗口修改并持久化了配置文件时触发；
-  - 重新从磁盘加载相关 JSON 配置，刷新内存缓存，并触发受影响 Feature 的动态状态切换（受支持环境下的热启用/热停用/参数热更新；不受支持平台持续保持 `unsupported` 阻断）；重新读取的数据不触发二次写盘操作。
+  - **跨端与外部业务数据同步**：在执行配置协调前，系统首先遍历所有已注册 Feature 并调用可选的 `reloadData(this)` 钩子，由 Feature 自身刷新内存中缓存的业务记录或状态索引（如 `image-compressor` 重新加载 `feature-image-compressor-records.json` 并同步更新 Dock 视图与内存索引）；
+  - 随后调用 `SettingsManager.reloadAfterExternalChange()` 从磁盘重新加载相关 JSON 配置，刷新内存缓存，并触发受影响 Feature 的动态状态切换（受支持环境下的热启用/热停用/参数热更新；不受支持平台持续保持 `unsupported` 阻断）；重新读取的数据不触发二次写盘操作。
 - **`onunload(): void`**：
   - 触发全系统注销流程；
   - 标记 `unloading = true`，停止接收并拒绝调度新任务；
@@ -77,9 +78,10 @@ stateDiagram-v2
 
 ### 2.2 独立设置窗口多实例隔离规范
 
-思源自 v3.8.7+ 支持独立的设置窗口（DOM 根节点带有 `body--settings` 类名）。
+思源支持独立的设置窗口（DOM 根节点带有 `body--settings` 类名）。
 - **运行规范**：在 `body--settings` 窗口实例中，OmniKit 作为独立的配置表单渲染器运行：
   - 仅加载 `SettingsManager`、Svelte 5 设置面板组件及其依赖的 `JsonStore`；
+  - 独立设置窗口不实例化 `FeatureManager`，以保持无状态轻量表单渲染；在设置面板中，配置为开启偏好的 Feature 状态显示为 `runtime.configured`（国际化文本：“已配置启用（运行状态请看主窗口）”），客观反映多实例架构下的配置语义；
   - 不初始化 Unified Dock；
   - 不注册思源右键菜单路由（MenuRouter）；
   - 不启动后台业务监听器（如编辑器事件监听、上传捕获、自动观察器等）；
@@ -140,6 +142,12 @@ export interface FeatureRegistration<T> {
   /** 配置编解码与校验器，定义 defaults() 和 parse(raw) */
   readonly codec: StoreCodec<T>;
   
+  /** 
+   * 可选：跨端/外部数据同步钩子
+   * 当收到思源内核 onDataChanged 广播时，Core 负责在配置检查前调用该钩子，由 Feature 自行重载业务数据
+   */
+  readonly reloadData?: (plugin: Plugin) => Promise<void>;
+
   /** Feature 运行时实例工厂函数 */
   create(plugin: Plugin, context: FeatureContext): BaseFeature;
   
@@ -286,12 +294,15 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 
 所有 JSON 文件统一通过 `JsonStore<T>` 进行读写，提供以下可靠性与容灾机制：
 1. **每文件独占异步队列**：单个文件的写入严格串行化（Promise Queue），相同内容（Fingerprint 比对）直接跳过写盘。
-2. **30 秒超时保护与确定性状态机**：
+2. **安全确定性读取与容灾契约 (`readPluginJSON`)**：
+   - 读取操作规范使用思源内核 `/api/file/getFile` REST API，精确区分文件缺失与系统故障；
+   - **缺失与正常初始化**：当内核响应 HTTP 202 且思源返回体 `code === 404` 时，确认为新安装或文件不存在，安全返回 `codec.defaults()` 并允许后续正常初始化写入；
+   - **错误设防与安全只读保护**：当读取遭遇网络错误、请求超时（超时时限设为 30 秒）或思源返回其他业务错误码（如 HTTP 202 且 `code` 为 500、503、403 等）时，系统判定为读取失败，立即将当前 Store 锁定为安全只读状态（`readOnlyReason`），保留上一次内存有效数据，严格禁止使用默认值或空对象静默覆盖用户的现有持久化文件；
+   - **损坏保护与非空备份隔离**：当文件内容存在 JSON 语法损坏且确认已成功读取到非空物理字节时，系统不使用默认值静默覆盖，而是将损坏文件重命名备份为 `.backup` 容灾文件，并在设置界面展示明确的故障提示以供用户确认修复；未读取到有效物理字节的系统错误严禁创建假备份或触发覆盖；
+   - **状态变动驱动重载**：`reload()` 方法在内容指纹变动或只读保护状态变动时均返回 `true`，确保外部状态协调准确响应。
+3. **30 秒超时保护与确定性状态机**：
    - 调用宿主 `Plugin.saveData` 时启动 30 秒超时定时器；
    - 若超时未响应，将内部状态标记为 `writeUncertain = true`，后续写入立即拦截并抛出错误，避免在未确定状态下继续写盘。
-3. **损坏保护与备份隔离**：
-   - 首次缺失配置文件时直接返回内存默认值，不创建空文件；
-   - 若文件损坏或存在 JSON 语法错误，系统不使用默认值静默覆盖。存储引擎锁定为只读状态，将损坏文件重命名为 `.backup` 备份文件，并提示用户显式确认修复。
 
 ### 4.3 重置边界与“数据管理”专区
 
@@ -359,7 +370,11 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
      - Badge 附带或卡片头部清晰展示该功能实际支持的前端平台说明（例如：“仅支持：桌面端、桌面窗口”）；
   4. **专属设置项允许预先调整（Ahead-of-Time Configuration）**：
      - 卡片主体区域的 Feature 专属设置组件（`settingsView`）保持挂载并允许用户交互浏览与修改参数；
-     - 专属设置的保存严格写入对应的 `feature-{id}-settings.json` 文件，满足用户在轻量端（如移动端、Web 端）提前配置复杂参数并依托思源多端云同步无缝流转至主力端（如桌面端）的合理诉求，且改动绝不破坏 `omnikit-core.json` 的总开关状态。
+     - 专属设置的保存严格写入对应的 `feature-{id}-settings.json` 文件，满足用户在轻量端（如移动端、Web 端）提前配置复杂参数并依托思源多端云同步无缝流转至主力端（如桌面端）的合理诉求，且改动绝不破坏 `omnikit-core.json` 的总开关状态；
+  5. **多窗口状态语义对齐 (Independent Settings Window Phase)**：
+     - 在思源独立设置窗口（`body--settings`）中，因其不运行 `FeatureManager`，对于配置处于开启状态的特性，状态 Badge 规范化渲染为 `runtime.configured`（「已配置启用（运行状态请看主窗口）」），客观表达运行状态由主窗口承载的系统架构事实。
+- **白名单层级路径异步解析防重规范**：
+  - 设置面板解析白名单文档路径时，采用非响应式登记集合（`pathLookupsStarted: Set<string>`）在发起网络请求前同步锁定目标文档 ID，确保同一文档 ID 在单次设置面板挂载周期内至多发起一轮路径查询，杜绝响应式更新级联触发重复网络请求。
 
 ### 5.3 统一菜单系统 (Unified Menu System)
 
@@ -403,7 +418,11 @@ Core 平台提供轻量级 `UiFeedback` 服务（注入 `FeatureContext.feedback
   - 短时间内同一事件源触发的完全相同文本自动抑制二次弹出，防止高频事件或批量处理时在屏幕右上角堆叠大量重复 Snackbar 气泡。
 - **通用交互能力封装**：
   - `notify(message: string, type?: "info" | "error", options?: { timeout?: number })`: 规范化气泡通知调度；
-  - `copyable(text: string, label?: string)`: 统一封装文本复制至系统剪贴板功能，并在复制成功后自动触发轻量提示（如 `[OmniKit] 已复制路径`），下游业务特性直接复用。
+  - `copyable(text: string, label?: string)`: 统一封装文本复制至系统剪贴板功能，并在复制成功后自动触发轻量提示（如 `[OmniKit] 已复制路径`），下游业务特性直接复用；
+- **局域网 HTTP 环境与无 WebCrypto 兼容规范**：
+  - 在非 HTTPS/局域网 HTTP 部署环境下，宿主浏览器不暴露 `crypto.randomUUID()` 与 `crypto.subtle` 安全上下文 API；
+  - 平台任务 ID 生成采用进程内时间戳与自增序列号，确保全网络环境可用；
+  - `copyable` 统一提供兼容性兜底：当 `navigator.clipboard` 在非安全 HTTP 环境不可用或写入被拒绝时，自动聚焦并选中文本输入框，向用户弹出明确的手动复制提示（`image.copySelectedPrompt`，如“已选中路径，请按 Ctrl+C 复制”），保证复制操作的确定性闭环。
 
 ### 5.6 通用底栏状态栏管理 (`PluginStatusBar`)
 
@@ -432,8 +451,8 @@ Core 平台在思源主工作区状态栏区域提供通用的轻量任务进度
 
 ### 6.1 `KernelClient` 安全调用门面
 
-对思源原生 REST API（`fetchPost`）进行封装与防御性处理：
-- **请求超时与中止**：默认设置 30 秒超时，支持透传 `AbortSignal`；
+对思源原生 REST API（`fetchPost` / `fetchSyncPost`）进行封装与防御性处理：
+- **请求超时与真实连接中止 (Timeout & Abort Propagation)**：默认设置 30 秒超时，支持透传 `AbortSignal`；内部集成专属 `AbortController`，当超时定时器触发或外部取消时，不仅终止 Promise 等待并拒绝返回 `KernelRequestError`，同时显式调用底层内部控制器的 `abort()`，将中止信号传播到底层 `fetchSyncPost` 与物理网络连接，释放连接套接字；
 - **响应错误归一化**：自动检查 HTTP 状态码与思源返回体中的 `code !== 0`，提取并包装为标准 `KernelError`；
 - **网络异常容灾**：网络断开或内核异常时不针对非幂等修改请求执行自动重试，避免向内核制造重复提交。
 
@@ -474,6 +493,7 @@ Core 平台在思源主工作区状态栏区域提供通用的轻量任务进度
 
 ### 8.1 插件版本权威源与双清单一致性
 - **单一版本权威源**：思源笔记插件生态将 `plugin.json` 中的 `version` 作为识别插件元数据与集市版本的唯一官方权威源；
+- **最低思源版本基准**：插件最低运行环境要求统一规范为思源笔记 `3.8.4`（`minAppVersion: "3.8.4"`），以对齐内核 API 契约（包括 `/api/asset/findAssetReferences` 引用反查、`before-upload-assets` 事件管道及 `/api/block/getBlockDOMs` 等能力）；
 - **开发清单同步**：`package.json` 中的 `version` 保持原子同步一致，确保 Node.js/pnpm 工具链与思源宿主元数据强一致；
 - **语义化版本规范**：版本号严格采用标准三段式 `X.Y.Z` 语义化版本（SemVer），无多余前缀或预发布后缀。
 

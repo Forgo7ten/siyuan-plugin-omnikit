@@ -27,6 +27,8 @@ export interface FeatureRegistration<T> {
   /** Optional feature-owned content for the shared OmniKit dock container. */
   dockView?: Component<{ context: FeatureContext; t: (key: string, values?: Record<string, string | number>) => string }>;
   readonly frontends?: readonly SiyuanFrontend[];
+  /** Optional feature reload callback dispatched when host data changes or external sync occurs. */
+  reloadData?: (plugin: Plugin) => Promise<void>;
 }
 
 function featureSlug(id: string): string {

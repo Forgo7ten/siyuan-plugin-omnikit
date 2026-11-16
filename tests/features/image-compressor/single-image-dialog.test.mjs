@@ -39,3 +39,123 @@ test("manual compression previews in memory and saves only through savePreview",
   assert.match(component, /URL\.revokeObjectURL\(previewURL\)/);
   assert.doesNotMatch(component, /window\.confirm|>\s*取消\s*</);
 });
+
+test("savePreview with replace: false generates asset and record with zero updateBlock calls", async () => {
+  const { savePreview } = await import("../../../src/features/image-compressor/services/ImageProcessingServices.ts");
+  let updateBlockCalls = 0;
+  let recordUpsertCalls = 0;
+  const webpFile = new File(["dummy-webp"], "output.webp", { type: "image/webp" });
+  const mockServices = {
+    origin: "https://siyuan.test",
+    config: () => ({ compression: { maxInputBytes: 10 * 1024 * 1024 } }),
+    assets: {
+      upload: async () => "assets/output.webp",
+    },
+    recordsReady: Promise.resolve(),
+    records: {
+      upsert: async () => { recordUpsertCalls++; },
+      markOperation: async () => {},
+    },
+    references: {
+      commitOccurrence: async () => {
+        updateBlockCalls++;
+        return "replaced";
+      },
+    },
+    ui: {
+      copyablePath: () => {},
+    },
+  };
+
+  const target = {
+    rootID: "20240101000000-abcdefg",
+    notebook: "20240101000000-hijklmn",
+    blockID: "20240101000000-opqrstu",
+    imageOrdinal: 0,
+    oldPath: "assets/original.png",
+    baselineBlockDOM: '<div data-node-id="20240101000000-opqrstu"><img src="assets/original.png"></div>',
+  };
+
+  const result = await savePreview(
+    mockServices,
+    target,
+    webpFile,
+    new AbortController().signal,
+    false, // replace: false
+  );
+
+  assert.equal(result.status, "saved");
+  assert.equal(result.reference, "not-requested");
+  assert.equal(result.path, "assets/output.webp");
+  assert.equal(recordUpsertCalls, 1);
+  assert.equal(updateBlockCalls, 0); // Strictly zero updateBlock calls
+});
+
+test("localizeRemoteOccurrence with replace: false uploads remote asset without updateBlock", async () => {
+  const { localizeRemoteOccurrence } = await import("../../../src/features/image-compressor/actions/SingleImageAction.ts");
+  const { savePreview } = await import("../../../src/features/image-compressor/services/ImageProcessingServices.ts");
+
+  let updateBlockCalls = 0;
+  let recordUpsertCalls = 0;
+  let uploadCalls = 0;
+
+  const mockServices = {
+    origin: "https://siyuan.test",
+    userAgent: () => "OmniKit/Test",
+    config: () => ({ compression: { maxInputBytes: 10 * 1024 * 1024 } }),
+    reader: {
+      read: async () => ({
+        blob: new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])], { type: "image/png" }),
+        name: "test.png",
+      }),
+    },
+    assets: {
+      upload: async (file) => {
+        uploadCalls++;
+        return `assets/${file.name}`;
+      },
+    },
+    recordsReady: Promise.resolve(),
+    records: {
+      upsert: async () => { recordUpsertCalls++; },
+      markOperation: async () => {},
+    },
+    references: {
+      commitOccurrence: async () => {
+        updateBlockCalls++;
+        return "replaced";
+      },
+    },
+    ui: {
+      copyablePath: () => {},
+      notify: () => {},
+    },
+  };
+
+  const remoteTarget = {
+    rootID: "20240101000000-abcdefg",
+    notebook: "20240101000000-hijklmn",
+    blockID: "20240101000000-opqrstu",
+    imageOrdinal: 0,
+    oldPath: "https://example.com/test.png",
+    baselineBlockDOM: '<div data-node-id="20240101000000-opqrstu"><img src="https://example.com/test.png"></div>',
+  };
+
+  const signal = new AbortController().signal;
+
+  // 1. Localize with replace: false
+  const localizedTarget = await localizeRemoteOccurrence(remoteTarget, mockServices, signal, false);
+  assert.equal(localizedTarget.oldPath, "assets/test.png");
+  assert.equal(uploadCalls, 1); // uploaded remote original to assets
+  assert.equal(updateBlockCalls, 0); // Strictly zero document writes during localization
+
+  // 2. Save preview with replace: false
+  const webpFile = new File(["dummy-webp"], "output.webp", { type: "image/webp" });
+  const result = await savePreview(mockServices, localizedTarget, webpFile, signal, false);
+
+  assert.equal(result.status, "saved");
+  assert.equal(result.reference, "not-requested");
+  assert.equal(uploadCalls, 2); // uploaded original + webp
+  assert.equal(recordUpsertCalls, 1); // record saved for assets/test.png -> assets/output.webp
+  assert.equal(updateBlockCalls, 0); // Strictly zero document writes end-to-end
+});

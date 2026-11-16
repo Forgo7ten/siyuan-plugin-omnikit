@@ -143,13 +143,24 @@ export class OmniKitPlugin extends Plugin {
   async onDataChanged(): Promise<void> {
     if (this.unloading || !this.settingsManager) return;
     const changed = await this.settingsManager.reloadAfterExternalChange();
-    if (this.unloading || changed.length === 0) return;
+    if (this.unloading) return;
     if (!this.settingsInstance && this.manager) {
-      if (changed.includes("core")) await this.manager.reconcileFromLoadedSettings();
-      for (const id of changed) {
-        if (id !== "core") await this.manager.notifySettingsChanged(id);
+      if (changed.length > 0) {
+        if (changed.includes("core")) await this.manager.reconcileFromLoadedSettings();
+        for (const id of changed) {
+          if (id !== "core") await this.manager.notifySettingsChanged(id);
+        }
+        this.refreshDock?.();
       }
-      this.refreshDock?.();
+      for (const registration of registrations) {
+        if (registration.reloadData && this.manager.isRunning(registration.id)) {
+          try {
+            await registration.reloadData(this);
+          } catch (error) {
+            this.logger.error(`Feature ${registration.id} reloadData 失败`, error);
+          }
+        }
+      }
     }
   }
 

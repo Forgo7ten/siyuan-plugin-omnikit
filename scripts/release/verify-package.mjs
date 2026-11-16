@@ -31,7 +31,7 @@ const pkg = JSON.parse(readFileSync(resolveRoot("package.json"), "utf8"));
 const manifest = JSON.parse(readFileSync(resolveRoot("dist/plugin.json"), "utf8"));
 assert.equal(manifest.name, "siyuan-plugin-omnikit");
 assert.equal(pkg.version, manifest.version);
-assert.equal(manifest.minAppVersion, "3.8.0");
+assert.equal(manifest.minAppVersion, "3.8.4");
 for (const locale of ["en", "zh-CN"]) {
   JSON.parse(readFileSync(resolveRoot(`dist/i18n/${locale}.json`), "utf8"));
 }

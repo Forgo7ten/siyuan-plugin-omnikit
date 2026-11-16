@@ -75,9 +75,29 @@ export async function compressDocumentImages(
     return summary;
   }
 
-  // Every block snapshot is fetched once before compression begins; these are the authorized targets.
+  // Every block snapshot is fetched before compression begins; these are the authorized targets.
   const targetNotebook = notebook;
   const blockDOMs = new Map<string, string>();
+  const missingBlockIds = [...new Set(scanned.map(o => o.blockId))];
+  if (missingBlockIds.length > 0) {
+    try {
+      const batchRes = await services.kernel.post<Record<string, string>>(
+        "/api/block/getBlockDOMs",
+        { ids: missingBlockIds, notebook: targetNotebook },
+        { signal },
+      );
+      if (batchRes.data && typeof batchRes.data === "object" && !Array.isArray(batchRes.data)) {
+        for (const [id, dom] of Object.entries(batchRes.data)) {
+          if (typeof dom === "string" && dom.trim()) {
+            blockDOMs.set(id, dom);
+          }
+        }
+      }
+    } catch {
+      // Fallback to per-block queries below if getBlockDOMs is unsupported or fails
+    }
+  }
+
   const authorized: AuthorizedOccurrence[] = [];
   for (const occurrence of scanned) {
     if (signal.aborted || !scope.active) return cancelledSummary(summary);
@@ -121,7 +141,6 @@ export async function compressDocumentImages(
   }
 
   const countedPaths = new Set<string>();
-  const alreadyWritten = new Map<string, Map<number, { oldPath: string; newPath: string }>>();
   const distinctGroups = [...byKey.entries()];
   const preparedMap = new Map<string, Prepared>();
   const failedKeys = new Set<string>();
@@ -199,58 +218,17 @@ export async function compressDocumentImages(
     let anyReplaced = false;
     for (const item of locations) {
       if (signal.aborted || !scope.active) return cancelledSummary(summary);
-      let target = item.target;
-      const replacements = alreadyWritten.get(target.blockID);
-      if (replacements?.size) {
-        const expected = patchAuthorizedBaseline(target.baselineBlockDOM, target.blockID, replacements);
-        if (!expected) {
-          summary.conflicts++; summary.completed++;
-          continue;
-        }
-        try {
-          const current = await readBlockDOM(services, target.blockID, targetNotebook, signal);
-          if (canonicalBlock(current, target.blockID) !== expected) {
-            summary.conflicts++; summary.completed++;
-            continue;
-          }
-          target = { ...target, baselineBlockDOM: current };
-          item.target = target;
-          for (const later of locations) if (later.target.blockID === target.blockID && !replacements.has(later.target.imageOrdinal)) {
-            later.target = { ...later.target, baselineBlockDOM: current };
-          }
-        } catch (error) {
-          context.logger.warn(`复核图片块失败：${target.blockID}`, error);
-          summary.conflicts++; summary.completed++;
-          continue;
-        }
-      }
+      const target = item.target;
       try {
         const committed = await services.references.commitOccurrence(target, prepared.path, signal);
         if (committed === "replaced") {
           anyReplaced = true;
-          const allowed = alreadyWritten.get(target.blockID) ?? new Map<number, { oldPath: string; newPath: string }>();
-          allowed.set(target.imageOrdinal, { oldPath: target.oldPath, newPath: prepared.path });
-          alreadyWritten.set(target.blockID, allowed);
-          // Read back immediately. Only advance baselines if the block contains our exact authorized patch.
-          try {
-            const after = await readBlockDOM(services, target.blockID, targetNotebook, signal);
-            const expected = patchAuthorizedBaseline(target.baselineBlockDOM, target.blockID, allowed);
-            if (!expected || canonicalBlock(after, target.blockID) !== expected) {
-              summary.conflicts++; summary.completed++;
-              continue;
-            }
-            blockDOMs.set(target.blockID, after);
-            for (const later of locations) if (later.target.blockID === target.blockID && !allowed.has(later.target.imageOrdinal)) {
-              later.target = { ...later.target, baselineBlockDOM: after };
-            }
-          } catch (error) {
-            context.logger.warn(`图片块写回后验证失败：${target.blockID}`, error);
-            summary.failed++; summary.completed++;
-            continue;
-          }
           recordRewrittenReference(summary, source.raw, prepared.originalBytes, prepared.compressedBytes, countedPaths);
-        } else if (committed === "conflict") summary.conflicts++;
-        else summary.failed++;
+        } else if (committed === "conflict") {
+          summary.conflicts++;
+        } else {
+          summary.failed++;
+        }
       } catch (error) {
         context.logger.warn(`提交图片引用失败：${source.raw}`, error);
         summary.failed++;
@@ -264,42 +242,6 @@ export async function compressDocumentImages(
   summary.uploaded = uploaded;
   report();
   return summary;
-}
-
-async function readBlockDOM(services: ImageProcessingServices, id: string, notebook: string, signal: AbortSignal): Promise<string> {
-  const response = await services.kernel.post<any>("/api/block/getBlockDOM", { id, notebook }, { signal });
-  if (response.data?.id !== id || typeof response.data.dom !== "string" || !response.data.dom.trim()) throw new Error("Invalid block DOM");
-  return response.data.dom;
-}
-
-function canonicalBlock(dom: string, blockID: string): string | undefined {
-  const parsed = new DOMParser().parseFromString(dom, "text/html");
-  if (parsed.querySelector("parsererror")) return undefined;
-  const roots = [...parsed.body.children].filter(node => node.getAttribute("data-node-id") === blockID);
-  if (roots.length !== 1 || parsed.body.children.length !== 1 || roots[0].querySelector("[data-node-id]")) return undefined;
-  return roots[0].outerHTML;
-}
-
-function patchAuthorizedBaseline(dom: string, blockID: string, replacements: Map<number, { oldPath: string; newPath: string }>): string | undefined {
-  const canonical = canonicalBlock(dom, blockID);
-  if (!canonical) return undefined;
-  const template = document.createElement("template");
-  template.innerHTML = canonical;
-  const root = template.content.children[0];
-  const images = [...root.querySelectorAll("img")];
-  for (const [ordinal, replacement] of replacements) {
-    const image = images[ordinal];
-    if (!image) return undefined;
-    const attr = image.hasAttribute("data-src") ? "data-src" : "src";
-    const current = image.getAttribute(attr);
-    if (current === replacement.oldPath) {
-      image.setAttribute(attr, replacement.newPath);
-      if (attr === "data-src" && image.getAttribute("src") === replacement.oldPath) image.setAttribute("src", replacement.newPath);
-    } else if (current !== replacement.newPath) {
-      return undefined;
-    }
-  }
-  return root.outerHTML;
 }
 
 function cancelledSummary(summary: CompressionBatchSummary): CompressionBatchSummary { summary.cancelled = true; return summary; }

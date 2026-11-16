@@ -75,6 +75,7 @@ test("feature lifecycle activates event listeners, contributes menus, and dispos
   assert.equal(events.get("paste")?.size, 1);
   assert.equal(events.get("loaded-protyle-static")?.size, 1);
   assert.equal(events.get("switch-protyle")?.size, 1);
+  assert.equal(events.get("destroy-protyle")?.size, 1);
 
   // Verify menu contributions
   const linkMenu = menuContributions.find(m => m.location === "link");
@@ -98,6 +99,7 @@ test("feature lifecycle activates event listeners, contributes menus, and dispos
   assert.equal(events.get("paste")?.size, 0);
   assert.equal(events.get("loaded-protyle-static")?.size, 0);
   assert.equal(events.get("switch-protyle")?.size, 0);
+  assert.equal(events.get("destroy-protyle")?.size, 0);
 });
 
 test("feature registration and both locales include titled-link settings", async () => {

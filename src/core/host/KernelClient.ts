@@ -42,6 +42,7 @@ export class KernelClient {
     return new Promise((resolve, reject) => {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
+      const internalController = new AbortController();
 
       const cleanup = () => {
         if (timer !== undefined) clearTimeout(timer);
@@ -55,12 +56,21 @@ export class KernelClient {
         fn();
       };
 
-      const onAbort = () => settle(() => reject(new KernelRequestError("Operation cancelled", "unknown", "AbortError")));
-      signal?.addEventListener("abort", onAbort, { once: true });
-      timer = setTimeout(() => settle(() => reject(new KernelRequestError("Request timed out", "unknown", "TimeoutError"))), timeout);
+      const onAbort = () => {
+        internalController.abort(new KernelRequestError("Operation cancelled", "unknown", "AbortError"));
+        settle(() => reject(new KernelRequestError("Operation cancelled", "unknown", "AbortError")));
+      };
+      if (signal) {
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      timer = setTimeout(() => {
+        internalController.abort(new KernelRequestError("Request timed out", "unknown", "TimeoutError"));
+        settle(() => reject(new KernelRequestError("Request timed out", "unknown", "TimeoutError")));
+      }, timeout);
 
       try {
-        Promise.resolve(this.request(path as any, body, undefined, false, signal))
+        Promise.resolve(this.request(path as any, body, undefined, false, internalController.signal))
           .then(response => {
             const result = response as unknown as KernelResponse<T>;
             if (!result || result.code !== 0) {
@@ -70,7 +80,7 @@ export class KernelClient {
             }
           })
           .catch(error => {
-            if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
+            if (signal?.aborted || internalController.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
               settle(() => reject(new KernelRequestError("Operation cancelled", "unknown", "AbortError")));
             } else {
               settle(() => reject(new KernelRequestError(error instanceof Error ? error.message : String(error), "unknown")));

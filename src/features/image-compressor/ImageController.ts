@@ -1,4 +1,5 @@
 import { showMessage } from "siyuan";
+import { combineSignals } from "../../core/host/ProtyleAdapter.ts";
 import type { FeatureContext } from "../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../core/framework/FeatureScope.ts";
 import { translate } from "../../i18n/translate.ts";
@@ -19,6 +20,8 @@ import type { AutoUploadNotice } from "./actions/AutoUploadHandler.ts";
  * Decouples menu/UI event triggers from execution and task life-cycles.
  */
 export class ImageController {
+  private readonly activeDocuments = new Set<string>();
+
   constructor(
     private readonly context: FeatureContext,
     private readonly scope: FeatureScope,
@@ -139,7 +142,20 @@ export class ImageController {
       return;
     }
 
+    if (this.activeDocuments.has(rootID)) {
+      const msg = this.t("image.batch.alreadyRunning") || "当前文档已有正在运行的压缩任务";
+      if (this.context.feedback) this.context.feedback.notify(msg, "info", { timeout: 4000 });
+      else showMessage(msg, 4000);
+      return;
+    }
+    this.activeDocuments.add(rootID);
+
     const controller = this.tasks.create(this.scope.signal);
+    const modalAbortController = new AbortController();
+    const abortOnScope = () => modalAbortController.abort(this.scope.signal.reason);
+    if (this.scope.signal.aborted) abortOnScope();
+    else this.scope.signal.addEventListener("abort", abortOnScope, { once: true });
+
     let state: ImageTaskState = {
       id: crypto.randomUUID(),
       phase: "preparing",
@@ -166,11 +182,36 @@ export class ImageController {
           return () => listeners.delete(listener);
         },
       },
+      () => {
+        modalAbortController.abort(new DOMException("Task modal dismissed", "AbortError"));
+      },
     );
 
+    const onSwitchEditor = (event: CustomEvent<any>) => {
+      const switchedRootID = event.detail?.protyle?.block?.rootID;
+      if (switchedRootID && switchedRootID !== rootID) {
+        modalAbortController.abort(new DOMException("Editor switched", "AbortError"));
+      }
+    };
+    const onDestroyProtyle = (event: CustomEvent<any>) => {
+      const destroyedRootID = event.detail?.protyle?.block?.rootID;
+      if (destroyedRootID === rootID) {
+        modalAbortController.abort(new DOMException("Editor destroyed", "AbortError"));
+      }
+    };
+    this.context.plugin.eventBus?.on("switch-protyle", onSwitchEditor);
+    this.context.plugin.eventBus?.on("destroy-protyle", onDestroyProtyle);
+
+    const cleanupAbort = () => {
+      this.context.plugin.eventBus?.off("switch-protyle", onSwitchEditor);
+      this.context.plugin.eventBus?.off("destroy-protyle", onDestroyProtyle);
+      this.scope.signal.removeEventListener("abort", abortOnScope);
+    };
+
     try {
+      const combined = combineSignals(controller.signal, modalAbortController.signal) ?? modalAbortController.signal;
       const options: BatchActionOptions = {
-        signal: controller.signal,
+        signal: combined,
         onProgress: update => {
           if (!this.scope.active) return;
           publish({
@@ -241,6 +282,8 @@ export class ImageController {
       this.context.logger.error("批量压缩文档图片失败", error);
       if (this.scope.active) publish({ phase: "failed", messages: [String(error)] });
     } finally {
+      cleanupAbort();
+      this.activeDocuments.delete(rootID);
       this.context.statusBar?.clear(state.id);
       this.tasks.release(controller);
       if (!this.scope.active) view.close();

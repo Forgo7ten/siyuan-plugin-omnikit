@@ -220,3 +220,34 @@ test("synchronously unauthorized document upload does not register onComplete or
   assert.equal(registered, false);
   scope.dispose();
 });
+
+test("AssetStore verifies upload persistence from kernel upload contract without re-download", async () => {
+  const { AssetStore, UploadOutcomeUnknown } = await import("../../../src/features/image-compressor/services/assets.ts");
+  const kernelSuccess = {
+    post: async () => ({
+      code: 0,
+      data: {
+        errFiles: [],
+        failedFiles: [],
+        succFiles: [{ index: 0, path: "assets/verified.webp" }],
+      },
+    }),
+  };
+  const store = new AssetStore(kernelSuccess, "https://siyuan.test");
+  const testFile = new File(["dummy"], "test.webp", { type: "image/webp" });
+  const path = await store.upload(testFile, "20240101000000-abcdefg");
+  assert.equal(path, "assets/verified.webp");
+
+  const kernelFailed = {
+    post: async () => ({
+      code: 0,
+      data: {
+        errFiles: ["error"],
+        failedFiles: [{ index: 0, path: "assets/bad.webp" }],
+        succFiles: [],
+      },
+    }),
+  };
+  const storeFailed = new AssetStore(kernelFailed, "https://siyuan.test");
+  await assert.rejects(storeFailed.upload(testFile, "20240101000000-abcdefg"), UploadOutcomeUnknown);
+});

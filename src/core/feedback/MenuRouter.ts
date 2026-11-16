@@ -15,8 +15,8 @@ export interface ImageMenuTarget {
 }
 
 /**
- * @compat Event names exist since 3.8.0. The detail shapes below must be verified against
- * real 3.8.0 / 3.8.9 frontends; adapters never guess a target from the first `.protyle`.
+ * @compat Event names exist since 3.8.4. The detail shapes below must be verified against
+ * real 3.8.4 / 3.8.9 frontends; adapters never guess a target from the first `.protyle`.
  * @invariant The core installs one listener per host event, independent of feature count.
  */
 export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: Logger): () => void {

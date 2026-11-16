@@ -46,9 +46,10 @@ test("dock lookups are user-triggered and restore is occurrence-scoped with pers
   assert.match(dock, /navigator\.clipboard\.writeText/);
   assert.match(dock, /image\.records\.originalStatus/);
   assert.match(dock, /image\.records\.compressedStatus/);
-  assert.match(dock, /origStatus === "missing" \|\| compStatus === "missing"/);
+  assert.match(dock, /dockAbort\?\.abort\(\)/);
   assert.match(dock, /omnikit-dock-tab-activated/);
   assert.doesNotMatch(dock, /relinkAsset|\/api\/asset\/removeAsset|removeAsset\(/);
+  assert.doesNotMatch(dock, /prunedNotice/);
   assert.doesNotMatch(dock, /noSafeOccurrences/);
 });
 

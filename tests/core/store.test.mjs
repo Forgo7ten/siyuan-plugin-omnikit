@@ -179,3 +179,116 @@ test("unconfirmed update times out without changing memory or starting another w
   await assert.rejects(store.update(value => { value.value = 2; }), /unconfirmed write/);
   assert.deepEqual(plugin.writes, ["feature-unit-test.json"]);
 });
+
+test("missing file via HTTP 202 code 404 initializes defaults without entering read-only", async () => {
+  const plugin = createPlugin();
+  const mockFetch = async () => new Response(JSON.stringify({ code: 404, msg: "file not found" }), {
+    status: 202,
+    headers: { "Content-Type": "application/json" },
+  });
+
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
+  await store.load();
+  assert.equal(store.readOnly, false);
+  assert.equal(store.needsRecovery, false);
+  assert.deepEqual(store.snapshot(), { schemaVersion: 1, value: 0 });
+  assert.deepEqual(plugin.writes, []);
+});
+
+test("server error HTTP 500 triggers read-only protection and rejects load", async () => {
+  const plugin = createPlugin();
+  const mockFetch = async () => new Response("Internal Server Error", { status: 500 });
+
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
+  await assert.rejects(store.load(), /Server error reading/);
+  assert.equal(store.readOnly, true);
+  assert.equal(store.needsRecovery, true);
+  assert.deepEqual(plugin.writes, []);
+
+  // Write operations are blocked in read-only mode
+  await assert.rejects(store.update(v => { v.value = 1; }), /read-only/);
+});
+
+test("HTTP 202 with non-404 code triggers read-only protection", async () => {
+  const plugin = createPlugin();
+  const mockFetch = async () => new Response(JSON.stringify({ code: 503, msg: "service unavailable" }), {
+    status: 202,
+    headers: { "Content-Type": "application/json" },
+  });
+
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
+  await assert.rejects(store.load(), /Kernel getFile failed: 503/);
+  assert.equal(store.readOnly, true);
+  assert.equal(store.needsRecovery, true);
+  assert.deepEqual(plugin.writes, []);
+});
+
+test("storage read timeout triggers read-only protection and unblocks queue", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const plugin = createPlugin();
+  let entered;
+  const fetchEntered = new Promise(resolve => { entered = resolve; });
+  const mockFetch = (_url, init) => {
+    entered();
+    return new Promise((_, reject) => {
+      init?.signal?.addEventListener("abort", () => {
+        reject(new Error("Storage read timed out"));
+      });
+    });
+  };
+
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
+  const pending = store.load();
+  await fetchEntered;
+  t.mock.timers.tick(30_000);
+  await assert.rejects(pending, /Storage read timed out/);
+  assert.equal(store.readOnly, true);
+  assert.equal(store.needsRecovery, true);
+
+  // Subsequent queue operation executes and is not deadlocked
+  let nextExecuted = false;
+  await assert.rejects(store.update(() => { nextExecuted = true; }), /read-only/);
+  assert.equal(nextExecuted, false);
+});
+
+test("queue unblocks following rejected update", async () => {
+  const plugin = createPlugin();
+  const mockFetch = async () => new Response(JSON.stringify({ schemaVersion: 1, value: 10 }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
+  await store.load();
+
+  // Failed update
+  await assert.rejects(store.update(() => { throw new Error("mutation error"); }), /mutation error/);
+
+  // Next update proceeds without deadlock
+  const updated = await store.update(v => { v.value = 20; });
+  assert.equal(updated, true);
+  assert.equal(store.snapshot().value, 20);
+});
+
+test("corrupt file content enters recovery mode and can recover with backup", async () => {
+  const plugin = createPlugin();
+  const corruptContent = JSON.stringify({ schemaVersion: 999, value: 4 });
+  const mockFetch = async () => new Response(corruptContent, {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
+  await store.load();
+  assert.equal(store.needsRecovery, true);
+  assert.equal(store.readOnly, true);
+
+  // Recover with backup creates a backup and resets to defaults
+  await store.recoverWithBackup();
+  assert.equal(store.needsRecovery, false);
+  assert.equal(store.readOnly, false);
+  assert.equal(store.snapshot().value, 0);
+  assert.equal(plugin.writes.length, 2);
+  assert.match(plugin.writes[0], /^feature-unit-test\.backup-\d+\.json$/);
+  assert.equal(plugin.writes[1], "feature-unit-test.json");
+});

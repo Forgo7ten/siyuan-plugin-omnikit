@@ -90,7 +90,7 @@ export async function compressSelectedImageQuick(
       excludedExtensions: services.config().compression.excludedExtensions,
     });
     if (!candidateDecision.eligible) return notify(context, services, "image.single.noBenefit");
-    target = await localizeRemoteOccurrence(target, services, signal);
+    target = await localizeRemoteOccurrence(target, services, signal, true);
     if (!scope.active || signal.aborted) return;
     const result = await services.compressOccurrence(target, services.config(), signal, {
       replace: true,
@@ -156,13 +156,13 @@ export async function compressSelectedImageCustom(
             ...config,
             compression: { ...config.compression, initialQuality: quality, manualMaxEdge },
           };
-          const original = await services.reader.read(source, {
+          const original = previewOriginal ?? await services.reader.read(source, {
             maxBytes: source.kind === "remote" ? Math.min(config.compression.maxInputBytes, 32 * 1024 * 1024) : config.compression.maxInputBytes,
             timeoutMs: 30_000,
             signal: previewAbort.signal,
             userAgent: services.userAgent(),
           });
-          if (source.kind === "remote") await assertImagePayload(original.blob);
+          if (!previewOriginal && source.kind === "remote") await assertImagePayload(original.blob);
           previewOriginal = original;
           const encoded = await services.encoder.encode(original.blob, original.name, tunedConfig,
             previewAbort.signal, undefined, "manual-dialog");
@@ -182,7 +182,7 @@ export async function compressSelectedImageCustom(
         },
         save: async (preview, replace) => {
           if (!scope.active || signal.aborted) return;
-          const localizedTarget = await localizeRemoteOccurrence(target, services, signal, previewOriginal);
+          const localizedTarget = await localizeRemoteOccurrence(target, services, signal, replace, previewOriginal);
           const result = await services.savePreview(localizedTarget, preview.file, signal, replace);
           if (result.status === "saved" && result.reference === "conflict") {
             services.ui.copyablePath(result.path, "image.single.conflict");
@@ -208,10 +208,11 @@ export async function compressSelectedImageCustom(
   }
 }
 
-async function localizeRemoteOccurrence(
+export async function localizeRemoteOccurrence(
   target: OccurrenceTarget,
   services: ImageProcessingServices,
   signal: AbortSignal,
+  replace: boolean = true,
   suppliedOriginal?: Downloaded,
 ): Promise<OccurrenceTarget> {
   const source = resolveSource(target.oldPath, services.origin);
@@ -226,6 +227,9 @@ async function localizeRemoteOccurrence(
   await assertImagePayload(original.blob);
   const file = new File([original.blob], safeFileName(original.name), { type: original.blob.type });
   const localPath = await services.assets.upload(file, target.rootID, signal);
+  if (!replace) {
+    return { ...target, oldPath: localPath };
+  }
   const committed = await services.references.commitOccurrence(target, localPath, signal);
   if (committed !== "replaced") throw new Error("Remote image localization could not be verified");
   const updatedDOM = await blockDOM(services.kernel, target.blockID, target.notebook, signal);

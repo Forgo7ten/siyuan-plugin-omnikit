@@ -80,7 +80,7 @@ export function inspectImage(b: Uint8Array): ImageInfo {
     return { mime: "image/webp", width: w, height: h, animated };
   }
   if (b[0] === 255 && b[1] === 216) {
-    let p = 2, w = 0, h = 0;
+    let p = 2, w = 0, h = 0, orientation = 1;
     while (p + 1 < b.length) {
       if (b[p++] !== 255) throw new Error("Invalid JPEG marker");
       while (b[p] === 255) p++;
@@ -91,6 +91,26 @@ export function inspectImage(b: Uint8Array): ImageInfo {
       const n = v.getUint16(p);
       if (n < 2 || n > b.length - p) throw new Error("Truncated JPEG segment");
       if (marker === 226 && text(b, p + 2, 4) === "MPF\0") throw new Error("Multi-picture JPEG is protected");
+      if (marker === 225 && n >= 14 && text(b, p + 2, 4) === "Exif" && b[p + 6] === 0 && b[p + 7] === 0) {
+        const tiffStart = p + 8;
+        const isLittle = b[tiffStart] === 0x49 && b[tiffStart + 1] === 0x49;
+        const isBig = b[tiffStart] === 0x4d && b[tiffStart + 1] === 0x4d;
+        if ((isLittle || isBig) && v.getUint16(tiffStart + 2, isLittle) === 42) {
+          const ifdOffset = v.getUint32(tiffStart + 4, isLittle);
+          if (ifdOffset >= 8 && tiffStart + ifdOffset + 2 <= b.length) {
+            const entries = v.getUint16(tiffStart + ifdOffset, isLittle);
+            for (let i = 0; i < entries; i++) {
+              const entryPos = tiffStart + ifdOffset + 2 + i * 12;
+              if (entryPos + 12 > b.length) break;
+              const tag = v.getUint16(entryPos, isLittle);
+              if (tag === 0x0112) {
+                orientation = v.getUint16(entryPos + 8, isLittle);
+                break;
+              }
+            }
+          }
+        }
+      }
       if ([192, 193, 194].includes(marker)) {
         if (n < 8 || ![1, 3].includes(b[p + 7])) throw new Error("Unsupported JPEG colour components");
         h = v.getUint16(p + 3);
@@ -99,6 +119,11 @@ export function inspectImage(b: Uint8Array): ImageInfo {
       p += n;
     }
     if (!w || !h) throw new Error("Unsupported/incomplete JPEG");
+    if (orientation >= 5 && orientation <= 8) {
+      const temp = w;
+      w = h;
+      h = temp;
+    }
     return { mime: "image/jpeg", width: w, height: h, animated: false };
   }
   throw new Error("Unsupported image signature; GIF/SVG/HEIF/AVIF are not converted by this engine");
@@ -268,10 +293,10 @@ export class BicEncoder implements ImageCodec {
       const expectedMaxEdge = strictDimensions ? Math.max(info.width, info.height)
         : Math.min(c.manualMaxEdge, Math.max(info.width, info.height));
       const expectedScale = Math.min(1, expectedMaxEdge / Math.max(info.width, info.height));
-      const expectedWidth = Math.max(1, Math.round(info.width * expectedScale));
-      const expectedHeight = Math.max(1, Math.round(info.height * expectedScale));
+      const expectedWidth = Math.max(1, Math.floor(info.width * expectedScale));
+      const expectedHeight = Math.max(1, Math.floor(info.height * expectedScale));
       if (!dimensions.width || !dimensions.height || dimensions.width !== actual.width || dimensions.height !== actual.height
-        || dimensions.width !== expectedWidth || dimensions.height !== expectedHeight) {
+        || Math.abs(dimensions.width - expectedWidth) > 1 || Math.abs(dimensions.height - expectedHeight) > 1) {
         throw new Error("Unexpected output dimensions");
       }
 

@@ -37,6 +37,21 @@ export class AdaptiveImageCompressor implements ImageCodec {
       return this.codec.encode(blob, name, config, signal, onProgress, mode, options);
     }
 
+    const c = config.compression;
+    const ext = name.split(/[?#]/)[0].split(".").pop()?.toLowerCase() ?? "";
+    if (
+      /excalidraw|(?:^|[\/\\])drawings?[\/\\._-]/i.test(name) ||
+      (c.excludedExtensions.includes(ext) && !(ext === "webp" && mode === "manual-dialog"))
+    ) {
+      return { kind: "skipped", reason: "protected-extension" };
+    }
+    if (mode !== "manual-dialog" && blob.size < c.minInputBytes) {
+      return { kind: "skipped", reason: "below_threshold" };
+    }
+    if (blob.size > c.maxInputBytes) {
+      return { kind: "skipped", reason: "exceeds_max_bytes" };
+    }
+
     const policy = getSimilarityPolicy();
     const worker = new SimilarityWorkerSession({
       signal,

@@ -61,3 +61,25 @@ test("late registrations are cleaned immediately", async () => {
   await feature.deactivate();
   assert.equal(cleaned, 1);
 });
+
+test("FeatureRegistration reloadData contract is optional and invokable", async () => {
+  let reloadedWith = null;
+  const registration = {
+    id: "testFeature",
+    titleKey: "feature.test.title",
+    descriptionKey: "feature.test.desc",
+    defaultEnabled: true,
+    file: "feature-test-settings.json",
+    codec: { defaults: () => ({}), parse: (x) => x },
+    create: () => ({}),
+    settingsView: () => null,
+    reloadData: async (plugin) => {
+      reloadedWith = plugin;
+    },
+  };
+
+  assert.equal(typeof registration.reloadData, "function");
+  const mockPlugin = { name: "test-plugin" };
+  await registration.reloadData?.(mockPlugin);
+  assert.equal(reloadedWith, mockPlugin);
+});

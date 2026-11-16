@@ -1,4 +1,4 @@
-import { showMessage } from "siyuan";
+import { showMessage, getActiveEditor } from "siyuan";
 import { BaseFeature } from "../../core/framework/BaseFeature.ts";
 import type { FeatureContext } from "../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../core/framework/FeatureScope.ts";
@@ -43,7 +43,7 @@ export class ImageCompressorFeature extends BaseFeature {
       category: "media",
       icon: "iconOmnikitMenu",
       defaultEnabled: false,
-      minimumAppVersion: "3.8.0",
+      minimumAppVersion: "3.8.4",
       frontends: ["all"],
     });
     this.pages = new PageAllowlist(settings);
@@ -130,10 +130,21 @@ export class ImageCompressorFeature extends BaseFeature {
     };
     const onEditor = (event: CustomEvent<any>) => attach(event.detail?.protyle);
     const onDestroyed = (event: CustomEvent<any>) => {
-      const element = event.detail?.protyle?.element;
+      const detail = event.detail;
+      const element = detail?.protyle?.element ?? detail?.element;
       if (element instanceof HTMLElement) {
         editors.get(element)?.handle?.dispose();
         editors.delete(element);
+      } else {
+        const destroyedRootID = detail?.protyle?.block?.rootID ?? detail?.block?.rootID;
+        if (typeof destroyedRootID === "string") {
+          for (const [el, entry] of editors.entries()) {
+            if (entry.rootID === destroyedRootID) {
+              entry.handle?.dispose();
+              editors.delete(el);
+            }
+          }
+        }
       }
     };
     const onSyncStart = () => { syncing = true; for (const entry of editors.values()) entry.handle?.pause(); };
@@ -147,6 +158,20 @@ export class ImageCompressorFeature extends BaseFeature {
       scope.own(() => ctx.plugin.eventBus.off(name, handler));
     }
     scope.own(() => { for (const entry of editors.values()) entry.handle?.dispose(); editors.clear(); });
+
+    try {
+      const active = (getActiveEditor() as any)?.protyle;
+      if (active) attach(active);
+    } catch {
+      // getActiveEditor may be absent in non-browser or test environments
+    }
+
+    const unsubscribe = ctx.settings.store<ImageFeatureConfig>(this.meta.id).subscribe(() => {
+      for (const entry of editors.values()) {
+        void entry.handle?.reconcile();
+      }
+    });
+    scope.own(unsubscribe);
   }
 
   private showAutoUploadNotice(ctx: FeatureContext, scope: FeatureScope, notice: AutoUploadNotice): void {
