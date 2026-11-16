@@ -26,11 +26,18 @@
   "icon": "icon.png",
   "keywords": [
     "toolkit",
-    "image",
-    "compression",
-    "webp",
-    "图片压缩",
     "工具箱",
+    "image compression",
+    "图片压缩",
+    "webp",
+    "图片优化",
+    "外链转存",
+    "titled link",
+    "链接标题",
+    "网页标题",
+    "自动标题",
+    "超链接",
+    "link title",
     "Svelte"
   ]
 }

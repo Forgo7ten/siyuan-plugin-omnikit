@@ -3,8 +3,7 @@
 
   # OmniKit
 
-  <p><b>A modular personal toolkit for SiYuan Note</b></p>
-  <p><i>思源笔记模块化个人工具箱插件</i></p>
+  <p>A modular toolkit plugin for SiYuan Note</p>
 
   <p>
     <a href="https://github.com/Forgo7ten/siyuan-plugin-omnikit/releases"><img src="https://img.shields.io/badge/Release-v0.1.0-blue.svg?style=flat-square" alt="Release" /></a>
@@ -12,48 +11,91 @@
   </p>
 
   <p>
-    <a href="#about">About</a> •
-    <a href="#installation">Installation</a> •
+    <b>English</b> • <a href="README.zh-CN.md">简体中文</a>
+  </p>
+
+  <p>
+    <a href="#overview">Overview</a> •
     <a href="#features">Features</a> •
+    <a href="#usage--settings">Usage & Settings</a> •
+    <a href="#safety-mechanisms">Safety</a> •
+    <a href="#installation">Installation</a> •
     <a href="#development">Development</a>
   </p>
 </div>
 
 ---
 
-# About
+# Overview
 
-**OmniKit** is a modular personal toolkit plugin for [SiYuan Note](https://b3log.org/siyuan/). Designed with a microkernel architecture, each feature operates independently and can be toggled on or off based on your everyday note-taking workflow. Click the OmniKit icon in the top bar and select "OmniKit Settings" to manage features in the unified settings panel.
-
----
-
-# Installation
-
-- **Marketplace Installation (Recommended)**: In SiYuan Note, open **Settings -> Marketplace -> Plugins**, search for `OmniKit`, click download and enable it.
-- **Manual Installation**: Go to the [Releases page](https://github.com/Forgo7ten/siyuan-plugin-omnikit/releases), download the latest `package.zip`, extract it into your SiYuan workspace plugin directory (`data/plugins/siyuan-plugin-omnikit/`), and restart SiYuan.
+**OmniKit** is a modular toolkit plugin for [SiYuan Note](https://b3log.org/siyuan/) providing automatic hyperlink titles, image compression, and remote image localization. Each module operates independently and can be toggled on or off in the settings panel.
 
 ---
 
 # Features
 
-Currently, OmniKit includes the following feature module:
+## 1. Titled Link
 
-## Image Compressor
+Asynchronously fetches webpage titles in the background and populates hyperlink anchor text when URLs are pasted in the editor.
 
-Helps reduce notebook asset sizes with safe, reversible WebP image compression:
+- **Automatic Title Fetching**: When an `http://` or `https://` link is pasted into the editor, the plugin fetches the webpage in the background, extracts the `<title>`, and fills in the link anchor text.
+- **Preserves Custom Text**: If the pasted content is a Markdown link with an existing title (e.g. `[title](url)`) or the link text has been manually edited, no modification is made.
+- **Static File Link Detection**: Links pointing to common non-web files (such as `.pdf`, `.zip`, `.exe`, etc.) extract and decode filenames directly from the URL without making network requests.
+- **Context Menu Actions**:
+  - Right-click an individual link and choose `[OmniKit] Fetch Page Title` to manually trigger re-fetching;
+  - Right-click a block icon and choose `[OmniKit] Fetch Link Titles in Current Block` to process all hyperlinks in the block.
+- **Undo Support**: Title insertion is performed through SiYuan's native editor transaction and can be undone with `Ctrl+Z`.
 
-- **Silent & Automatic Compression**: Automatically converts new pasted or dropped images into smaller WebP format in the background without interrupting your typing. Can be enabled globally or restricted to an allowlist of specific documents in settings.
-- **Single Image Actions & Fine-Tuning**: Right-click any image in the editor and choose `[OmniKit] Compress Image` for instant conversion, or `[OmniKit] Compress...` to open a preview dialog where you can adjust quality and compare original vs. compressed images with size savings badges.
-- **Document Batch Compression**: Right-click a document in the file tree or the editor title bar and choose `[OmniKit] Compress Images in Document` to process all eligible images in the current document in one go.
-- **Remote Image Localization**: Automatically detects and downloads external HTTP/HTTPS images into local notebook assets.
-- **Records & One-Click Restore (Dock)**: Click the OmniKit icon in the sidebar (Dock) to open the Image Records panel. Inspect mappings and status of all compressed images, jump and highlight source blocks, copy asset paths, or restore compressed references back to original images with one click (the plugin never deletes original files).
+## 2. Image Compressor & Localization
+
+Converts images into WebP format and downloads remote image URLs into local workspace assets.
+
+- **Automatic Compression for New Images**: Newly pasted or dropped images are compressed into WebP in the background. Can be configured to run globally or restricted to an allowlist of specific documents.
+- **Manual Single Image Compression & Preview**:
+  - Right-click an image in the editor and choose `[OmniKit] Compress Image` for immediate conversion;
+  - Choose `[OmniKit] Compress...` to open a preview dialog where compression quality can be adjusted while comparing visual quality and file sizes, with options to save as an asset only or replace the document reference.
+- **Document Batch Compression**: Right-click a document node in the file tree or on the document title bar and choose `[OmniKit] Compress Images in Document` to process all images in the document.
+- **Remote Image Localization**: Detects external HTTP/HTTPS images in documents and downloads them into the local `assets/` directory.
+- **Records Dock & Reference Revert**:
+  - Open the OmniKit Dock in the sidebar to view historical compression mappings and statuses;
+  - Jump to and highlight corresponding image blocks in the editor;
+  - Revert document references back to original images at any time.
+
+---
+
+# Usage & Settings
+
+1. Click the OmniKit icon in the SiYuan top bar and select **OmniKit Settings**;
+2. Toggle individual feature modules on or off;
+3. Available options:
+   - **Image Compressor**: smart compression toggle (MS-SSIM adaptive search), target similarity, fixed compression quality, maximum dimension limit, remote image localization, global mode, and document allowlists;
+   - **Titled Link**: sync to tooltip attribute (`data-title`), network timeout, and fallback display behavior on request failure.
+
+---
+
+# Safety Mechanisms
+
+- **Original Assets Preserved**: Converted WebP files are stored as new assets in `assets/`; the plugin does not physically delete original user files;
+- **Zero Workspace Clutter**: No temporary log files, queue caches, or `.tmp` dump files are written to the workspace;
+- **Pre-write Snapshot Verification**: Target blocks and nodes are verified before updating document references; conflicting concurrent edits abort safely without overwriting content.
+
+---
+
+# Installation
+
+- **Marketplace (Recommended)**: In SiYuan Note, open **Settings -> Marketplace -> Plugins**, search for `OmniKit`, download and enable.
+- **Manual Installation**: Download `package.zip` from the [Releases page](https://github.com/Forgo7ten/siyuan-plugin-omnikit/releases), extract into `data/plugins/siyuan-plugin-omnikit/` in your workspace, and restart SiYuan.
 
 ---
 
 # Development
 
-### Common Commands
+### Requirements
+- Node.js >= 24.0.0
+- pnpm >= 11.4.0
+- SiYuan Note >= 3.8.4
 
+### Commands
 ```bash
 # Install dependencies
 pnpm install

@@ -28,6 +28,9 @@
     "image-compressor",
     "image-compression",
     "webp",
+    "titled-link",
+    "link-title",
+    "url-title",
     "svelte",
     "svelte-5"
   ],
