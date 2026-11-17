@@ -482,8 +482,8 @@ Core 平台在思源主工作区状态栏区域提供通用的轻量任务进度
 
 | Feature ID | 中文名称 | 支持端 (Frontends) | 业务规范文档 | 默认状态 | 说明 |
 |---|---|---|---|---|---|
-| `image-compressor` | 图片压缩 | 全端通用 (`all`) | [features/image-compressor.md](features/image-compressor.md) | 关闭 (`false`) | 针对思源新插入图片与文档已有图片的无损/高质 WebP 压缩，含统一 Dock 记录与引用回溯 |
-| `titled-link` | 自动标题链接 | 全端通用 (`all`) | [features/titled-link.md](features/titled-link.md) | 开启 (`true`) | 针对思源行内超链接异步获取并填充网页标题，支持非网页文件免抓取、单链右键菜单与块级批量提取，具备双轨网络、流式截断、万国码嗅探与并发冲突保护 |
+| `image-compressor` | 图片压缩 | 全端通用 (`all`) | [PRD](features/image-compressor/PRD.md) · [DESIGN](features/image-compressor/DESIGN.md) | 关闭 (`false`) | 针对思源新插入图片与文档已有图片的无损/高质 WebP 压缩，含统一 Dock 记录与引用回溯 |
+| `titled-link` | 自动标题链接 | 全端通用 (`all`) | [PRD](features/titled-link/PRD.md) · [DESIGN](features/titled-link/DESIGN.md) | 开启 (`true`) | 针对思源行内超链接异步获取并填充网页标题，支持非网页文件免抓取、单链右键菜单与块级批量提取，具备双轨网络、流式截断、万国码嗅探与并发冲突保护 |
 
 *(后续新增 Feature 需在完成需求规范编写与冻结后，补充更新至本索引表)*
 

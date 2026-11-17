@@ -2,7 +2,7 @@
 
 > **版本**：v1.0（正式发布稿）  
 > **状态**：正式发布（Approved）  
-> **设计基准**：严格遵循 [AGENTS.md](../AGENTS.md)、[CORE-PRD.md](CORE-PRD.md)、[image-compressor.md](features/image-compressor.md) 及 [titled-link.md](features/titled-link.md)  
+> **设计基准**：严格遵循 [AGENTS.md](../AGENTS.md)、[CORE-PRD.md](CORE-PRD.md)、[image-compressor](features/image-compressor/PRD.md) 及 [titled-link](features/titled-link/PRD.md)（各特性严格维护独立的 `PRD.md` 与 `DESIGN.md`）  
 > **源码基线**：`Forgo7ten/siyuan-plugin-omnikit` (`feat-image-compressor`)
 
 ---
@@ -679,7 +679,7 @@ sequenceDiagram
 当团队或 Agent 需要向 OmniKit 增加新的业务特性时，必须严格执行以下开发步骤与契约清单：
 
 ### 6.1 开发步骤指南
-1. **需求规范先行**：在 `docs/features/<feature-name>.md` 编写完整的业务需求与约束规范，获得评审冻结；
+1. **需求与技术实现严格解耦先行**：在 `docs/features/<feature-name>/` 目录下分别建立 `PRD.md`（纯产品需求文档：功能描述、用户交互、业务规则与验收用例，遇到 BUG 或代码重构时不随意改动产品规范）与 `DESIGN.md`（技术实现设计文档：架构分层、模块协作、算法数据流与底层 API 契约，遇到 BUG 或代码实现调整时独立更新技术设计），完成评审与 Spec-Freeze；
 2. **建立特性目录**：在 `src/features/<feature-name>/` 下创建特性包，包括：
    - `settings.ts`：定义配置 TypeScript 类型与默认值；
    - `registration.ts`：定义 `FeatureRegistration<T>` 元数据，声明支持端列表 `frontends`（可选，5+1 取值集合，省略或空数组时默认为全端支持），指定配置文件为 `feature-{id}-settings.json`；
