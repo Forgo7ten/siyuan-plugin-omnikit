@@ -293,16 +293,14 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 ### 4.2 底层存储引擎 `JsonStore<T>`
 
 所有 JSON 文件统一通过 `JsonStore<T>` 进行读写，提供以下可靠性与容灾机制：
-1. **每文件独占异步队列**：单个文件的写入严格串行化（Promise Queue），相同内容（Fingerprint 比对）直接跳过写盘。
-2. **安全确定性读取与容灾契约 (`readPluginJSON`)**：
+1. **精简存储模型与单文件独占串行队列**：基于单文件 Promise 串行队列（Promise Queue）调度所有写操作，配合思源原生 `Plugin.loadData` / `saveData` 实现持久化，杜绝写竞争；
+2. **内容指纹防抖**：内存维护序列化内容指纹（Fingerprint），相同数据重复保存自动跳过实际磁盘 I/O；
+3. **安全确定性读取与容灾契约 (`readPluginJSON`)**：
    - 读取操作规范使用思源内核 `/api/file/getFile` REST API，精确区分文件缺失与系统故障；
    - **缺失与正常初始化**：当内核响应 HTTP 202 且思源返回体 `code === 404` 时，确认为新安装或文件不存在，安全返回 `codec.defaults()` 并允许后续正常初始化写入；
    - **错误设防与安全只读保护**：当读取遭遇网络错误、请求超时（超时时限设为 30 秒）或思源返回其他业务错误码（如 HTTP 202 且 `code` 为 500、503、403 等）时，系统判定为读取失败，立即将当前 Store 锁定为安全只读状态（`readOnlyReason`），保留上一次内存有效数据，严格禁止使用默认值或空对象静默覆盖用户的现有持久化文件；
    - **损坏保护与非空备份隔离**：当文件内容存在 JSON 语法损坏且确认已成功读取到非空物理字节时，系统不使用默认值静默覆盖，而是将损坏文件重命名备份为 `.backup` 容灾文件，并在设置界面展示明确的故障提示以供用户确认修复；未读取到有效物理字节的系统错误严禁创建假备份或触发覆盖；
    - **状态变动驱动重载**：`reload()` 方法在内容指纹变动或只读保护状态变动时均返回 `true`，确保外部状态协调准确响应。
-3. **30 秒超时保护与确定性状态机**：
-   - 调用宿主 `Plugin.saveData` 时启动 30 秒超时定时器；
-   - 若超时未响应，将内部状态标记为 `writeUncertain = true`，后续写入立即拦截并抛出错误，避免在未确定状态下继续写盘。
 
 ### 4.3 重置边界与“数据管理”专区
 
@@ -378,6 +376,10 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 
 ### 5.3 统一菜单系统 (Unified Menu System)
 
+- **通用上下文转换与业务解耦架构 (MenuRouter & Matcher Contract)**：
+  - `MenuRouter` 作为通用宿主事件到上下文转换层，统一监听思源 EventBus 菜单事件（如 `click-blockicon`、`open-menu-doctree`、`open-menu-link` 等）；
+  - **通用上下文提取**：`MenuRouter` 仅负责从原生 detail 中提取标准通用上下文（例如 `selectedDocumentIDs: string[]`、`selectedDocumentCount: number`、`protyle?: IProtyle`、`targetElement?: HTMLElement` 等），平台核心代码中严禁包含任何特定业务的条件分支（例如针对图片的直接判断、针对 2 篇文档的硬编码业务判定等）；
+  - **Feature 自主注册 Matcher**：具体的业务匹配规则与菜单项由各 Feature 在自身模块内自主注册的 Matcher 函数判定。Matcher 接收标准通用上下文，自主决定是否激活菜单项、动态计算菜单标题与绑定点击动作；
 - **前缀分流权威收口规范 (Context-Aware Prefix via MenuRegistry)**：
   - 由 `MenuRegistry` 作为菜单项注册与派发的唯一权威分流收口，**严禁 Feature 层在菜单标题中硬编码 `[OmniKit]` 前缀**；
   - **顶栏自有菜单 (`location === "topbar"`)**：**彻底移除 `[OmniKit]` 前缀**（例如呈现为 `压缩当前文档图片`、`开启当前文档图片自动压缩`），与顶栏环境深度融合，保持清爽克制；
@@ -475,6 +477,13 @@ Core 平台在思源主工作区状态栏区域提供通用的轻量任务进度
 - 统一日志输出格式：`[OmniKit][{level}][{tag}] {message}`；
 - 与 `omnikit-core.json` 中的 `general.debugLog` 开关深度绑定；
 - 调试日志（Debug/Trace）在开关关闭时保持静默，生产环境下默认仅输出 Warn 与 Error 级别日志。
+
+### 6.4 `ProtyleAdapter` 宿主通用数据提取器
+
+为抹平思源不同事件与触发源的数据结构差异，Core 提供标准化的 `ProtyleAdapter`：
+- **标准属性直接提取**：直接从思源标准事件对象提取核心上下文（如 `detail.protyle.block.rootID` 与 `detail.protyle.element`）；
+- **确定性数据流**：依赖思源原生稳定的数据结构，不设立多层冗余的兜底空值回退链，保障宿主适配层的精简、高效与确定性；
+- **只读辅助**：适配器仅执行结构化属性解构与类型守卫，不产生任何副作用。
 
 ---
 

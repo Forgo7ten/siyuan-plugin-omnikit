@@ -21,7 +21,7 @@ OmniKit 是基于现代前端与思源笔记插件生态构建的高效、高可
 ### 1.2 核心设计哲学
 1. **微内核与单向依赖**：Core 平台层不感知具体 Feature 的内部实现，所有功能通过元数据驱动注入；
 2. **多实例与环境防护**：针对思源独立设置窗口（`body--settings`）进行无副作用纯渲染隔离；
-3. **确定性存储体系**：单文件 Promise 排队、30秒超时拦截、损坏备份恢复与配置/数据物理隔离；
+3. **确定性存储体系**：单文件 Promise 串行队列、内存缓存指纹跳写、思源原生 loadData/saveData 与配置/数据物理隔离；
 4. **防御性块级改写**：写前基于 `OccurrenceTarget` 进行精确节点读回核验、采用进程内写租约（Write Lease）与持久化前置闸门；
 5. **可重现与确定性工程体系**：统一工程脚本体系、全自动化质量门禁与多入口幂等发版闭环。
 
@@ -47,8 +47,9 @@ flowchart TD
         
         subgraph CoreInfra["基础设施与驱动"]
             KernelClient["KernelClient (安全 API 调用门面)"]
+            ProtyleAdapter["ProtyleAdapter (宿主数据标准提取器)"]
             SettingsMgr["SettingsManager (多文件配置协调器)"]
-            JsonStore["JsonStore (并发队列/超时/容灾)"]
+            JsonStore["JsonStore (单文件串行队列/指纹跳写/容灾)"]
             Logger["Logger (动态等级日志)"]
             Platform["Platform (环境探测 & IsTargetSupported 判定)"]
         end
@@ -56,7 +57,7 @@ flowchart TD
         subgraph CoreUI["统一宿主 UI 容器"]
             UnifiedDock["UnifiedDock (单槽位 Tab 容器)"]
             SettingsShell["SettingsRoot.svelte (iPad 双栏联动面板)"]
-            MenuRouter["MenuRouter & MenuRegistry ([OmniKit] 前缀路由)"]
+            MenuRouter["MenuRouter & MenuRegistry (通用上下文转换与 Matcher 路由)"]
             FeedbackService["UiFeedback (统一交互/前缀/防抖/静默)"]
             StatusBar["PluginStatusBar (单例底栏状态栏)"]
         end
@@ -204,10 +205,9 @@ stateDiagram-v2
 ### 3.4 `SettingsManager` 与 `JsonStore` (确定性存储体系)
 - **文件位置**：`src/core/store/SettingsManager.ts`、`src/core/store/JsonStore.ts`
 - **核心机制**：
-  - **每文件独占 Promise 队列**：每个 JSON 文件的保存操作串行化执行，防止写竞争；
+  - **精简存储模型与每文件独占 Promise 队列**：基于单文件 Promise 串行队列调度所有写操作，配合思源原生 `Plugin.loadData` / `saveData` 实现持久化，杜绝写竞争；
+  - **内容指纹防抖**：内存维护序列化指纹（`fingerprint`），相同数据重复保存自动跳过实际磁盘 I/O；
   - **安全读取与状态契约**：调用思源内核 `/api/file/getFile`（或安全处理 `/api/file/loadData`）读取配置文件。明确状态契约：HTTP 状态码为 202 且思源 code 为 404 时确认为文件不存在，返回 `defaults()` 并安全初始化；若返回网络错误、服务不可用（如 code 500、503、403）、请求超时（30 秒超时时限）或读写锁异常，必须抛出错误并挂起写队列或进入只读保护模式（`readOnly: true`），严禁静默使用空对象或默认值覆盖用户的现有持久化文件；
-  - **内容指纹防抖**：内存维护序列化指纹（`fingerprint`），相同数据重复保存自动跳过实际 I/O；
-  - **30 秒写保护超时**：调用思源 `saveData` 时启动 30 秒超时保护。若超时未收到成功确认，标记 `writeUncertain = true` 并阻断后续写入，避免在状态未明确时破坏数据；
   - **异常损坏隔离**：解析非空 JSON 失败时不使用默认值覆盖。将损坏文件隔离备份为 `.backup` 并提示用户显式确认修复。
 
 ### 3.5 `KernelClient` (安全内核 API 封装)
@@ -241,7 +241,10 @@ stateDiagram-v2
     - **状态 Badge 与平台说明**：卡片顶部 Badge 渲染 `runtime.unsupported`（「当前平台暂不支持」），并展示友好的支持平台列表说明（如“仅支持：桌面端、桌面窗口”）；
     - **专属设置项允许预调**：卡片主体内的专属设置组件（`settingsView`）保持挂载并允许交互调整，满足跨端云同步场景下提前配置参数的诉求；修改保存仅局限于其专属配置文件 `feature-{id}-settings.json`，绝对不触碰 `omnikit-core.json`；
 - **统一菜单路由器 (`MenuRouter` / `MenuRegistry`)** (`src/core/feedback/MenuRouter.ts` / `src/core/feedback/MenuRegistry.ts`)：
-  - 集中拦截思源上下文菜单事件（`event-bus`）；
+  - **通用上下文转换与业务解耦架构**：
+    - `MenuRouter` 作为通用的宿主事件到上下文转换层，集中监听思源 EventBus 上下文菜单事件（`click-blockicon`、`open-menu-doctree`、`open-menu-link` 等）；
+    - **通用上下文提取**：`MenuRouter` 仅负责从原生 detail 中提取标准通用上下文（例如 `selectedDocumentIDs: string[]`、`selectedDocumentCount: number`、`protyle?: IProtyle`、`targetElement?: HTMLElement` 等），Core 平台层彻底移除硬编码的业务分支（如针对图片的直接判断、针对 2 篇文档的硬编码业务判定等）；
+    - **Feature 自主注册 Matcher**：具体的业务匹配规则与菜单项由各 Feature 在自身模块内自主注册的 Matcher 判定。Matcher 接收标准通用上下文，自主决定是否激活菜单项、动态生成文案与绑定点击动作；
   - 严格校验菜单所属 Feature 的运行态（`phase === "enabled"`）；
   - **平台兼容性排除**：处于 `unsupported` 状态的功能未被激活且无 `FeatureScope`，不向 `MenuRegistry` 注入任何菜单动作项；`isFeatureRunning` 核验天然拦截，外部宿主上下文菜单与顶栏快捷菜单自动跳过渲染，无冗余开销；
   - **顶栏菜单与分隔线规范**：
@@ -272,6 +275,13 @@ stateDiagram-v2
   - **通用样式规范**：容器类名固定为通用的 `.omnikit-status-bar`，严禁硬编码 feature 名称；单行布局（`max-width: 260px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px;`）；
   - **多任务字典调度**：内部维护 `tasks: Map<string, string>`，支持 `update(taskID, text)` 与 `clear(taskID)`；无活跃任务时自动添加 `.fn__none` 完全隐藏；
   - **跨端兼容短路**：在移动端原生 App（`addStatusBar` 返回 `undefined`）与独立设置窗口中自动短路（`mounted = false`），不进行无意义的 DOM 操作。
+
+### 3.9 `ProtyleAdapter` (宿主数据标准提取器)
+- **文件位置**：`src/core/host/ProtyleAdapter.ts`
+- **主要职责**：
+  - 统一抹平思源不同事件触发源的数据结构差异，提供确定性的 Protyle 上下文提取；
+  - **标准属性直接提取**：直接从原生事件上下文提取 `detail.protyle.block.rootID` 与 `detail.protyle.element` 等标准对象，杜绝多层冗余的兜底空值回退链，保障适配层的高效与简洁；
+  - **无副作用与只读守卫**：纯函数式上下文提取与类型守卫，不产生任何 DOM 侵入或状态副作用。
 
 ---
 
@@ -371,9 +381,8 @@ sequenceDiagram
     
     alt 核验一致 (无并发编辑冲突)
         SafeWriter->>Host: POST /api/block/updateBlock (更新指定单处图片节点引用)
-        Host-->>SafeWriter: 内核写入成功
-        SafeWriter->>Host: POST /api/block/getBlockDOM (二次读回复核)
-        Host-->>SafeWriter: 复核确认
+        Host-->>SafeWriter: 内核返回 code: 0 (落盘确认)
+        SafeWriter->>SafeWriter: 信任内核写入确认，完成改写
     else 发生冲突 (图片已被用户删除或修改)
         SafeWriter-->>Handler: 安全放弃写回 (Conflict Skipped)
     end
@@ -435,17 +444,17 @@ sequenceDiagram
 | `ImageCompressorFeature.ts` | `ImageCompressorFeature` | Feature 入口；注册菜单、事件监听；提取 Protyle 与 blockID 上下文后直接委托 `ImageController`；所有监听句柄由 `FeatureScope` 集中托管与注销 |
 | `ImageController.ts` | `ImageController` | 业务编排唯一门面；负责全局开关与白名单准入校验；调度 Action 与 `ImageTaskPanel` 进度模态框；接入 Core `UiFeedback` 发送统一通知，接入 Core `PluginStatusBar` 维护底栏轻量任务文本；统筹当前文件进度与正常中止静默；针对空任务批次与扫描无符合项提供明确提示 |
 | `ImageCandidateClassifier.ts` | `classifyImageCandidate` | 纯路径与扩展名前置准入分类器；统一过滤常见视频扩展名、动态图（GIF/APNG）、矢量图（SVG）与 Excalidraw 及绘图专用目录（精确限定为 `drawings/` 与 `drawing/` 目录路径，保护 `drawing-xxx.png` 等普通文件名）；在扫描、上传前置、外链与读取前统一设防 |
-| `AutoUploadHandler.ts` | `AutoUploadHandler` | 监听 Protyle 编辑器上传事件；**上传前纯同步授权与候选预筛选**：在 `before-upload-assets` 中纯同步判断授权和候选图片预筛选，未授权或无图片时不创建 MutationObserver，零开销退出；授权且存在候选图片时挂载观察器并同步注册 `onComplete`；仅返回纯数据结构 `AutoUploadNotice` |
+| `AutoUploadHandler.ts` | `AutoUploadHandler` | 监听 Protyle 编辑器上传事件；**上传前纯同步授权与候选预筛选**：在 `before-upload-assets` 中纯同步判断授权和候选图片预筛选，未授权或无图片时不创建 MutationObserver，零开销退出；授权且存在候选图片时挂载观察器并同步注册 `onComplete`；捕获上传完成事件后等待块落盘锁定图片位置，无退避轮询与死锁状态；仅返回纯数据结构 `AutoUploadNotice` |
 | `RemoteImageWatcher.ts` | `RemoteImageWatcher` | 监听新插入 HTTP/HTTPS 外链图片；**未授权低开销设防**：在入口及 `sweep()` 扫描入口设防，未授权文档中严禁向内核发起 `blockDOM` 网络请求与全量 DOM 解析；支持黑白名单配置热重载（通过 Store 订阅同步更新），联动 `getActiveEditor()` 获取当前激活 Protyle 实例；在 Protyle 销毁（`destroy-protyle`）时注销观察器与定时器；授权文档中外链资源桌面端走 `/api/network/forwardProxy` 转发代理挂载全局 User-Agent，移动端/Web 端遵循端侧安全策略 |
 | `ImageOccurrenceResolver.ts` | `ImageOccurrenceResolver` | 在 DOM 树中建立 `OccurrenceTarget` 精确定位（`rootID` + `notebook` + `blockID` + `imageOrdinal` + `oldPath`） |
 | `src/features/image-compressor/similarity/` | 智能压缩独立子模块 | 划分独立的相似度算法域：包含 `SimilarityEvaluator`、`computeMSSSIM`、`adaptiveQualitySearch`、`SimilarityWorkerSession` 与内联 Worker；负责多尺度相似度评估与质量搜索 |
 | `image.ts` / `BicEncoder.ts` | `BicEncoder` | 封装基于 WebP 编码器的物理生成引擎；严格执行保尺寸校验、EXIF 探测、整数网格对齐与输出字节完整性核验 |
 | `ImageProcessingServices.ts` | `ImageProcessingServices` | 聚合读取、本地化、编码、上传与写回步骤的编排服务层；统一执行分类器与持久化前置闸门；以思源内核 `/api/asset/upload` 响应（`succFiles[0].index === 0` 且 `failedFiles.length === 0`）为落盘确认依据 |
 | `ImageCompressionRecordStore.ts` | `ImageCompressionRecordStore` | 专职管理 `feature-image-compressor-records.json` 磁盘持久化，实现持久化前置闸门 |
-| `SafeBlockWriter.ts` | `SafeBlockWriter` | 进程内单写租约控制器（`withBlockWriteLease`），写前读回节点核验，调用 `/api/block/updateBlock`；中止时显式抛出 `AbortError` 或返回专用取消结果（如 `"aborted"`），严禁混淆为 `conflict` |
+| `SafeBlockWriter.ts` | `SafeBlockWriter` | 进程内单写租约控制器（`withBlockWriteLease`），写前读回节点核验，调用 `/api/block/updateBlock` 并直接信任内核成功响应（`code === 0`），无需后置读回复核；中止时显式抛出 `AbortError` 或返回专用取消结果（如 `"aborted"`），严禁混淆为 `conflict` |
 | `ImageRecordsDock.svelte` | Svelte 5 组件 | 嵌入 Core 统一 Dock 的 Tab 视图，提供顶部 Hero 品牌卡片区（52px~56px，避开右上角 32px 浮动 Snackbar）、记录浏览、初始 present 状态与挂载自动异步核验、状态 Badge 纯主题 CSS 变量渲染（严禁硬编码 Hex，保证深浅模式对比度）、对称双向引用管理（查找原图引用/恢复原图引用，直接执行无需二次弹窗；严格区分主动查找与操作静默刷新；防覆盖铁律；全部处理完毕后自动收起展开区并保留成功统计）、记录持久化纯手动管理与零自动淘汰（`statAsset` 失败仅在 UI 标记为 `unknown` 状态，绝对严禁自动调用 `removeRecord`）、持有组件专属 `AbortController` 并在卸载时取消在途检索与核验、`findAssetReferences` 遇到加密或未索引笔记本返回 `skippedNotebooks` 时展示不完整提示 |
 | `SingleImageAction.ts` | `SingleImageAction` | 纯领域单图处理，涵盖图片右键“压缩此图片”（直接执行）与“压缩…”（预览对话框）业务动作，作用域严格限定为仅替换当前选中的单处引用（最小副作用原则）；对话框生命周期内持有原图 Blob 缓存，重新调整参数时不重复向内核发起下载；在 `replace: false` 预览模式下仅生成 WebP 资产并写入业务记录供用户复制，严格执行零文档写回（`updateBlock` 调用次数为 0）；不调用 `showMessage`，统一向 Controller 返回纯数据结构 `ImageActionOutcome` |
-| `DocumentBatchAction.ts` | `DocumentBatchAction` | 纯领域文档批量处理；通过 `activeDocuments: Set<string>` 维护当前正在处理的文档集合防止并发重复拉起；扫描当前文档合格图片采用 `/api/block/getBlockDOMs`（每批 64 个块）批量读取降低网络往返；同源图片合并编码；执行桌面端 2 / 移动端 1 有界并发准备；字节数统计直接复用 `OccurrenceCompressionResult`，不重复读取磁盘；进度明确划分 `preparing`（包含 `uploaded` 统计）与 `applying`（`completed / total`）；逐位置独立执行 OccurrenceTarget 节点核验与改写；向 Controller 返回纯数据结构 `CompressionBatchSummary` |
+| `DocumentBatchAction.ts` | `DocumentBatchAction` | 纯领域文档批量处理；通过 `activeDocuments: Set<string>` 维护当前正在处理的文档集合防止并发重复拉起；**只读 SQL 批量查询加速**：扫描当前文档图片块采用思源只读 SQL（`/api/query/sql`，如 `SELECT id, markdown FROM blocks WHERE root_id = ? AND markdown LIKE '%assets/%'`）在 1 次请求中批量获取所有图片块；同源图片合并编码；执行桌面端 2 / 移动端 1 有界并发准备；字节数统计直接复用 `OccurrenceCompressionResult`，不重复读取磁盘；进度明确划分 `preparing`（包含 `uploaded` 统计）与 `applying`（`completed / total`）；逐位置独立执行 OccurrenceTarget 节点核验与改写；向 Controller 返回纯数据结构 `CompressionBatchSummary` |
 | `ImageSettingsPanel.svelte` | Svelte 5 组件 | 设置卡片组件，调用思源内核原生 `/api/filetree/getFullHPathByID` 解析并展示包含笔记本全名的白名单完整层级路径；支持智能压缩总开关与目标相似度配置 |
 
 #### 3. 智能压缩质量计算模块解耦与性能契约
@@ -504,13 +513,10 @@ sequenceDiagram
    - 移动端自动短路不操作状态栏；
    - 当任务正常完成、被用户中止（按 Esc / 切换标签页）或所属 Feature 停用时，Controller 统筹销毁模态框并彻底清除状态栏任务，不残留失效进度。
 4. **文档批量扫描与并发去重契约 (Batch Query & Concurrency Deduplication)**：
-   - 文档内图片扫描采用思源原生批量查询接口 `/api/block/getBlockDOMs`（按每批 64 个块分批请求），避免为每个块单独发起网络往返；
+   - **只读 SQL 批量查询加速**：文档内图片扫描采用思源只读 SQL（`/api/query/sql`，如 `SELECT id, markdown FROM blocks WHERE root_id = ? AND markdown LIKE '%assets/%'`）在 1 次请求中批量获取所有图片块，避免逐块发起网络往返；
    - 批处理控制器维护 `activeDocuments: Set<string>` 注册集合，防止针对同一文档重复并发拉起批处理任务；
    - 任务进度状态机明确区分两个执行阶段：准备与上传阶段（`phase: "preparing"`，展示 `uploaded` 进度）与节点替换阶段（`phase: "applying"`，展示 `completed / total` 进度）；
    - 扫描无符合项或全部跳过时，联动销毁模态框并由 Controller 向用户派发中性客观提示。
-   - 同时，Controller 联动调用 Core `PluginStatusBar`，在支持的桌面客户端主窗口呈现单行轻量文本（如 `图片压缩 5/18 · photo.png`）；
-   - 移动端自动短路不操作状态栏；
-   - 当任务正常完成、被用户中止（按 Esc / 切换标签页）或所属 Feature 停用时，Controller 统筹销毁模态框并彻底清除状态栏任务，不残留失效进度。
 
 ### 5.3 核心技术安全机制
 
@@ -549,7 +555,7 @@ export function withBlockWriteLease<T>(key: string, operation: () => Promise<T>)
      1. 块归属未变（`blockID` 归属于目标 `rootID`）；
      2. 块内第 `imageOrdinal` 个图片节点依然存在；
      3. 该图片节点的当前资源引用路径仍精确等于 `target.oldPath`；
-4. 若核验通过，仅改写该目标图片节点的引用属性并提交 `/api/block/updateBlock`；
+4. 若核验通过，仅改写该目标图片节点的引用属性并提交 `/api/block/updateBlock`；根据思源 Go 内核契约，内核返回 `code: 0` 即意味着事务落盘并广播了 WebSocket，直接信任返回值，无后置读回复核；
 5. 若后台处理期间目标图片被删除、替换或序号改变，任一要素核验失败时系统安全放弃本次单处写回操作；提示文案客观反馈：`[OmniKit] 目标图片已被修改或移动，已放弃替换当前引用，WebP 已保存至记录`。
 
 #### 3. 单图右键压缩最小副作用与零写回预览原则
@@ -674,11 +680,131 @@ sequenceDiagram
 
 ---
 
-## 6. 新 Feature 扩展开发指南
+## 6. 自动标题链接功能技术实现设计
+
+### 6.1 异步处理与原生受控事务写回全流程时序
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as 用户
+    participant Protyle as 活动 Protyle 编辑器
+    participant Feature as TitledLinkFeature
+    participant Controller as TitledLinkController
+    participant Parser as stream-parser & dual-track
+    participant SafeWriter as SafeTransactionWriter
+    participant Host as 思源内核 (Kernel)
+
+    rect rgb(240, 248, 255)
+    Note over User,Feature: 步骤一：事件触发与前置准入判定
+    alt 独立粘贴 URL (满足单 URL/无选区/空白修整)
+        User->>Protyle: 粘贴纯 URL (原生粘贴毫秒级插入链接)
+        Protyle->>Feature: 捕获输入/粘贴事件
+        Feature->>Controller: 委托判定 (延迟 100~300ms 检查节点)
+    else 右键菜单触发 (单链或块级批量)
+        User->>Feature: 触发上下文菜单动作
+        Feature->>Controller: 提取链接与块上下文并派发
+    end
+    end
+
+    rect rgb(255, 250, 240)
+    Note over Controller,Parser: 步骤二：文件免抓取判定与双轨流式解析
+    alt 命中非网页扩展名 (.zip/.pdf/.exe/.mp4/图片等)
+        Controller->>Controller: 直接提取并解码路径末尾文件名作为标题 (零网络)
+    else 网页超链接
+        Controller->>Parser: 发起双轨网络请求 (携带 Core 统一 UA)
+        alt 桌面端 (desktop)
+            Parser->>Host: 原生 fetch 流式分块读取 (Chunk Stream)
+            Parser->>Parser: 嗅探编码并检测 </head> 或 </title> 闭合标签
+            Parser->>Parser: 触发 64KB 熔断或闭合截断，主动取消底层网络流 (节省 95% 流量)
+        else 移动端 (mobile)
+            Parser->>Host: POST /api/network/forwardProxy (代理转发)
+            Host-->>Parser: 返回 Base64 数据
+            Parser->>Parser: 截取前 64KB 二进制流送入解码与万国码嗅探
+        end
+        Parser->>Controller: 返回净化与截断后的标准标题
+    end
+    end
+
+    rect rgb(240, 255, 240)
+    Note over Controller,SafeWriter: 步骤三：内存真理核验与原生受控事务提交
+    Controller->>SafeWriter: 提交标题写回请求
+    alt 当前为活动 Protyle 编辑器 (Live State 优先)
+        SafeWriter->>SafeWriter: 写前核验: 目标 linkElement 存在且锚文本未被用户手动修改
+        SafeWriter->>Protyle: 内存 DOM 更新 linkElement.textContent
+        SafeWriter->>Protyle: 调用 protyle.updateTransactionElement(blockElement, oldHTML)
+        Note over Protyle: 原生受控事务: 100% 支持 Ctrl+Z 撤销/重做并自动落盘
+    else 非活动编辑器或后台更新
+        SafeWriter->>Host: POST /api/block/updateBlock (dataType: "dom")
+        Host-->>SafeWriter: 内核返回 code: 0 (落盘确认)
+        SafeWriter->>SafeWriter: 信任内核写入确认，完成改写
+    end
+    end
+```
+
+### 6.2 模块职责与大网页流式保护
+
+| 模块文件 | 核心职责 | 技术契约与边界 |
+|---|---|---|
+| `TitledLinkFeature.ts` | Feature 入口 | 集中注册上下文菜单（单链/块级批量）与粘贴监听；提取 Protyle 与选区上下文并委托 Controller；由 `FeatureScope` 集中托管与注销 |
+| `TitledLinkController.ts` | 业务编排门面 | 负责前置准入校验、剪贴板修整、延迟防抖、非网页文件免抓取、受控并发调度与用户交互反馈收口 |
+| `dual-track-fetcher.ts` | 双轨网络驱动 | 桌面端原生 `fetch` 直连分块读取；移动端通过思源内核 `/api/network/forwardProxy` 代理转发；复用 Core 平台 `general.userAgent` |
+| `stream-parser.ts` | 流式解析与保护 | 32KB~64KB 流式分块读取、64KB 硬熔断、`</head>` / `</title>` 截断；GBK/Big5/Shift-JIS/UTF-8 字符集嗅探与解码；`window.Lute.UnEscapeHTMLStr` 实体还原；标题归一化与截断 |
+| `safe-writer.ts` | 原生受控事务写回 | 内存 DOM 优先核验；活动 Protyle 调用 `updateTransactionElement`；非活动更新调用 `/api/block/updateBlock` 并信任 `code: 0`；块级批量同块聚合写回 |
+| `title-cache.ts` | 短期内存缓存 | 100 条 / 5 分钟 TTL 内存 LRU 结构；Generation Ticket 代际保护；零磁盘持久化 |
+
+#### 1. 大网页截断与流式保护机制 (`stream-parser.ts` & `dual-track-fetcher.ts`)
+为防范恶意或超大网页（如数十兆的大型 HTML、包含超长内联 Base64 图片或未压缩正文）耗尽主线程内存与带宽，系统实施两级流式截断防护：
+1. **桌面端流式分块截断与网络流掐断**：
+   - 桌面端直接发起 `window.fetch` 流式请求，以 Chunk Stream 模式仅读取前置 32KB~64KB 数据；
+   - 在流式分块读取过程中，正则检测到 `</head>` 或 `</title>` 闭合标签时，立即调用 `ReadableStreamDefaultReader.cancel()` 主动掐断底层 TCP 连接；
+   - 该机制使网络连接平均仅读取前数十 KB 即可完成网页标题解析，节省 95% 以上的网络带宽，杜绝大网页在主线程触发高内存占用；
+2. **移动端 64KB 二进制硬熔断截取**：
+   - 移动端通过思源内核 `/api/network/forwardProxy` 获取网络响应 Base64 字节流；
+   - 前端接收后严格仅截取前 64KB 二进制流送入解码与解析器，丢弃后续全部正文数据，杜绝移动设备低内存环境下的崩溃风险；
+3. **万国码自动嗅探与解码**：
+   - 优先依据响应头 `Content-Type: charset=...` 识别编码；
+   - 未声明响应头时在前置 Chunk 中嗅探 `<meta charset="...">` 或 `<meta http-equiv="Content-Type" content="...; charset=...">`；
+   - 支持 GBK、GB2312、Big5、Shift-JIS、EUC-JP、UTF-8 等常见编码，调用浏览器原生 `TextDecoder(encoding)` 规范化转码，解决中文网站乱码问题；
+   - 解码后调用思源官方内置 `window.Lute.UnEscapeHTMLStr` 接口还原 HTML 实体与 Unicode 实体。
+
+### 6.3 内存 DOM 实时真理与原生受控事务写回
+
+在思源 Protyle 编辑器中，编辑操作以内存 DOM 为核心。系统针对活动编辑器与后台更新确立明确的写回策略：
+1. **活动编辑器：内存 DOM 优先与受控事务**：
+   - 当目标链接处于当前激活打开的 Protyle 编辑器内时，内存 DOM 呈现用户的实时输入状态；
+   - **写前核验**：检查目标 `linkElement` 是否依然存在于当前 DOM 树中，且其内部文本是否未被用户手动修改；
+   - **局部 DOM 更新**：核验通过后，直接在内存 DOM 中更新 `linkElement.textContent`（开启 `replaceTitle` 时同步更新 `data-title` 属性），严禁改写 `data-href`；
+   - **提交受控事务**：调用思源官方编辑器事务接口：
+     ```typescript
+     protyle.updateTransactionElement(target.blockElement, oldBlockOuterHTML);
+     ```
+   - **原生撤销与历史版本**：该事务调用使思源编辑器将本次标题修改纳入原生撤销栈，100% 支持用户使用 `Ctrl+Z` 撤销与 `Ctrl+Y` 重做，并由思源编辑器自动同步触发块落盘与 Doc History 记录；
+2. **非活动编辑器或后台更新**：
+   - 当目标块不在当前激活的 Protyle 编辑器中时，系统调用思源内核 REST API `/api/block/updateBlock`（`dataType: "dom"`）；
+   - 根据思源 Go 内核契约，内核返回 `code: 0` 即意味着落盘并广播了 WebSocket 事务，系统直接信任该返回值完成写回；
+3. **块级批量同块聚合写回**：
+   - 在块级批量提取模式下，同块内所有链接拉取完成后，在单次 `updateTransactionElement` 事务中将该块内所有已完成的链接一并提交；
+   - 消除同块内多次提交引发的撤销历史碎片，用户仅需按一次 `Ctrl+Z` 即可一次性恢复当前块内所有被提取链接的原始状态。
+
+### 6.4 短期内存 LRU 缓存与任务代际保护
+
+1. **短期内存 LRU 结构**：
+   - 采用纯内存短期 LRU 缓存，最大容量 100 条，TTL 存活时限为 5 分钟；
+   - 自动模式下优先查询缓存，命中且未过期时直接复用，避免在同一文档内重复粘贴相同链接时消耗网络带宽；
+   - 手动单链提取模式强制绕过缓存发起真实网络请求，满足用户强制刷新标题的诉求；
+2. **任务代际保护 (Generation Ticket)**：
+   - 每个缓存条目与任务持有自增代际版本号；手动操作或新任务启动时代际增加，迟到的历史异步请求在完成时比对代际，若已过时则安全丢弃，防止陈旧数据覆盖最新标题；
+3. **零工作区污染**：
+   - 缓存仅驻留于宿主内存，不向思源工作区 `data/` 目录写入任何缓存或排队文件，功能停用或插件注销时随作用域安全释放。
+
+---
+
+## 7. 新 Feature 扩展开发指南
 
 当团队或 Agent 需要向 OmniKit 增加新的业务特性时，必须严格执行以下开发步骤与契约清单：
 
-### 6.1 开发步骤指南
+### 7.1 开发步骤指南
 1. **需求与技术实现严格解耦先行**：在 `docs/features/<feature-name>/` 目录下分别建立 `PRD.md`（纯产品需求文档：功能描述、用户交互、业务规则与验收用例，遇到 BUG 或代码重构时不随意改动产品规范）与 `DESIGN.md`（技术实现设计文档：架构分层、模块协作、算法数据流与底层 API 契约，遇到 BUG 或代码实现调整时独立更新技术设计），完成评审与 Spec-Freeze；
 2. **建立特性目录**：在 `src/features/<feature-name>/` 下创建特性包，包括：
    - `settings.ts`：定义配置 TypeScript 类型与默认值；
@@ -690,7 +816,7 @@ sequenceDiagram
 4. **国际化补充**：在 `src/i18n/zh-CN.json` 和 `src/i18n/en.json` 添加对应的特性标题、描述及业务文案；
 5. **保持 Core Schema 独立**：新特性的专属配置项保存在特性独立配置文件中，不写入 `omnikit-core.json`。
 
-### 6.2 Feature 扩展技术契约自查清单 (Feature Checklist)
+### 7.2 Feature 扩展技术契约自查清单 (Feature Checklist)
 - [ ] Feature 是否纯粹面向 `BaseFeature` 和 `FeatureContext` 编程？
 - [ ] 是否不存在任何跨 Feature 的直接代码引用（`import`）？
 - [ ] 是否按需声明了平台兼容性列表 `frontends`（5+1 取值集合，缺失或空数组时默认为全端支持）？在不受支持的环境下是否平稳保持在 `unsupported` 状态，不挂载任何资源与菜单，且不破坏跨端云同步中的启用偏好？
@@ -716,11 +842,11 @@ sequenceDiagram
 
 ---
 
-## 7. 工程化脚本体系与构建工具链
+## 8. 工程化脚本体系与构建工具链
 
 OmniKit 的工程化工具链统一人性化收敛在 `scripts/` 目录体系中，各脚本遵循单一职责原则（Single Responsibility Principle）与高可靠防御性设计，支撑从本地开发、静态校验到发布归档的全生命周期。
 
-### 7.1 统一脚本目录架构与分工
+### 8.1 统一脚本目录架构与分工
 
 项目工程脚本收敛于如下规范化目录拓扑，工程根目录下不设立零散或非标准的辅助工具目录：
 
@@ -767,7 +893,7 @@ scripts/
 - `pnpm release`：调用 `node scripts/release/release.mjs`；
 - `pnpm clean`：调用 `node scripts/clean.mjs`。
 
-### 7.2 核心构建与工具链实现契约
+### 8.2 核心构建与工具链实现契约
 
 #### 1. 多端与市场高精图标渲染规范 (`scripts/build/render-icons.mjs`)
 - **渲染引擎与入参**：基于 `@resvg/resvg-js` 高性能 Rust 原生 SVG 渲染引擎，输入源文件为 `assets/omnikit-plugin.svg`；
@@ -834,11 +960,11 @@ scripts/
 
 ---
 
-## 8. CI/CD 与多入口自动化发版架构规范
+## 9. CI/CD 与多入口自动化发版架构规范
 
 OmniKit 构建并维护高可靠、自动化的 CI/CD 体系，通过 `.github/workflows/ci.yml` 守护日常代码提交质量，通过 `.github/workflows/release.yml` 实现多入口、幂等且具备防递归安全机制的自动化发版。
 
-### 8.1 双触发模型与发布架构拓扑
+### 9.1 双触发模型与发布架构拓扑
 
 发版工作流同时支持“本地推送 Tag”与“GitHub Actions 界面手动一键发版”双入口，两套入口共享完全一致的构建与质量门禁流水线：
 
@@ -914,7 +1040,7 @@ flowchart TD
     NcipolloAction --> Finish
 ```
 
-### 8.2 单一版本权威源与默认分支保护
+### 9.2 单一版本权威源与默认分支保护
 
 - **单一版本权威源**：
   - 思源笔记生态将 `plugin.json` 作为识别插件元数据与版本的唯一官方契约；
@@ -927,7 +1053,7 @@ flowchart TD
   - 提取的版本号必须严格匹配 `^[0-9]+\.[0-9]+\.[0-9]+$` 格式；
   - 若包含非标准后缀或格式不合规，脚本立即报错并终止流水线。
 
-### 8.3 全流程质量防护门禁 (Quality Gate Pipeline)
+### 9.3 全流程质量防护门禁 (Quality Gate Pipeline)
 
 无论通过何种入口触发，所有发版任务必须依次通过以下 8 道刚性质量防护门禁，任一步骤失败立即阻断发布：
 
@@ -954,7 +1080,7 @@ flowchart TD
 8. **压缩包完整性解包测试**：
    - 执行 `unzip -t package.zip`，底层校验 ZIP 压缩包的 CRC32 与物理完整性。
 
-### 8.4 Tag 与 Release 状态协调矩阵 (`reconcile-tag.sh`)
+### 9.4 Tag 与 Release 状态协调矩阵 (`reconcile-tag.sh`)
 
 在手动发版流程中，`reconcile-tag.sh` **严格位于产物构建与所有质量门禁全部通过之后**执行，确保构建失败时绝不提前对远端 Tag 或 Release 产生破坏性副作用。
 
@@ -969,7 +1095,7 @@ flowchart TD
 | 指向历史旧提交 | 不存在 | 调用 GitHub API `DELETE repos/.../git/refs/tags/${RELEASE_TAG}` 删除旧 Tag，重新指向当前提交 | 清除指向过时提交的孤立 Tag |
 | 不存在 | 已存在 | 终止发布，报错提示状态异常 | 异常状态设防拦截 |
 
-### 8.5 防递归死循环机制与并发安全防护
+### 9.5 防递归死循环机制与并发安全防护
 
 #### 1. `GITHUB_TOKEN` 防递归天然安全原理
 - 在手动发版阶段，工作流通过 GitHub CLI 执行发布操作：
@@ -995,11 +1121,11 @@ flowchart TD
 
 ---
 
-## 9. 自动化依赖安全与监控规范
+## 10. 自动化依赖安全与监控规范
 
 OmniKit 通过配置 `.github/dependabot.yml` 建立生产级依赖安全与自动化维护体系，保障依赖时效性与构建环境的严格稳定性。
 
-### 9.1 双生态监控架构
+### 10.1 双生态监控架构
 
 Dependabot 实施双生态覆盖体系，统一采用月度监控周期，在依赖安全与开发者审查开销之间取得最佳平衡：
 
@@ -1034,13 +1160,13 @@ updates:
       - "automated-pr"
 ```
 
-### 9.2 `lockfile-only` 依赖锁定保护策略
+### 10.2 `lockfile-only` 依赖锁定保护策略
 
 - **策略约束**：针对 `npm` 生态严格配置 `versioning-strategy: lockfile-only`；
 - **保护核心**：Dependabot 仅被允许更新 `pnpm-lock.yaml` 文件中的子依赖解析版本，**绝对禁止自动修改 `package.json` 中声明的主版本号与 SemVer 范围**；
 - **稳定性保障**：保全项目显式声明的依赖契约，杜绝依赖版本隐式自动上浮引发构建不一致或破坏生产稳定性。
 
-### 9.3 Actions 核心大版本防御与自动化分组
+### 10.3 Actions 核心大版本防御与自动化分组
 
 - **核心 Actions 大版本防御**：
   - 严格锁定受信官方维护的 GitHub Actions：`actions/checkout@v4`、`actions/setup-node@v4`、`pnpm/action-setup@v4` 与 `ncipollo/release-action@v1`；
@@ -1053,11 +1179,11 @@ updates:
 
 ---
 
-## 10. 系统全链路自查与发版验收清单
+## 11. 系统全链路自查与发版验收清单
 
 在执行代码提交、特性上线或正式发版前，开发人员与 AI Agent 必须逐项对照以下清单执行全量核查：
 
-### 10.1 Feature 业务与平台契约核验
+### 11.1 Feature 业务与平台契约核验
 - [ ] Feature 是否纯粹面向 `BaseFeature` 和 `FeatureContext` 编程，无跨 Feature 依赖？
 - [ ] 是否按需声明了 `frontends` 平台兼容性列表（5+1 取值集合），在不受支持的端平稳处于 `unsupported` 且不破坏云同步偏好？
 - [ ] 存储文件命名是否严格遵循 `feature-${id}-settings.json` 与 `feature-${id}-{dataname}.json`，重置设置时绝对不影响数据文件？
@@ -1072,7 +1198,7 @@ updates:
 - [ ] 批量处理 0 项时是否联动销毁了任务进度模态框？
 - [ ] Dock 改写后的静默刷新是否遵循防覆盖铁律，保留操作成功统计？
 
-### 10.2 工程脚本与工具链核验
+### 11.2 工程脚本与工具链核验
 - [ ] 所有工程脚本是否收敛于 `scripts/` 目录体系，根目录下无非标准的 `tools/` 目录？
 - [ ] `scripts/build/render-icons.mjs` 是否正确生成 $160 \times 160$ 像素且 $\le 64\text{ KiB}$ 的图标至 `.generated/icon.png`？
 - [ ] `scripts/dev/install-workspace.mjs` 是否实施了软链接拒绝、路径逃逸防御、目标身份校验与原子备份回滚？
@@ -1082,14 +1208,14 @@ updates:
 - [ ] `scripts/release/verify-package.mjs` 是否严格核验物理清单、PNG 标头、文档引用、版本一致性与 ZIP Central Directory 条目（严禁包含 `kernel.js` 和 `node_modules/`）？
 - [ ] `scripts/clean.mjs` 是否正常清理 `dist/`、`.generated/` 与 `package.zip`？
 
-### 10.3 CI/CD 与发版工作流核验
+### 11.3 CI/CD 与发版工作流核验
 - [ ] `.github/workflows/release.yml` 是否同时支持 `push.tags: ["v*"]` 与 `workflow_dispatch` 双入口？
 - [ ] 手动发版是否免参数输入，单一以 `plugin.json.version` 为发版权威源？
 - [ ] 发版流水线是否完整对齐 8 道质量门禁（依赖冻结安装、版本一致性、`pnpm check`、`pnpm test`、`pnpm build:app`、`pnpm package:verify`、`unzip -t`）？
 - [ ] 手动发版是否采用默认 `GITHUB_TOKEN`，天然阻断 `push.tags` 递归死循环？
 - [ ] 工作流是否声明了 `concurrency: { group: "release", cancel-in-progress: false }` 避免并发冲突？
 
-### 10.4 依赖安全与规范核验
+### 11.4 依赖安全与规范核验
 - [ ] `.github/dependabot.yml` 是否覆盖 `npm` 与 `github-actions` 双生态月度监控？
 - [ ] `npm` 监控策略是否严格配置为 `lockfile-only`，保全 `package.json` 声明范围？
 - [ ] Actions 依赖是否锁定官方核心大版本，并配置分组 PR？
