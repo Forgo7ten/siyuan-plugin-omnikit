@@ -51,7 +51,7 @@ test("resolver captures one exact ordinal among duplicate image paths", async ()
   assert.equal(resolveImageOccurrence(baseline, { rootID, notebook, blockID, imageOrdinal: 4, oldPath: "assets/a.png" }), undefined);
 }));
 
-test("writer checks block ownership and baseline, then updates and reads back one occurrence", async () => withDocument(async () => {
+test("writer checks block ownership and baseline, then updates occurrence and trusts kernel response", async () => withDocument(async () => {
   let current = blockDOM(["assets/a.png", "assets/a.png", "assets/b.png"]);
   const target = resolveImageOccurrence(current, { rootID, notebook, blockID, imageOrdinal: 1, oldPath: "assets/a.png" });
   const calls = [];
@@ -64,7 +64,7 @@ test("writer checks block ownership and baseline, then updates and reads back on
   } };
   assert.equal(await commitOneImage(kernel, target, "assets/a.webp", "http://localhost:6806"), "replaced");
   assert.equal((current.match(/data-src="assets\/a\.webp"/g) ?? []).length, 1);
-  assert.deepEqual(calls, ["/api/block/getBlockInfo", "/api/block/getBlockDOM", "/api/block/updateBlock", "/api/block/getBlockInfo", "/api/block/getBlockDOM"]);
+  assert.deepEqual(calls, ["/api/block/getBlockInfo", "/api/block/getBlockDOM", "/api/block/updateBlock"]);
 }));
 
 test("writer safely skips a stale baseline without sending updateBlock", async () => withDocument(async () => {

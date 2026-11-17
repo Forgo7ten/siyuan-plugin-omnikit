@@ -29,7 +29,7 @@ export function resolveImageOccurrence(
 export async function waitForPersistedImageOccurrence(
   kernel: KernelClient,
   evidence: ImageOccurrenceEvidence,
-  attempts = 8,
+  attempts = 2,
   signal?: AbortSignal,
 ): Promise<OccurrenceTarget | undefined> {
   for (let attempt = 0; attempt < attempts; attempt++) {
@@ -51,7 +51,7 @@ export async function waitForPersistedImageOccurrence(
     } catch {
       if (signal?.aborted) return undefined;
     }
-    if (attempt + 1 < attempts) await new Promise(resolve => setTimeout(resolve, 120 + attempt * 70));
+    if (attempt + 1 < attempts) await new Promise(resolve => setTimeout(resolve, 50));
   }
   return undefined;
 }

@@ -82,20 +82,10 @@ export async function commitOneImage(
         await kernel.post("/api/block/updateBlock", {
           id: target.blockID, dataType: "dom", data: patched, lockType: true,
         }, { signal, timeout: 30_000 });
-      } catch {
+        return "replaced";
+      } catch (error) {
+        if (signal?.aborted || (error as { name?: string })?.name === "AbortError") throw error;
         // The request may have committed despite a lost response. Never replay it.
-        return "unknown";
-      }
-      try {
-        if (!await readIdentity(kernel, target, signal)) return "unknown";
-        const after = await readDOM(kernel, target, signal);
-        if (!after) return "unknown";
-        const verify = document.createElement("template");
-        verify.innerHTML = after;
-        const roots = [...verify.content.children].filter(node => node.getAttribute("data-node-id") === target.blockID);
-        const actual = roots.length === 1 ? [...roots[0].querySelectorAll("img")][target.imageOrdinal] : undefined;
-        return actual && imagePath(actual) === newPath ? "replaced" : "unknown";
-      } catch {
         return "unknown";
       }
     } catch (error) {

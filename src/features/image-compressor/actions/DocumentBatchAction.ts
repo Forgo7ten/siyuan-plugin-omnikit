@@ -9,6 +9,7 @@ import type { ImageProcessingServices } from "../services/ImageProcessingService
 import { resolveSource, type ImageSource } from "../policy/source.ts";
 import type { OccurrenceTarget } from "../policy/contracts.ts";
 import { resolveImageOccurrence } from "../services/ImageOccurrenceResolver.ts";
+import { sqlLiteral } from "../services/references.ts";
 import { scanDocumentImages, type DocumentImageOccurrence } from "./scanDocumentImages.ts";
 
 export interface BatchActionOptions {
@@ -56,18 +57,44 @@ export async function compressDocumentImages(
   const config = services.config();
   const editorNotebook = typeof protyle?.notebookId === "string" ? protyle.notebookId : undefined;
   let notebook = editorNotebook ?? "";
-  let scanned: DocumentImageOccurrence[];
   try {
     const identity = await services.kernel.post<any>("/api/block/getBlockInfo", { id: rootID, ...(editorNotebook ? { notebook: editorNotebook } : {}) }, { signal });
     if (!isDocumentRootIdentity(identity.data, rootID)) throw new Error("Unable to verify document identity");
     if (editorNotebook && identity.data?.box && editorNotebook !== identity.data.box) throw new Error("Document notebook changed");
     notebook = editorNotebook || identity.data?.box || protyle?.block?.box || "";
     if (!notebook) throw new Error("Document notebook is unavailable");
-    const response = await services.kernel.post<any>("/api/block/getBlockDOM", { id: rootID, notebook }, { signal });
-    if (response.data?.id !== rootID || typeof response.data.dom !== "string" || !response.data.dom.trim()) throw new Error("Invalid document DOM");
-    const scan = scanDocumentImages(response.data.dom, services.origin, config);
-    scanned = scan.occurrences;
-    summary.scannedBlocks = scan.scannedBlocks;
+  } catch (error) {
+    if (signal.aborted || !scope.active) return cancelledSummary(summary);
+    context.logger.warn("验证当前文档身份失败", error);
+    return summary;
+  }
+
+  const targetNotebook = notebook;
+  const blockDOMs = new Map<string, string>();
+  const scanned: DocumentImageOccurrence[] = [];
+  try {
+    const stmt = `SELECT id, markdown FROM blocks WHERE root_id = ${sqlLiteral(rootID)} AND type = 'p' AND markdown LIKE '%assets/%'`;
+    const sqlRes = await services.kernel.post<Array<{ id: string; markdown?: string }>>(
+      "/api/query/sql",
+      { stmt, mode: "readonly" },
+      { signal },
+    );
+    const rows = Array.isArray(sqlRes.data) ? sqlRes.data : [];
+    summary.scannedBlocks = rows.length;
+    for (const row of rows) {
+      if (signal.aborted || !scope.active) return cancelledSummary(summary);
+      if (!row?.id) continue;
+      try {
+        const response = await services.kernel.post<any>("/api/block/getBlockDOM", { id: row.id, notebook: targetNotebook }, { signal });
+        if (response.data?.id === row.id && typeof response.data.dom === "string" && response.data.dom.trim()) {
+          blockDOMs.set(row.id, response.data.dom);
+          const scan = scanDocumentImages(response.data.dom, services.origin, config);
+          scanned.push(...scan.occurrences);
+        }
+      } catch (error) {
+        context.logger.warn(`读取图片块失败：${row.id}`, error);
+      }
+    }
     summary.scanComplete = true;
   } catch (error) {
     if (signal.aborted || !scope.active) return cancelledSummary(summary);
@@ -75,48 +102,15 @@ export async function compressDocumentImages(
     return summary;
   }
 
-  // Every block snapshot is fetched before compression begins; these are the authorized targets.
-  const targetNotebook = notebook;
-  const blockDOMs = new Map<string, string>();
-  const missingBlockIds = [...new Set(scanned.map(o => o.blockId))];
-  if (missingBlockIds.length > 0) {
-    try {
-      const batchRes = await services.kernel.post<Record<string, string>>(
-        "/api/block/getBlockDOMs",
-        { ids: missingBlockIds, notebook: targetNotebook },
-        { signal },
-      );
-      if (batchRes.data && typeof batchRes.data === "object" && !Array.isArray(batchRes.data)) {
-        for (const [id, dom] of Object.entries(batchRes.data)) {
-          if (typeof dom === "string" && dom.trim()) {
-            blockDOMs.set(id, dom);
-          }
-        }
-      }
-    } catch {
-      // Fallback to per-block queries below if getBlockDOMs is unsupported or fails
-    }
-  }
-
   const authorized: AuthorizedOccurrence[] = [];
   for (const occurrence of scanned) {
     if (signal.aborted || !scope.active) return cancelledSummary(summary);
-    let dom = blockDOMs.get(occurrence.blockId);
+    const dom = blockDOMs.get(occurrence.blockId);
     if (!dom) {
-      try {
-        const response = await services.kernel.post<any>("/api/block/getBlockDOM", { id: occurrence.blockId, notebook: targetNotebook }, { signal });
-        if (response.data?.id !== occurrence.blockId || typeof response.data.dom !== "string" || !response.data.dom.trim()) throw new Error("Invalid image block DOM");
-        const blockDOM = response.data.dom as string;
-        dom = blockDOM;
-        blockDOMs.set(occurrence.blockId, blockDOM);
-      } catch (error) {
-        context.logger.warn(`读取图片块失败：${occurrence.blockId}`, error);
-        summary.failed++;
-        summary.completed++;
-        continue;
-      }
+      summary.failed++;
+      summary.completed++;
+      continue;
     }
-    if (!dom) continue;
     const target = resolveImageOccurrence(dom, {
       rootID, notebook: targetNotebook, blockID: occurrence.blockId, imageOrdinal: occurrence.imageOrdinal, oldPath: occurrence.source.raw,
     });

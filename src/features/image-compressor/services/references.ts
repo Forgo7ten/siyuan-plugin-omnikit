@@ -127,10 +127,19 @@ export class ReferenceService {
   async plan(mappings: Mapping[], seed: DocumentRow, _maxDocuments: number, _forceSQL = false, selectedBlockID?: string, signal?: AbortSignal): Promise<ReferencePlan> {
     if (!mappings.length || new Set(mappings.map(mapping => mapping.key)).size !== mappings.length) throw new Error("Empty or duplicate mappings");
     if (!seed.id || seed.root_id !== seed.id || !seed.box) throw new Error("Document identity unavailable");
-    const rootDOM = await blockDOM(this.k, seed.id, seed.box, signal);
-    const root = parsed(rootDOM);
-    const blockIDs = new Set([...root.querySelectorAll("[data-node-id]")].map(node => node.getAttribute("data-node-id")).filter((value): value is string => Boolean(value)));
-    if (selectedBlockID) blockIDs.clear(), blockIDs.add(selectedBlockID);
+
+    const blockIDs: string[] = [];
+    if (selectedBlockID) {
+      blockIDs.push(selectedBlockID);
+    } else {
+      const stmt = `SELECT id, markdown FROM blocks WHERE root_id = ${sqlLiteral(seed.id)} AND type = 'p' AND markdown LIKE '%assets/%'`;
+      const response = await this.k.post<Array<{ id: string; markdown?: string }>>("/api/query/sql", { stmt, mode: "readonly" }, { signal });
+      const rows = Array.isArray(response.data) ? response.data : [];
+      for (const row of rows) {
+        if (row?.id) blockIDs.push(row.id);
+      }
+    }
+
     const patches: BlockPatch[] = [];
     for (const id of blockIDs) {
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");

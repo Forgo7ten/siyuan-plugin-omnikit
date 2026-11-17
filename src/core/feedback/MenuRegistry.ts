@@ -3,16 +3,25 @@ import type { Logger } from "../host/Logger.ts";
 
 export type MenuLocation = "topbar" | "doc-title" | "doc-tree" | "image" | "link" | "blockicon";
 
-export interface MenuContext {
+export interface HostMenuContext {
   location: MenuLocation;
   rootID?: string;
+  selectedDocumentIDs?: readonly string[];
   selectedDocumentCount?: number;
-  imageElement?: HTMLElement;
+  protyle?: any;
+  targetElement?: HTMLElement;
   blockID?: string;
-  imageURL?: string;
   /** Original host detail, for feature actions that need the full host context. */
   detail?: any;
+
+  // Preserved for backward compatibility
+  imageElement?: HTMLElement;
+  imageURL?: string;
 }
+
+export type MenuContext = HostMenuContext;
+
+export type MenuMatcher = (context: HostMenuContext) => boolean;
 
 export interface OmniMenuItem {
   id: string;
@@ -23,7 +32,7 @@ export interface OmniMenuItem {
   run: () => void | Promise<void>;
 }
 
-export type MenuProvider = (context: MenuContext) => readonly OmniMenuItem[];
+export type MenuProvider = (context: HostMenuContext) => readonly OmniMenuItem[];
 
 export interface HostMenu {
   addItem(item: {
@@ -42,6 +51,7 @@ interface Entry {
   location: MenuLocation;
   scope: FeatureScope;
   provider: MenuProvider;
+  matcher?: MenuMatcher;
 }
 
 /**
@@ -50,12 +60,9 @@ interface Entry {
  * @invariant A contribution is rendered only while its scope is active and its owner is
  * runtime-running. Configuration alone never authorizes an action.
  * @invariant Contribution identity is `location/owner/id`: one feature may legitimately
- * expose the same action id in several host menus (for example a document action in the
- * title menu, the document tree and the top bar).
+ * expose the same action id in several host menus.
  * @safety Entries leave the registry when their scope expires, and an already-open host
  * menu re-checks authorization on click.
- * @safety A duplicate declaration is a programming error, not a runtime failure: it is
- * logged and skipped instead of aborting the whole feature activation.
  */
 export class MenuRegistry {
   private readonly entries: Entry[] = [];
@@ -67,13 +74,23 @@ export class MenuRegistry {
     private readonly notifyInactive?: () => void,
   ) {}
 
-  contribute(scope: FeatureScope, owner: string, location: MenuLocation, id: string, provider: MenuProvider): void {
+  contribute(
+    scope: FeatureScope,
+    owner: string,
+    location: MenuLocation,
+    id: string,
+    provider: MenuProvider,
+    matcherOrOptions?: MenuMatcher | { matcher?: MenuMatcher },
+  ): void {
     if (!scope.active) return;
     if (this.entries.some(entry => entry.location === location && entry.owner === owner && entry.id === id)) {
       this.reportError(new Error(`菜单项重复：${location}/${owner}/${id}`));
       return;
     }
-    const entry: Entry = { scope, owner, location, id, provider };
+    const matcher = typeof matcherOrOptions === "function"
+      ? matcherOrOptions
+      : matcherOrOptions?.matcher;
+    const entry: Entry = { scope, owner, location, id, provider, matcher };
     this.entries.push(entry);
     scope.own(() => {
       const index = this.entries.indexOf(entry);
@@ -82,18 +99,31 @@ export class MenuRegistry {
   }
 
   /** Every host menu expansion reads live state; no menu DOM is cached. */
-  render(location: MenuLocation, host: HostMenu, context: MenuContext): void {
+  render(location: MenuLocation, host: HostMenu, context: HostMenuContext): void {
     let declared = 0;
     let rendered = 0;
     const skippedFor: string[] = [];
+
+    const selectedDocumentIDs = context.selectedDocumentIDs ?? (context.rootID ? [context.rootID] : []);
+    const selectedDocumentCount = context.selectedDocumentCount ?? selectedDocumentIDs.length;
+    const normalizedContext: HostMenuContext = {
+      ...context,
+      selectedDocumentIDs,
+      selectedDocumentCount,
+    };
+
     for (const entry of [...this.entries]) {
       if (entry.location !== location) continue;
       declared++;
       if (!entry.scope.active) { skippedFor.push(`${entry.owner}：功能作用域已停用`); continue; }
       if (!this.isFeatureRunning(entry.owner)) { skippedFor.push(`${entry.owner}：功能未运行`); continue; }
+      if (entry.matcher && !entry.matcher(normalizedContext)) {
+        skippedFor.push(`${entry.owner}：Matcher 条件不满足`);
+        continue;
+      }
 
       let items: readonly OmniMenuItem[];
-      try { items = entry.provider(context); }
+      try { items = entry.provider(normalizedContext); }
       catch (error) { this.reportError(error); continue; }
 
       const isTopbar = location === "topbar";
@@ -136,14 +166,18 @@ export class MenuRegistry {
       声明项数: declared,
       绘制项数: rendered,
       跳过项: skippedFor,
-      rootID: context.rootID,
-      hasImage: Boolean(context.imageURL),
+      rootID: normalizedContext.rootID,
+      hasImage: Boolean(normalizedContext.imageURL),
     });
   }
 
   list(owner: string): readonly OmniMenuItem[] {
     return this.entries
       .filter(entry => entry.owner === owner)
-      .flatMap(entry => entry.provider({ location: entry.location }));
+      .flatMap(entry => entry.provider({
+        location: entry.location,
+        selectedDocumentIDs: [],
+        selectedDocumentCount: 0,
+      }));
   }
 }

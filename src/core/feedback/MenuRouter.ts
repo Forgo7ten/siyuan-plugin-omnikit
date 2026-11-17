@@ -1,6 +1,6 @@
 import type { Plugin } from "siyuan";
 import type { Logger } from "../host/Logger.ts";
-import type { MenuContext, MenuRegistry } from "./MenuRegistry.ts";
+import type { HostMenuContext, MenuRegistry } from "./MenuRegistry.ts";
 import { resolveEditorRootID } from "../host/ProtyleAdapter.ts";
 
 export interface SingleDocumentTarget {
@@ -15,69 +15,134 @@ export interface ImageMenuTarget {
 }
 
 /**
- * @compat Event names exist since 3.8.4. The detail shapes below must be verified against
- * real 3.8.4 / 3.8.9 frontends; adapters never guess a target from the first `.protyle`.
- * @invariant The core installs one listener per host event, independent of feature count.
+ * Extract selected document IDs from SiYuan tree menu event details.
+ * Supports single and multiple selection without filtering by business rules.
+ */
+export function extractDocTreeDocumentIDs(detail: any): string[] {
+  if (!detail) return [];
+  const ids: string[] = [];
+
+  if (Array.isArray(detail.items)) {
+    for (const item of detail.items) {
+      if (item && typeof item.id === "string") {
+        const itemType = item.type;
+        if (itemType === "notebook" || itemType === "navigation-root" || detail.type === "notebook") {
+          continue;
+        }
+        ids.push(item.id);
+      }
+    }
+  } else if (detail.elements) {
+    const elements = Array.from(detail.elements as ArrayLike<HTMLElement>);
+    for (const el of elements) {
+      const nodeType = el?.getAttribute?.("data-type");
+      if (nodeType && (nodeType === "navigation-root" || nodeType === "notebook")) {
+        continue;
+      }
+      const id = el?.getAttribute?.("data-node-id") ?? (el as any)?.dataset?.id;
+      if (typeof id === "string" && id) {
+        ids.push(id);
+      }
+    }
+  } else if (detail.data?.id && typeof detail.data.id === "string") {
+    ids.push(detail.data.id);
+  } else if (detail.id && typeof detail.id === "string") {
+    ids.push(detail.id);
+  }
+
+  return ids;
+}
+
+/**
+ * Universal host event to context bridge.
+ * Converts SiYuan host events into standardized HostMenuContext instances
+ * and delegates business matching to Feature-registered matchers and providers.
  */
 export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: Logger): () => void {
   const titleHandler = (event: CustomEvent<any>) => {
     const detail = event.detail;
+    if (!detail?.menu) return;
     const rootID = resolveEditorRootID(detail);
-    if (!rootID || !detail?.menu) {
-      logger?.debug("忽略文档标题菜单事件", { 文档根ID: rootID, 存在菜单: Boolean(detail?.menu) });
-      return;
-    }
+    const selectedDocumentIDs = rootID ? [rootID] : [];
     logger?.debug("打开文档标题菜单", { 文档根ID: rootID });
-    menus.render("doc-title", detail.menu, { location: "doc-title", rootID, selectedDocumentCount: 1, detail });
+    menus.render("doc-title", detail.menu, {
+      location: "doc-title",
+      rootID,
+      selectedDocumentIDs,
+      selectedDocumentCount: selectedDocumentIDs.length,
+      protyle: detail.protyle,
+      targetElement: detail.element,
+      detail,
+    });
   };
 
   const treeHandler = (event: CustomEvent<any>) => {
     const detail = event.detail;
-    const analysis = analyzeDocTreeTarget(detail);
-    if (!analysis.target) {
-      // @compat The rejection reason is the only way to tell a multi-selection from an
-      // unknown detail shape; log the raw shape instead of failing silently.
-      logger?.debug("忽略文档树菜单事件", { 原因: translateTreeReason(analysis.reason), 事件信息: describeDocTreeDetail(detail) });
-      return;
-    }
-    logger?.debug("打开文档树菜单", { 文档根ID: analysis.target.rootID });
-    menus.render("doc-tree", detail.menu, { location: "doc-tree", rootID: analysis.target.rootID, selectedDocumentCount: 1, detail });
+    if (!detail?.menu) return;
+    const selectedDocumentIDs = extractDocTreeDocumentIDs(detail);
+    const selectedDocumentCount = selectedDocumentIDs.length;
+    const rootID = selectedDocumentCount === 1 ? selectedDocumentIDs[0] : undefined;
+    const targetElement = detail.elements?.[0] ?? detail.element;
+    const protyle = detail.protyle;
+
+    logger?.debug("打开文档树菜单", { selectedDocumentIDs, selectedDocumentCount, rootID });
+    menus.render("doc-tree", detail.menu, {
+      location: "doc-tree",
+      rootID,
+      selectedDocumentIDs,
+      selectedDocumentCount,
+      targetElement,
+      protyle,
+      detail,
+    });
   };
 
   const imageHandler = (event: CustomEvent<any>) => {
     const detail = event.detail;
-    const target = resolveImageMenuTarget(detail);
-    if (!target || !detail?.menu) {
-      logger?.debug("忽略图片菜单事件", { 存在图片目标: Boolean(target), 存在菜单: Boolean(detail?.menu) });
-      return;
-    }
-    logger?.debug("打开图片菜单", { 图片资源: target.url, 图片块ID: target.blockID, 文档根ID: target.rootID });
+    if (!detail?.menu) return;
+    const targetElement = detail.element as HTMLElement | undefined;
+    const rootID = resolveEditorRootID(detail);
+    const protyle = detail.protyle;
+    const blockID = targetElement?.closest?.("[data-node-id]")?.getAttribute?.("data-node-id") ?? protyle?.block?.id;
+    const selectedDocumentIDs = rootID ? [rootID] : [];
+
+    const image = targetElement?.tagName?.toLowerCase() === "img"
+      ? (targetElement as HTMLImageElement)
+      : (targetElement?.querySelector?.("img") as HTMLImageElement | null);
+    const imageURL = image?.getAttribute("data-src") || image?.getAttribute("src") || undefined;
+
+    logger?.debug("打开图片菜单", { rootID, blockID, imageURL });
     menus.render("image", detail.menu, {
       location: "image",
-      rootID: target.rootID,
-      imageElement: target.element,
-      imageURL: target.url,
-      blockID: target.blockID,
+      rootID,
+      selectedDocumentIDs,
+      selectedDocumentCount: selectedDocumentIDs.length,
+      targetElement,
+      protyle,
+      blockID,
+      imageElement: image ?? undefined,
+      imageURL,
       detail,
     });
   };
 
   const linkHandler = (event: CustomEvent<any>) => {
     const detail = event.detail;
-    const link = detail?.element as HTMLElement | undefined;
-    const isLink = link?.getAttribute?.("data-type")?.split(" ").includes("a") === true;
-    if (!detail?.menu || !isLink) {
-      logger?.debug("忽略链接菜单事件", { 存在链接目标: isLink, 存在菜单: Boolean(detail?.menu) });
-      return;
-    }
-    const href = link.getAttribute?.("data-href") ?? undefined;
-    const text = link.textContent ?? undefined;
-    const blockID = link.closest?.("[data-node-id]")?.getAttribute?.("data-node-id") ?? undefined;
+    if (!detail?.menu) return;
+    const targetElement = detail.element as HTMLElement | undefined;
     const rootID = resolveEditorRootID(detail);
-    logger?.debug("打开链接菜单", { href, text, blockID, rootID });
+    const protyle = detail.protyle;
+    const blockID = targetElement?.closest?.("[data-node-id]")?.getAttribute?.("data-node-id") ?? protyle?.block?.id;
+    const selectedDocumentIDs = rootID ? [rootID] : [];
+
+    logger?.debug("打开链接菜单", { rootID, blockID });
     menus.render("link", detail.menu, {
       location: "link",
       rootID,
+      selectedDocumentIDs,
+      selectedDocumentCount: selectedDocumentIDs.length,
+      targetElement,
+      protyle,
       blockID,
       detail,
     });
@@ -85,11 +150,22 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
 
   const blockIconHandler = (event: CustomEvent<any>) => {
     const detail = event.detail;
-    if (!detail?.menu || !Array.isArray(detail.blockElements)) return;
+    if (!detail?.menu) return;
     const rootID = resolveEditorRootID(detail);
+    const selectedDocumentIDs = rootID ? [rootID] : [];
+    const protyle = detail.protyle;
+    const targetElement = Array.isArray(detail.blockElements) ? detail.blockElements[0] : detail.element;
+    const blockID = targetElement?.getAttribute?.("data-node-id") ?? protyle?.block?.id;
+
+    logger?.debug("打开块图标菜单", { rootID, blockID });
     menus.render("blockicon", detail.menu, {
       location: "blockicon",
       rootID,
+      selectedDocumentIDs,
+      selectedDocumentCount: selectedDocumentIDs.length,
+      targetElement,
+      protyle,
+      blockID,
       detail,
     });
   };
@@ -109,21 +185,8 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
   };
 }
 
-function translateTreeReason(reason?: string): string | undefined {
-  if (!reason) return undefined;
-  if (reason === "no-menu") return "缺少菜单";
-  if (reason.startsWith("multi-selection:")) return `选中了多个项目：${reason.slice("multi-selection:".length)}`;
-  if (reason.startsWith("not-a-document:")) return `目标不是文档：${reason.slice("not-a-document:".length)}`;
-  if (reason.startsWith("not-a-document-node:")) return `目标节点不是文档：${reason.slice("not-a-document-node:".length)}`;
-  if (reason === "no-target") return "没有目标项目";
-  if (reason === "no-id") return "缺少文档ID";
-  return reason;
-}
-
 /**
- * @safety Only a single, explicitly identified document file may receive write actions.
- * Multi-selection (`items`/`elements` length != 1), notebooks (`navigation-root`) and
- * unresolved nodes are rejected before any menu is rendered.
+ * Backward compatibility helper for analyzing a doc tree target expecting a single document.
  */
 export function analyzeDocTreeTarget(detail: any): { target?: SingleDocumentTarget; reason?: string } {
   if (!detail?.menu) return { reason: "no-menu" };
@@ -131,23 +194,19 @@ export function analyzeDocTreeTarget(detail: any): { target?: SingleDocumentTarg
   const items = Array.isArray(detail.items) ? detail.items : undefined;
   const elements = detail.elements ? Array.from(detail.elements as ArrayLike<HTMLElement>) : undefined;
 
-  // Any explicit multi-selection signal rejects the whole menu, not just extra entries.
   if (items && items.length !== 1) return { reason: `multi-selection:${items.length}` };
   if (elements && elements.length !== 1) return { reason: `multi-selection:${elements.length}` };
   if (!items && !elements) return { reason: "no-target" };
 
-  // Newer builds expose an explicit target type; notebooks and mixed selections never pass.
   if (detail.type && detail.type !== "doc") return { reason: `not-a-document:${detail.type}` };
 
   const element = elements?.[0];
   const nodeType = element?.getAttribute?.("data-type");
   if (nodeType && nodeType !== "navigation-file") return { reason: `not-a-document-node:${nodeType}` };
 
-  const idFromItem = items?.[0]?.id;
-  const idFromElement = element?.getAttribute("data-node-id") ?? element?.dataset?.id;
-  const rootID = idFromItem || idFromElement;
-  if (typeof rootID !== "string" || !rootID) return { reason: "no-id" };
-  return { target: { rootID } };
+  const ids = extractDocTreeDocumentIDs(detail);
+  if (ids.length !== 1) return { reason: ids.length === 0 ? "no-id" : `multi-selection:${ids.length}` };
+  return { target: { rootID: ids[0] } };
 }
 
 export function resolveSingleDocTreeItem(detail: any): SingleDocumentTarget | undefined {
@@ -168,10 +227,7 @@ export function describeDocTreeDetail(detail: any): Record<string, unknown> {
   };
 }
 
-/**
- * @compat Image menus differ between versions: `detail.element` may be the image itself or
- * a container. Only an `<img>` with a local source becomes a target.
- */
+/** Backward compatibility helper for image menu target resolution. */
 export function resolveImageMenuTarget(detail: any): ImageMenuTarget | undefined {
   const element = detail?.element as HTMLElement | undefined;
   if (!element) return undefined;

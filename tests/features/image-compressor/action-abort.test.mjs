@@ -22,6 +22,14 @@ test("DocumentBatchAction returns cancelled quietly without showing invalidDocum
   assert.match(batch, /if \(signal\.aborted \|\| !scope\.active\) \{\s*return cancelledSummary\(summary\);\s*\}\s*if \(!rootID \|\| protyle\?\.disabled\) \{\s*showMessage\(translate\(context\.plugin\.i18n, "image\.batch\.invalidDocument"\), 5000\);/);
 });
 
+test("DocumentBatchAction discovers candidate image blocks via read-only SQL query", async () => {
+  const batch = await read("../../../src/features/image-compressor/actions/DocumentBatchAction.ts");
+  assert.match(batch, /SELECT id, markdown FROM blocks WHERE root_id = \$\{sqlLiteral\(rootID\)\} AND type = 'p' AND markdown LIKE '%assets\/%'/);
+  assert.match(batch, /mode:\s*["']readonly["']/);
+  assert.doesNotMatch(batch, /mode:\s*["']write["']/);
+  assert.doesNotMatch(batch, /getBlockDOMs/);
+});
+
 test("RemoteImageWatcher guards against unauthorized documents before taking snapshot or HTTP calls", async () => {
   const watcher = await read("../../../src/features/image-compressor/actions/RemoteImageWatcher.ts");
 

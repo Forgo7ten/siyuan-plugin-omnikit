@@ -158,26 +158,21 @@ test("recovery is serialized with update and reload", async () => {
   ]);
 });
 
-test("unconfirmed update times out without changing memory or starting another write", async t => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
+test("failed update preserves memory state and does not deadlock subsequent writes", async () => {
   const plugin = createPlugin();
   const store = new JsonStore(plugin, "feature-unit-test.json", codec);
   await store.load();
-  let entered;
-  const saveEntered = new Promise(resolve => { entered = resolve; });
-  plugin.saveData = async path => {
-    plugin.writes.push(path);
-    entered();
-    return new Promise(() => {});
-  };
-  const pending = store.update(value => { value.value = 1; });
-  await saveEntered;
-  t.mock.timers.tick(30_000);
-  await assert.rejects(pending, /outcome is unconfirmed/);
+
+  plugin.setSaveResult({ code: -1 });
+  await assert.rejects(store.update(value => { value.value = 1; }), /Save failed/);
   assert.equal(store.snapshot().value, 0);
-  assert.equal(store.needsRecovery, true);
-  await assert.rejects(store.update(value => { value.value = 2; }), /unconfirmed write/);
-  assert.deepEqual(plugin.writes, ["feature-unit-test.json"]);
+
+  // Subsequent write is NOT deadlocked and succeeds when backend recovers
+  plugin.setSaveResult(undefined);
+  const updated = await store.update(value => { value.value = 2; });
+  assert.equal(updated, true);
+  assert.equal(store.snapshot().value, 2);
+  assert.deepEqual(plugin.writes, ["feature-unit-test.json", "feature-unit-test.json"]);
 });
 
 test("missing file via HTTP 202 code 404 initializes defaults without entering read-only", async () => {

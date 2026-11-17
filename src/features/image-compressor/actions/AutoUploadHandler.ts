@@ -256,28 +256,11 @@ async function processCompletedUpload(
         continue;
       }
       const evidence = candidates[0];
-      const target = await waitForPersistedImageOccurrence(services.kernel, evidence, 8, scope.signal);
+      const target = await waitForPersistedImageOccurrence(services.kernel, evidence, 2, scope.signal);
       if (!target || !scope.active || scope.signal.aborted) {
         logger.debug?.("未能在思源内核中核验到块持久化位置，跳过", { path });
         skipped++;
         lastSkipReason = "notMatched";
-        continue;
-      }
-
-      const block = (await services.kernel.post<{ id: string; dom: string }>("/api/block/getBlockDOM", {
-        id: target.blockID, notebook: target.notebook,
-      }, { signal: scope.signal })).data;
-      const template = document.createElement("template");
-      template.innerHTML = block.dom;
-      const owner = [...template.content.querySelectorAll("[data-node-id]")].find(node => node.getAttribute("data-node-id") === target.blockID);
-      const matching = [...(owner?.querySelectorAll("img") ?? [])].filter(image => {
-        const raw = image.hasAttribute("data-src") ? image.getAttribute("data-src") : image.getAttribute("src");
-        try { return raw && resolveSource(raw.replaceAll("\\", "/"), services.origin).key === source.key; } catch { return false; }
-      });
-      if (matching.length !== 1) {
-        logger.debug?.("块内图片引用与当前位置不匹配或存在重复，跳过", { path, matchingCount: matching.length });
-        skipped++;
-        lastSkipReason = "conflict";
         continue;
       }
 
@@ -325,11 +308,11 @@ async function processCompletedUpload(
 export async function waitForObservedImages(
   observed: InsertedImage[], key: string, signal: AbortSignal,
 ): Promise<InsertedImage[]> {
-  for (let attempt = 0; attempt < 8; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     if (signal.aborted) return [];
     const matches = observed.filter(item => item.key === key);
     if (matches.length) return matches;
-    if (attempt < 7) await new Promise(resolve => setTimeout(resolve, 100 + attempt * 80));
+    if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 30));
   }
   return [];
 }

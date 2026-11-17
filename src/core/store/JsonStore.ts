@@ -5,7 +5,6 @@ export interface StoreCodec<T> {
   parse(raw: unknown): T;
 }
 export type StoreListener<T> = (next: Readonly<T>) => void;
-const SAVE_TIMEOUT_MS = 30_000;
 const READ_TIMEOUT_MS = 30_000;
 
 function clone<T>(value: T): T {
@@ -28,7 +27,6 @@ export class JsonStore<T> {
   private listeners = new Set<StoreListener<T>>();
   private rawToBackup: unknown;
   private readOnlyReason?: string;
-  private writeUncertain = false;
   private recoveryPromise?: Promise<void>;
 
   constructor(
@@ -58,14 +56,12 @@ export class JsonStore<T> {
 
   async load(): Promise<void> {
     return this.enqueue(async () => {
-      this.assertCertain();
       await this.readIntoMemory();
     });
   }
 
   async reload(): Promise<boolean> {
     return this.enqueue(async () => {
-      this.assertCertain();
       const before = this.fingerprint;
       if (this.plugin.data && typeof this.plugin.data === "object") {
         delete this.plugin.data[this.file];
@@ -77,7 +73,6 @@ export class JsonStore<T> {
 
   async update(mutator: (draft: T) => void): Promise<boolean> {
     return this.enqueue(async () => {
-      this.assertCertain();
       if (this.readOnlyReason) {
         throw new Error(`${this.file} is read-only: ${this.readOnlyReason}`);
       }
@@ -99,7 +94,6 @@ export class JsonStore<T> {
   async recoverWithBackup(): Promise<void> {
     if (this.recoveryPromise) return this.recoveryPromise;
     const operation = this.enqueue(async () => {
-      this.assertCertain();
       if (!this.readOnlyReason) return;
       if (this.rawToBackup === undefined) {
         throw new Error(`Cannot back up unreadable ${this.file}; do not overwrite it`);
@@ -126,37 +120,15 @@ export class JsonStore<T> {
     return operation;
   }
 
-  private assertCertain(): void {
-    if (this.writeUncertain) {
-      throw new Error(`${this.file} has an unconfirmed write; reload the plugin before retrying`);
-    }
-  }
-
   private async saveConfirmed(path: string, data: unknown, action: string): Promise<void> {
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const timeoutError = new Error("timeout");
-    const save = this.plugin.saveData(path, data);
-    try {
-      const response = await Promise.race([
-        save,
-        new Promise<never>((_, reject) => {
-          timeout = setTimeout(() => reject(timeoutError), SAVE_TIMEOUT_MS);
-        }),
-      ]);
-      if (response && typeof response === "object" && "code" in response &&
-          (response as {code: number}).code !== 0) {
-        throw new Error(`Save failed to ${action} ${this.file}`);
-      }
-    } catch (error) {
-      if (error === timeoutError) {
-        this.writeUncertain = true;
-        this.readOnlyReason = `Write outcome is unconfirmed for ${this.file}`;
-        this.emit();
-        throw new Error(`Save timed out while trying to ${action} ${this.file}; outcome is unconfirmed`);
-      }
-      throw error;
-    } finally {
-      if (timeout !== undefined) clearTimeout(timeout);
+    const response = await this.plugin.saveData(path, data);
+    if (
+      response &&
+      typeof response === "object" &&
+      "code" in response &&
+      (response as { code: number }).code !== 0
+    ) {
+      throw new Error(`Save failed to ${action} ${this.file}`);
     }
   }
 

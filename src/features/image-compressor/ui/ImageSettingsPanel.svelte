@@ -41,13 +41,16 @@
   }
 
   $effect(() => {
-    for (const [id, meta] of Object.entries(draft.auto.pageAllowlist)) {
-      if (meta.title && meta.title.includes("/")) {
-        resolvedHPaths[id] = meta.title;
-      } else if (!resolvedHPaths[id]) {
-        void resolveHPath(id);
+    const allowlist = draft.auto.pageAllowlist;
+    untrack(() => {
+      for (const [id, meta] of Object.entries(allowlist)) {
+        if (meta.title && meta.title.includes("/")) {
+          resolvedHPaths[id] = meta.title;
+        } else if (!resolvedHPaths[id]) {
+          void resolveHPath(id);
+        }
       }
-    }
+    });
   });
 
   const initial = untrack(() => copy(store.snapshot()));

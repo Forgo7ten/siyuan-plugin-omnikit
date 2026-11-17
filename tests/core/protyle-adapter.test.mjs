@@ -3,52 +3,41 @@ import assert from "node:assert/strict";
 import {
   resolveEditorRootID,
   resolveNotebookID,
+  resolveProtyleElement,
   resolveProtyleRunner,
   combineSignals,
 } from "../../src/core/host/ProtyleAdapter.ts";
 
-test("resolveEditorRootID unpacks rootID across various event and editor structures", () => {
+test("resolveEditorRootID unpacks rootID across standard event and editor structures", () => {
   // 1. Direct detail.data.rootID (e.g. click-editortitleicon)
   assert.equal(
     resolveEditorRootID({ detail: { data: { rootID: "root-detail-data-1" } } }),
     "root-detail-data-1",
   );
 
-  // 2. Fallback to detail.data.id
+  // 2. Event detail: detail.protyle.block.rootID
   assert.equal(
-    resolveEditorRootID({ detail: { data: { id: "root-detail-id-2" } } }),
-    "root-detail-id-2",
+    resolveEditorRootID({ detail: { protyle: { block: { rootID: "root-detail-protyle-2" } } } }),
+    "root-detail-protyle-2",
   );
 
   // 3. Protyle instance: protyle.block.rootID
   assert.equal(
-    resolveEditorRootID({ protyle: { block: { rootID: "root-block-3" } } }),
+    resolveEditorRootID({ block: { rootID: "root-block-3" } }),
     "root-block-3",
   );
 
-  // 4. Nested Protyle instance: protyle.protyle.block.rootID
-  assert.equal(
-    resolveEditorRootID({ protyle: { protyle: { block: { rootID: "root-nested-4" } } } }),
-    "root-nested-4",
-  );
-
-  // 5. Editor wrapper: editor.protyle.block.rootID
-  assert.equal(
-    resolveEditorRootID({ editor: { protyle: { block: { rootID: "root-editor-5" } } } }),
-    "root-editor-5",
-  );
-
-  // 6. IProtyle getInstance()
+  // 4. IProtyle getInstance()
   assert.equal(
     resolveEditorRootID({
       getInstance() {
-        return { block: { rootID: "root-instance-6" } };
+        return { block: { rootID: "root-instance-4" } };
       },
     }),
-    "root-instance-6",
+    "root-instance-4",
   );
 
-  // 7. Non-object or empty returns undefined
+  // 5. Non-object or empty returns undefined
   assert.equal(resolveEditorRootID(null), undefined);
   assert.equal(resolveEditorRootID(undefined), undefined);
   assert.equal(resolveEditorRootID("invalid"), undefined);
@@ -56,18 +45,18 @@ test("resolveEditorRootID unpacks rootID across various event and editor structu
   assert.equal(resolveEditorRootID({ data: { rootID: "" } }), undefined);
 });
 
-test("resolveNotebookID unpacks notebook ID across various structures", () => {
+test("resolveNotebookID unpacks notebook ID across standard structures", () => {
   // 1. Direct protyle.notebookId
   assert.equal(resolveNotebookID({ notebookId: "nb-1" }), "nb-1");
 
   // 2. protyle.block.box
   assert.equal(resolveNotebookID({ block: { box: "box-2" } }), "box-2");
 
-  // 3. nested protyle.protyle.notebookId
-  assert.equal(resolveNotebookID({ protyle: { notebookId: "nb-3" } }), "nb-3");
+  // 3. event detail: detail.protyle.notebookId
+  assert.equal(resolveNotebookID({ detail: { protyle: { notebookId: "nb-3" } } }), "nb-3");
 
-  // 4. nested protyle.protyle.block.box
-  assert.equal(resolveNotebookID({ protyle: { block: { box: "box-4" } } }), "box-4");
+  // 4. event detail: detail.protyle.block.box
+  assert.equal(resolveNotebookID({ detail: { protyle: { block: { box: "box-4" } } } }), "box-4");
 
   // 5. detail.data.box
   assert.equal(resolveNotebookID({ detail: { data: { box: "box-5" } } }), "box-5");
@@ -86,6 +75,34 @@ test("resolveNotebookID unpacks notebook ID across various structures", () => {
   assert.equal(resolveNotebookID(null), undefined);
   assert.equal(resolveNotebookID({}), undefined);
   assert.equal(resolveNotebookID({ notebookId: "" }), undefined);
+});
+
+test("resolveProtyleElement extracts editor DOM element", () => {
+  const mockElement = { tagName: "DIV", className: "protyle" };
+
+  // 1. Direct element
+  assert.equal(resolveProtyleElement({ element: mockElement }), mockElement);
+
+  // 2. detail.protyle.element
+  assert.equal(
+    resolveProtyleElement({ detail: { protyle: { element: mockElement } } }),
+    mockElement,
+  );
+
+  // 3. IProtyle getInstance().element
+  assert.equal(
+    resolveProtyleElement({
+      getInstance() {
+        return { element: mockElement };
+      },
+    }),
+    mockElement,
+  );
+
+  // 4. Invalid
+  assert.equal(resolveProtyleElement(null), undefined);
+  assert.equal(resolveProtyleElement({}), undefined);
+  assert.equal(resolveProtyleElement({ element: "not-an-element" }), undefined);
 });
 
 test("resolveProtyleRunner extracts runner with updateTransactionElement", () => {

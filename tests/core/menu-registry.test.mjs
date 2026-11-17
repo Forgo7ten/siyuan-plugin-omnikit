@@ -120,3 +120,87 @@ test("link and block icon context menus receive exactly one OmniKit prefix", () 
     assert.equal(items[0].label.match(/\[OmniKit\]/g)?.length, 1);
   }
 });
+
+test("feature-registered matcher filters dynamic context without hardcoded core logic", () => {
+  const scope = new FeatureScope();
+  const menu = new MenuRegistry(() => true, error => { throw error; });
+
+  // Feature A matches only single document
+  menu.contribute(
+    scope,
+    "featureSingle",
+    "doc-tree",
+    "single-action",
+    () => [{ id: "single", label: "Single Doc Action", run: () => {} }],
+    context => context.selectedDocumentCount === 1,
+  );
+
+  // Feature B matches multi-document selection (e.g. diff or batch)
+  menu.contribute(
+    scope,
+    "featureMulti",
+    "doc-tree",
+    "multi-action",
+    () => [{ id: "multi", label: "Multi Doc Action", run: () => {} }],
+    context => (context.selectedDocumentCount ?? 0) >= 2,
+  );
+
+  // Scenario 1: Single document context
+  const singleItems = [];
+  menu.render("doc-tree", { addItem: item => singleItems.push(item) }, {
+    location: "doc-tree",
+    rootID: "doc-1",
+    selectedDocumentIDs: ["doc-1"],
+    selectedDocumentCount: 1,
+  });
+  assert.equal(singleItems.length, 1);
+  assert.equal(singleItems[0].label, "[OmniKit] Single Doc Action");
+
+  // Scenario 2: Multi-document context (3 documents)
+  const multiItems = [];
+  menu.render("doc-tree", { addItem: item => multiItems.push(item) }, {
+    location: "doc-tree",
+    selectedDocumentIDs: ["doc-1", "doc-2", "doc-3"],
+    selectedDocumentCount: 3,
+  });
+  assert.equal(multiItems.length, 1);
+  assert.equal(multiItems[0].label, "[OmniKit] Multi Doc Action");
+});
+
+test("menu router dispatches multi-document selection to context without dropping", () => {
+  const listeners = new Map();
+  const plugin = { eventBus: {
+    on(name, handler) { listeners.set(name, handler); },
+    off(name) { listeners.delete(name); },
+  } };
+  const registry = new MenuRegistry(() => true, error => { throw error; });
+  let receivedContext;
+
+  registry.contribute(new FeatureScope(), "multiDocFeature", "doc-tree", "diff", context => {
+    receivedContext = context;
+    return [{ id: "diff", label: `Compare (${context.selectedDocumentCount})`, run: () => {} }];
+  });
+
+  const dispose = installMenuRouter(plugin, registry);
+
+  const docTreeMenu = [];
+  listeners.get("open-menu-doctree")({
+    detail: {
+      type: "doc",
+      items: [
+        { id: "doc-alpha", type: "navigation-file" },
+        { id: "doc-beta", type: "navigation-file" },
+      ],
+      menu: { addItem: item => docTreeMenu.push(item) },
+    },
+  });
+
+  assert.equal(docTreeMenu.length, 1);
+  assert.equal(docTreeMenu[0].label, "[OmniKit] Compare (2)");
+  assert.ok(receivedContext);
+  assert.deepEqual(receivedContext.selectedDocumentIDs, ["doc-alpha", "doc-beta"]);
+  assert.equal(receivedContext.selectedDocumentCount, 2);
+  assert.equal(receivedContext.rootID, undefined);
+
+  dispose();
+});

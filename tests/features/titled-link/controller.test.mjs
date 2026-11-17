@@ -83,10 +83,10 @@ test("a newer manual request suppresses an older response and its notification",
   }
   assert.equal(deferred.length, 2);
   deferred[1](htmlResponse("New title"));
-  assert.equal(await newer, "conflict");
+  assert.equal(await newer, "updated");
   deferred[0](htmlResponse("Old title"));
   assert.equal(await older, "superseded");
-  assert.deepEqual(notices, ["titledLink.conflict"]);
+  assert.deepEqual(notices, ["titledLink.updated"]);
   scope.dispose();
 });
 

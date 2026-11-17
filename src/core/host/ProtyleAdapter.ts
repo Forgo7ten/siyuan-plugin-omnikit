@@ -1,5 +1,5 @@
 /**
- * Lightweight pure-function adapters for SiYuan Protyle editor contexts and signals.
+ * Pure-function adapters for standard SiYuan Protyle editor contexts and signals.
  */
 
 export interface ProtyleRunner {
@@ -7,50 +7,53 @@ export interface ProtyleRunner {
 }
 
 /**
- * Robustly extract document root ID across Protyle instances, event details, and nested editor wrappers.
+ * Standard extraction of document root ID from SiYuan editor instances and event details.
  */
 export function resolveEditorRootID(context: unknown): string | undefined {
   if (!context || typeof context !== "object") return undefined;
   const target = (context as { detail?: any }).detail ?? context;
   const candidate =
-    target?.data?.rootID ??
-    target?.data?.id ??
-    target?.block?.rootID ??
     target?.protyle?.block?.rootID ??
-    target?.protyle?.protyle?.block?.rootID ??
-    target?.editor?.protyle?.block?.rootID ??
-    (typeof target?.getInstance === "function"
-      ? target.getInstance()?.block?.rootID ?? target.getInstance()?.protyle?.block?.rootID
-      : undefined);
+    target?.block?.rootID ??
+    target?.data?.rootID ??
+    (typeof target?.getInstance === "function" ? target.getInstance()?.block?.rootID : undefined);
   return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
 }
 
 /**
- * Robustly extract notebook (box) ID across Protyle instances, event details, and nested editor wrappers.
+ * Standard extraction of notebook (box) ID from SiYuan editor instances and event details.
  */
 export function resolveNotebookID(context: unknown): string | undefined {
   if (!context || typeof context !== "object") return undefined;
   const target = (context as { detail?: any }).detail ?? context;
   const candidate =
-    target?.notebookId ??
-    target?.notebook ??
-    target?.data?.box ??
-    target?.data?.notebookId ??
-    target?.block?.box ??
     target?.protyle?.notebookId ??
     target?.protyle?.block?.box ??
-    target?.protyle?.protyle?.notebookId ??
-    target?.protyle?.protyle?.block?.box ??
-    target?.editor?.protyle?.notebookId ??
-    target?.editor?.protyle?.block?.box ??
-    (typeof target?.getInstance === "function"
-      ? target.getInstance()?.notebookId ?? target.getInstance()?.block?.box
-      : undefined);
+    target?.notebookId ??
+    target?.block?.box ??
+    target?.data?.box ??
+    (typeof target?.getInstance === "function" ? target.getInstance()?.notebookId : undefined);
   return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
 }
 
 /**
- * Extract a runnable protyle transaction runner from direct Protyle instances, IProtyle wrappers, or nested properties.
+ * Standard extraction of Protyle editor element (.protyle) from event details or instances.
+ */
+export function resolveProtyleElement(context: unknown): HTMLElement | undefined {
+  if (!context || typeof context !== "object") return undefined;
+  const target = (context as { detail?: any }).detail ?? context;
+  const element =
+    target?.protyle?.element ??
+    target?.element ??
+    (typeof target?.getInstance === "function" ? target.getInstance()?.element : undefined);
+  if (!element || typeof element !== "object") return undefined;
+  if (typeof HTMLElement !== "undefined" && element instanceof HTMLElement) return element;
+  if (typeof (element as any).tagName === "string") return element as HTMLElement;
+  return undefined;
+}
+
+/**
+ * Extract a runnable protyle transaction runner from Protyle instances or IProtyle wrappers.
  */
 export function resolveProtyleRunner(context: unknown): ProtyleRunner | null {
   if (!context || typeof context !== "object") return null;
@@ -72,11 +75,19 @@ export function resolveProtyleRunner(context: unknown): ProtyleRunner | null {
 
 /**
  * Combine multiple abort signals using modern native AbortSignal.any.
- * Avoids persistent closure listener leaks on long-lived FeatureScope signals.
  */
 export function combineSignals(...signals: (AbortSignal | undefined)[]): AbortSignal | undefined {
   const valid = signals.filter((s): s is AbortSignal => !!s);
   if (valid.length === 0) return undefined;
   if (valid.length === 1) return valid[0];
-  return AbortSignal.any(valid);
+  if (typeof AbortSignal.any === "function") return AbortSignal.any(valid);
+  const controller = new AbortController();
+  for (const s of valid) {
+    if (s.aborted) {
+      controller.abort(s.reason);
+      return controller.signal;
+    }
+    s.addEventListener("abort", () => controller.abort(s.reason), { once: true });
+  }
+  return controller.signal;
 }

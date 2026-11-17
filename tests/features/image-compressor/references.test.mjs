@@ -45,3 +45,87 @@ test("reference plans do not perform SQL writes or workspace-wide relinking", as
   assert.doesNotMatch(source, /mode:\s*["']write["']/);
   assert.match(source, /mode:\s*["']readonly["']/);
 });
+
+test("ReferenceService.plan discovers candidate blocks via read-only SQL query", async () => {
+  const calls = [];
+  const client = {
+    async post(url, body) {
+      calls.push({ url, body });
+      if (url === "/api/query/sql") {
+        return { code: 0, data: [{ id: id(2), markdown: "![alt](assets/a.png)" }] };
+      }
+      if (url === "/api/block/getBlockDOM") {
+        return { code: 0, data: { id: id(2), dom: `<div data-node-id="${id(2)}"><img data-src="assets/a.png" src="assets/a.png"></div>` } };
+      }
+      throw new Error(`Unexpected endpoint ${url}`);
+    },
+  };
+
+  const priorDoc = globalThis.document;
+  const priorParser = globalThis.DOMParser;
+  try {
+    class MockImg {
+      constructor() { this.tagName = "IMG"; this.attrs = { "data-src": "assets/a.png", src: "assets/a.png" }; }
+      hasAttribute(n) { return n in this.attrs; }
+      getAttribute(n) { return this.attrs[n]; }
+      setAttribute(n, v) { this.attrs[n] = v; }
+      closest() { return null; }
+    }
+    class MockBlock {
+      constructor(blockId, img) {
+        this.tagName = "DIV";
+        this.blockId = blockId;
+        this.img = img;
+      }
+      getAttribute(n) { return n === "data-node-id" ? this.blockId : null; }
+      querySelectorAll(selector) {
+        if (selector === "[data-node-id]") return [];
+        if (selector === "img") return [this.img];
+        return [];
+      }
+      querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
+      get outerHTML() { return `<div data-node-id="${this.blockId}"><img data-src="${this.img.getAttribute("data-src")}" src="${this.img.getAttribute("src")}"></div>`; }
+    }
+    class MockDoc {
+      constructor(block) {
+        this.block = block;
+        this.body = { children: [block] };
+      }
+      querySelector() { return null; }
+      querySelectorAll(selector) {
+        if (selector === "[data-node-id]") return [this.block];
+        return [];
+      }
+    }
+    globalThis.DOMParser = class {
+      parseFromString() {
+        return new MockDoc(new MockBlock(id(2), new MockImg()));
+      }
+    };
+    globalThis.document = {
+      createElement: name => {
+        if (name === "template") {
+          return {
+            content: {
+              children: [new MockBlock(id(2), new MockImg())],
+              querySelector: () => null,
+            },
+            set innerHTML(_) {},
+          };
+        }
+        return {};
+      },
+    };
+
+    const service = new ReferenceService(client, "http://localhost:6806");
+    const plan = await service.plan([mapping], seed, 10);
+    assert.equal(plan.patches.length, 1);
+    assert.equal(plan.patches[0].id, id(2));
+    assert.equal(calls[0].url, "/api/query/sql");
+    assert.match(calls[0].body.stmt, /SELECT id, markdown FROM blocks WHERE root_id = '.*' AND type = 'p' AND markdown LIKE '%assets\/%'/);
+    assert.equal(calls[0].body.mode, "readonly");
+  } finally {
+    globalThis.DOMParser = priorParser;
+    globalThis.document = priorDoc;
+  }
+});

@@ -98,34 +98,89 @@ test("captures an occurrence and commits through the native undo transaction", a
   assert.equal(await commitLinkTitle(target, "Example", { replaceTitle: true, kernel }), "updated");
   assert.equal(links[0].textContent, "Example");
   assert.equal(links[0].getAttribute("data-title"), "Example");
-  assert.deepEqual(kernel.calls, ["/api/block/getBlockInfo", "/api/block/getBlockDOM"]);
+  assert.deepEqual(kernel.calls, []);
   assert.equal(transactions.length, 1);
   assert.equal(transactions[0].oldHTML, original);
   assert.match(transactions[0].newHTML, />Example<\/span>/);
 }));
 
-test("rejects live concurrent edits before any persisted read or transaction", async () => installDOMParser(async () => {
+test("user typing in active editor does not conflict and preserves typing in native transaction", async () => installDOMParser(async () => {
   const { links, block, protyle, transactions } = fixture();
   const target = captureLinkTarget(links[0], protyle);
   const kernel = kernelFor(block);
-  block.prefix = "user typing";
+  block.prefix = "user typing ";
+
+  assert.equal(await commitLinkTitle(target, "Example", { replaceTitle: false, kernel }), "updated");
+  assert.equal(links[0].textContent, "Example");
+  assert.equal(kernel.calls.length, 0);
+  assert.equal(transactions.length, 1);
+  assert.match(transactions[0].oldHTML, /user typing /);
+  assert.match(transactions[0].newHTML, /user typing /);
+  assert.match(transactions[0].newHTML, />Example<\/span>/);
+}));
+
+test("rejects live occurrence edits when link text was modified concurrently", async () => installDOMParser(async () => {
+  const { links, block, protyle, transactions } = fixture();
+  const target = captureLinkTarget(links[0], protyle);
+  const kernel = kernelFor(block);
+  links[0].textContent = "user edited link";
 
   assert.equal(await commitLinkTitle(target, "Example", { replaceTitle: false, kernel }), "conflict");
-  assert.equal(links[0].textContent, "https://example.com/0");
-  assert.equal(kernel.calls.length, 0);
+  assert.equal(links[0].textContent, "user edited link");
   assert.equal(transactions.length, 0);
 }));
 
-test("rejects persisted occurrence changes even when the live DOM still matches", async () => installDOMParser(async () => {
+test("rejects live occurrence edits when link was removed from block", async () => installDOMParser(async () => {
   const { links, block, protyle, transactions } = fixture();
   const target = captureLinkTarget(links[0], protyle);
+  links[0].isConnected = false;
+
+  assert.equal(await commitLinkTitle(target, "Example", { replaceTitle: false }), "conflict");
+  assert.equal(transactions.length, 0);
+}));
+
+test("non-active background mode updates block via updateBlock and trusts code: 0", async () => installDOMParser(async () => {
+  const { links, block, protyle } = fixture();
+  const target = {
+    ...captureLinkTarget(links[0], protyle),
+    protyle: null,
+  };
+  const updateCalls = [];
+  const kernel = {
+    calls: [],
+    async post(path, body) {
+      this.calls.push(path);
+      if (path === "/api/block/getBlockDOM") {
+        return { data: { id: block.id, dom: block.outerHTML }, code: 0 };
+      }
+      if (path === "/api/block/updateBlock") {
+        updateCalls.push(body);
+        return { code: 0, data: null };
+      }
+      return { data: {}, code: 0 };
+    },
+  };
+
+  assert.equal(await commitLinkTitle(target, "Example", { replaceTitle: true, kernel }), "updated");
+  assert.deepEqual(kernel.calls, ["/api/block/getBlockDOM", "/api/block/updateBlock"]);
+  assert.equal(updateCalls.length, 1);
+  assert.equal(updateCalls[0].id, block.id);
+  assert.equal(updateCalls[0].dataType, "dom");
+  assert.match(updateCalls[0].data, />Example<\/span>/);
+}));
+
+test("non-active background mode rejects when persisted occurrence changed", async () => installDOMParser(async () => {
+  const { links, block, protyle } = fixture();
+  const target = {
+    ...captureLinkTarget(links[0], protyle),
+    protyle: null,
+  };
   const stale = `<div data-node-id="${block.id}"><span data-type="a" data-href="https://changed.example/">changed</span></div>`;
 
   assert.equal(await commitLinkTitle(target, "Example", {
     replaceTitle: false,
     kernel: kernelFor(block, { dom: stale }),
   }), "conflict");
-  assert.equal(transactions.length, 0);
 }));
 
 test("allows sequential plugin-owned writes in one block while retaining per-occurrence checks", async () => installDOMParser(async () => {
@@ -139,7 +194,7 @@ test("allows sequential plugin-owned writes in one block while retaining per-occ
   assert.equal(links[1].textContent, "Second");
 }));
 
-test("commits same-block title updates with one persisted read and one native transaction", async () => installDOMParser(async () => {
+test("commits same-block title updates with one native transaction in active editor", async () => installDOMParser(async () => {
   const { links, block, protyle, transactions } = fixture(2);
   const first = captureLinkTarget(links[0], protyle);
   const second = captureLinkTarget(links[1], protyle);
@@ -150,26 +205,68 @@ test("commits same-block title updates with one persisted read and one native tr
     { target: first, title: "First" },
     { target: second, title: "Second" },
   ], { replaceTitle: false, kernel }), ["updated", "updated"]);
-  assert.deepEqual(kernel.calls, ["/api/block/getBlockInfo", "/api/block/getBlockDOM"]);
+  assert.deepEqual(kernel.calls, []);
   assert.equal(transactions.length, 1);
   assert.equal(transactions[0].oldHTML, original);
   assert.equal(links[0].textContent, "First");
   assert.equal(links[1].textContent, "Second");
 }));
 
-test("abandons the whole group when a persisted occurrence conflicts", async () => installDOMParser(async () => {
+test("abandons the whole group when an occurrence conflicts in active editor", async () => installDOMParser(async () => {
   const { links, block, protyle, transactions } = fixture(2);
   const first = captureLinkTarget(links[0], protyle);
   const second = captureLinkTarget(links[1], protyle);
+  links[1].textContent = "user edited text";
+
+  assert.deepEqual(await commitLinkTitles([
+    { target: first, title: "First" },
+    { target: second, title: "Second" },
+  ], { replaceTitle: false }), ["conflict", "conflict"]);
+  assert.equal(transactions.length, 0);
+  assert.equal(links[0].textContent, "https://example.com/0");
+  assert.equal(links[1].textContent, "user edited text");
+}));
+
+test("commits same-block title updates with one updateBlock in non-active mode", async () => installDOMParser(async () => {
+  const { links, block, protyle } = fixture(2);
+  const first = { ...captureLinkTarget(links[0], protyle), protyle: null };
+  const second = { ...captureLinkTarget(links[1], protyle), protyle: null };
+  const updateCalls = [];
+  const kernel = {
+    calls: [],
+    async post(path, body) {
+      this.calls.push(path);
+      if (path === "/api/block/getBlockDOM") {
+        return { data: { id: block.id, dom: block.outerHTML }, code: 0 };
+      }
+      if (path === "/api/block/updateBlock") {
+        updateCalls.push(body);
+        return { code: 0, data: null };
+      }
+      return { data: {}, code: 0 };
+    },
+  };
+
+  assert.deepEqual(await commitLinkTitles([
+    { target: first, title: "First" },
+    { target: second, title: "Second" },
+  ], { replaceTitle: false, kernel }), ["updated", "updated"]);
+  assert.deepEqual(kernel.calls, ["/api/block/getBlockDOM", "/api/block/updateBlock"]);
+  assert.equal(updateCalls.length, 1);
+  assert.match(updateCalls[0].data, />First<\/span>/);
+  assert.match(updateCalls[0].data, />Second<\/span>/);
+}));
+
+test("abandons the whole group when a persisted occurrence conflicts in non-active mode", async () => installDOMParser(async () => {
+  const { links, block, protyle } = fixture(2);
+  const first = { ...captureLinkTarget(links[0], protyle), protyle: null };
+  const second = { ...captureLinkTarget(links[1], protyle), protyle: null };
   const stale = `<div data-node-id="${block.id}"><span data-type="a" data-href="${links[0].getAttribute("data-href")}">${links[0].textContent}</span><span data-type="a" data-href="https://changed.example/">changed</span></div>`;
 
   assert.deepEqual(await commitLinkTitles([
     { target: first, title: "First" },
     { target: second, title: "Second" },
   ], { replaceTitle: false, kernel: kernelFor(block, { dom: stale }) }), ["conflict", "conflict"]);
-  assert.equal(transactions.length, 0);
-  assert.equal(links[0].textContent, "https://example.com/0");
-  assert.equal(links[1].textContent, "https://example.com/1");
 }));
 
 test("waits for IME composition and aborts safely on timeout or signal", async () => installDOMParser(async () => {
@@ -252,20 +349,19 @@ test("resolves and commits via SiYuan IProtyle wrapper", async () => installDOMP
   assert.match(transactions[0].newHTML, />Resolved Title<\/span>/);
 }));
 
-test("safely handles kernel network failures in verifyPersisted as conflict", async () => installDOMParser(async () => {
-  const { links, block, protyle, transactions } = fixture();
-  const target = captureLinkTarget(links[0], protyle);
+test("safely handles kernel network failures in non-active mode as conflict", async () => installDOMParser(async () => {
+  const { links, block, protyle } = fixture();
+  const target = { ...captureLinkTarget(links[0], protyle), protyle: null };
   const throwingKernel = {
     post: async () => { throw new Error("Network timeout or connection refused"); },
   };
   const result = await commitLinkTitle(target, "Example", { replaceTitle: false, kernel: throwingKernel });
   assert.equal(result, "conflict");
-  assert.equal(transactions.length, 0);
 }));
 
-test("safely propagates AbortError during verifyPersisted as aborted", async () => installDOMParser(async () => {
-  const { links, block, protyle, transactions } = fixture();
-  const target = captureLinkTarget(links[0], protyle);
+test("safely propagates AbortError during non-active kernel calls as aborted", async () => installDOMParser(async () => {
+  const { links, block, protyle } = fixture();
+  const target = { ...captureLinkTarget(links[0], protyle), protyle: null };
   const controller = new AbortController();
   const abortingKernel = {
     post: async () => {
@@ -281,5 +377,4 @@ test("safely propagates AbortError during verifyPersisted as aborted", async () 
     signal: controller.signal,
   });
   assert.equal(result, "aborted");
-  assert.equal(transactions.length, 0);
 }));

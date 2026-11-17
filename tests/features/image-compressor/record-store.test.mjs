@@ -82,25 +82,24 @@ test("stale status updates cannot overwrite a newer compressed path", async () =
   assert.equal(store.snapshot()[0].lastOperation, "replaced");
 });
 
-test("a JsonStore timeout leaves memory unchanged and blocks subsequent writes", async t => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
+test("a failed save leaves memory unchanged and does not deadlock subsequent writes", async () => {
   const plugin = createPlugin();
-  let entered;
-  const saveEntered = new Promise(resolve => { entered = resolve; });
+  let fail = true;
   plugin.saveData = async path => {
     plugin.writes.push(path);
-    entered();
-    return new Promise(() => {});
+    if (fail) throw new Error("Save failed");
   };
   const store = new ImageCompressionRecordStore(plugin);
   await store.init();
 
-  const pending = store.upsert("assets/a.png", "assets/a.webp");
-  await saveEntered;
-  t.mock.timers.tick(30_000);
-  await assert.rejects(pending, /outcome is unconfirmed/);
+  await assert.rejects(store.upsert("assets/a.png", "assets/a.webp"), /Save failed/);
   assert.deepEqual(store.snapshot(), []);
-  await assert.rejects(store.upsert("assets/b.png", "assets/b.webp"), /unconfirmed write/);
-  assert.deepEqual(plugin.writes, ["feature-image-compressor-records.json"]);
+
+  // Subsequent write is NOT deadlocked and succeeds when backend recovers
+  fail = false;
+  await store.upsert("assets/b.png", "assets/b.webp");
+  assert.equal(store.snapshot().length, 1);
+  assert.equal(store.snapshot()[0].originalPath, "assets/b.png");
+  assert.deepEqual(plugin.writes, ["feature-image-compressor-records.json", "feature-image-compressor-records.json"]);
 });
 

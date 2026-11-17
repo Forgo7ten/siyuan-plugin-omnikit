@@ -17,7 +17,7 @@ export interface TitledLinkProtyle {
  * Stable block identity and ordinal/value snapshots prevent URL-wide replacement.
  */
 export interface LinkOccurrenceTarget {
-  readonly protyle: TitledLinkProtyle;
+  readonly protyle?: TitledLinkProtyle | null;
   readonly notebook: string;
   readonly rootID: string;
   readonly blockID: string;
@@ -27,7 +27,7 @@ export interface LinkOccurrenceTarget {
   readonly originalHref: string;
   readonly originalText: string;
   readonly originalTitle: string | null;
-  readonly originalBlockHTML: string;
+  readonly originalBlockHTML?: string;
   /** Occurrence contract aliases used by generic safety tooling. */
   readonly oldPath: string;
   readonly oldValue: string;
