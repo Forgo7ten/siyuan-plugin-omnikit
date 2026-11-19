@@ -22,7 +22,7 @@ export interface AdaptiveQualitySearchOptions {
   qualityTolerance?: number;
   maxEvaluations?: number;
   signal?: AbortSignal;
-  encode: (quality: number, signal?: AbortSignal) => Promise<Blob>;
+  encode: (quality: number, signal?: AbortSignal) => Promise<Blob | { kind: "skipped"; reason: string }>;
   evaluate: (candidate: Blob, signal?: AbortSignal) => Promise<number>;
   onProgress?: (progress: QualitySearchProgress) => void;
 }
@@ -39,7 +39,19 @@ export type AdaptiveQualitySearchResult =
       bestCandidate: QualityCandidate;
       candidates: QualityCandidate[];
       converged: false;
+    }
+  | {
+      status: "skipped";
+      reason: string;
+      candidates: QualityCandidate[];
     };
+
+class SearchSkippedSignal extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+    this.name = "SearchSkippedSignal";
+  }
+}
 
 interface BracketPoint extends QualityCandidate {}
 
@@ -94,17 +106,24 @@ export async function adaptiveQualitySearch(
   const candidates: QualityCandidate[] = [];
   let method: QualitySearchProgress["method"] = "initial";
 
+  const roundQuality = (requested: number): number =>
+    Math.round(clamp(requested, minQuality, maxQuality) * 10000) / 10000;
+
   const probe = async (requestedQuality: number): Promise<QualityCandidate> => {
     abortIfNeeded(options.signal);
-    const quality = Math.round(clamp(requestedQuality, minQuality, maxQuality) * 10000) / 10000;
+    const quality = roundQuality(requestedQuality);
     const cached = cache.get(quality);
     if (cached) return cached;
     if (candidates.length >= maxEvaluations) {
       throw new Error("Quality search evaluation limit reached");
     }
 
-    const blob = await options.encode(quality, options.signal);
+    const encoded = await options.encode(quality, options.signal);
     abortIfNeeded(options.signal);
+    if (encoded && typeof encoded === "object" && "kind" in encoded && encoded.kind === "skipped") {
+      throw new SearchSkippedSignal(encoded.reason);
+    }
+    const blob = encoded as Blob;
     if (!(blob instanceof Blob) || blob.size <= 0) {
       throw new Error("Encoder returned an empty candidate");
     }
@@ -129,71 +148,91 @@ export async function adaptiveQualitySearch(
     return candidate;
   };
 
-  const initial = await probe(clamp(options.initialQuality, minQuality, maxQuality));
-  let low: BracketPoint;
-  let high: BracketPoint;
+  try {
+    const initial = await probe(clamp(options.initialQuality, minQuality, maxQuality));
+    let low: BracketPoint;
+    let high: BracketPoint;
 
-  if (initial.similarity >= target) {
-    method = "endpoint";
-    const minimum = await probe(minQuality);
-    if (minimum.similarity >= target) {
-      const qualifying = candidates.filter(c => c.similarity >= target);
-      const best = qualifying.reduce(betterCandidate);
-      return { status: "met", candidate: best, candidates, converged: true };
+    if (initial.similarity >= target) {
+      method = "endpoint";
+      const minimum = await probe(minQuality);
+      if (minimum.similarity >= target) {
+        const qualifying = candidates.filter(c => c.similarity >= target);
+        const best = qualifying.reduce(betterCandidate);
+        return { status: "met", candidate: best, candidates, converged: true };
+      }
+      low = minimum;
+      high = initial;
+    } else {
+      method = "endpoint";
+      const maximum = await probe(maxQuality);
+      if (maximum.similarity < target) {
+        const bestCandidate = candidates.reduce((a, b) => (a.similarity >= b.similarity ? a : b));
+        return { status: "unreachable", bestCandidate, candidates, converged: false };
+      }
+      low = initial;
+      high = maximum;
     }
-    low = minimum;
-    high = initial;
-  } else {
-    method = "endpoint";
-    const maximum = await probe(maxQuality);
-    if (maximum.similarity < target) {
+
+    let forceBisection = false;
+    while (candidates.length < maxEvaluations && high.quality - low.quality > tolerance) {
+      abortIfNeeded(options.signal);
+      const range = high.quality - low.quality;
+      const denominator = high.similarity - low.similarity;
+      const secantQuality =
+        denominator > 1e-9
+          ? low.quality + ((target - low.similarity) * range) / denominator
+          : Number.NaN;
+      const margin = range * 0.1;
+      const safeSecant =
+        Number.isFinite(secantQuality) &&
+        secantQuality > low.quality + margin &&
+        secantQuality < high.quality - margin;
+
+      let nextQuality = !forceBisection && safeSecant ? secantQuality : (low.quality + high.quality) / 2;
+      method = !forceBisection && safeSecant ? "secant" : "bisection";
+      forceBisection = false;
+
+      let roundedNext = roundQuality(nextQuality);
+      if (roundedNext <= low.quality || roundedNext >= high.quality) {
+        method = "bisection";
+        nextQuality = (low.quality + high.quality) / 2;
+        roundedNext = roundQuality(nextQuality);
+        if (roundedNext <= low.quality || roundedNext >= high.quality) {
+          break;
+        }
+      }
+
+      const next = await probe(roundedNext);
+      if (next.quality <= low.quality || next.quality >= high.quality) {
+        break;
+      }
+      const nonMonotonic =
+        next.similarity < low.similarity - 0.002 || next.similarity > high.similarity + 0.002;
+      if (next.similarity >= target) {
+        high = next;
+      } else {
+        low = next;
+      }
+      if (nonMonotonic) forceBisection = true;
+    }
+
+    const qualifying = candidates.filter(c => c.similarity >= target);
+    if (qualifying.length === 0) {
       const bestCandidate = candidates.reduce((a, b) => (a.similarity >= b.similarity ? a : b));
       return { status: "unreachable", bestCandidate, candidates, converged: false };
     }
-    low = initial;
-    high = maximum;
-  }
-
-  let forceBisection = false;
-  while (candidates.length < maxEvaluations && high.quality - low.quality > tolerance) {
-    abortIfNeeded(options.signal);
-    const range = high.quality - low.quality;
-    const denominator = high.similarity - low.similarity;
-    const secantQuality =
-      denominator > 1e-9
-        ? low.quality + ((target - low.similarity) * range) / denominator
-        : Number.NaN;
-    const margin = range * 0.1;
-    const safeSecant =
-      Number.isFinite(secantQuality) &&
-      secantQuality > low.quality + margin &&
-      secantQuality < high.quality - margin;
-
-    const nextQuality = !forceBisection && safeSecant ? secantQuality : (low.quality + high.quality) / 2;
-    method = !forceBisection && safeSecant ? "secant" : "bisection";
-    forceBisection = false;
-
-    const next = await probe(nextQuality);
-    const nonMonotonic =
-      next.similarity < low.similarity - 0.002 || next.similarity > high.similarity + 0.002;
-    if (next.similarity >= target) {
-      high = next;
-    } else {
-      low = next;
+    const best = qualifying.reduce(betterCandidate);
+    return {
+      status: "met",
+      candidate: best,
+      candidates,
+      converged: high.quality - low.quality <= tolerance,
+    };
+  } catch (error) {
+    if (error instanceof SearchSkippedSignal) {
+      return { status: "skipped", reason: error.reason, candidates };
     }
-    if (nonMonotonic) forceBisection = true;
+    throw error;
   }
-
-  const qualifying = candidates.filter(c => c.similarity >= target);
-  if (qualifying.length === 0) {
-    const bestCandidate = candidates.reduce((a, b) => (a.similarity >= b.similarity ? a : b));
-    return { status: "unreachable", bestCandidate, candidates, converged: false };
-  }
-  const best = qualifying.reduce(betterCandidate);
-  return {
-    status: "met",
-    candidate: best,
-    candidates,
-    converged: high.quality - low.quality <= tolerance,
-  };
 }

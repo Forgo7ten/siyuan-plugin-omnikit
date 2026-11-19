@@ -6,6 +6,19 @@ export interface StoreCodec<T> {
 }
 export type StoreListener<T> = (next: Readonly<T>) => void;
 const READ_TIMEOUT_MS = 30_000;
+const SAVE_TIMEOUT_MS = 30_000;
+
+async function withTimeout<R>(operation: Promise<R>, timeoutMs: number, message: string): Promise<R> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -43,8 +56,6 @@ export class JsonStore<T> {
   }
 
   get needsRecovery(): boolean { return !!this.readOnlyReason; }
-  get readOnly(): boolean { return !!this.readOnlyReason; }
-  get isReadOnly(): boolean { return !!this.readOnlyReason; }
   get error(): string | undefined { return this.readOnlyReason; }
   snapshot(): T { return clone(this.value); }
 
@@ -121,7 +132,11 @@ export class JsonStore<T> {
   }
 
   private async saveConfirmed(path: string, data: unknown, action: string): Promise<void> {
-    const response = await this.plugin.saveData(path, data);
+    const response = await withTimeout(
+      Promise.resolve(this.plugin.saveData(path, data)),
+      SAVE_TIMEOUT_MS,
+      `Storage save timed out to ${action} ${this.file}`,
+    );
     if (
       response &&
       typeof response === "object" &&
@@ -197,11 +212,21 @@ export class JsonStore<T> {
         (ioError instanceof TypeError || (ioError as Error)?.message?.includes("Invalid URL")) &&
         typeof (this.plugin as any).loadData === "function"
       ) {
-        const legacy = await this.plugin.loadData(this.file);
-        if (legacy === "" || legacy == null) {
-          isMissing = true;
-        } else {
-          raw = legacy;
+        try {
+          const legacy = await withTimeout(
+            Promise.resolve(this.plugin.loadData(this.file)),
+            READ_TIMEOUT_MS,
+            "Storage read timed out",
+          );
+          if (legacy === "" || legacy == null) {
+            isMissing = true;
+          } else {
+            raw = legacy;
+          }
+        } catch (fallbackError) {
+          this.readOnlyReason = `Unable to read settings: ${String(fallbackError)}`;
+          this.emit();
+          throw fallbackError;
         }
       } else {
         this.readOnlyReason = `Unable to read settings: ${String(ioError)}`;

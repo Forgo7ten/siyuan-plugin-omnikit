@@ -22,7 +22,7 @@ export interface FeatureRegistration<T> {
   settingsView: Component<{
     store: JsonStore<T>;
     runtimePhase: string;
-    t: (key: string) => string;
+    t: (key: string, values?: Record<string, string | number>) => string;
   }>;
   /** Optional feature-owned content for the shared OmniKit dock container. */
   dockView?: Component<{ context: FeatureContext; t: (key: string, values?: Record<string, string | number>) => string }>;

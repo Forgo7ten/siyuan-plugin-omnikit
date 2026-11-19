@@ -63,3 +63,16 @@ test("settings navigation features title uses dedicated i18n key in both locales
   assert.match(root, /<div class="nav-section-title">\{t\("nav\.features"\)\}<\/div>/);
   assert.doesNotMatch(root, /\{t\("status"\)\s*\?\s*"功能模块"\s*:\s*"Features"\}/);
 });
+
+test("SettingsManager load settles all stores and reloadAfterExternalChange preserves core-first order", async () => {
+  const p = plugin();
+  const settings = new SettingsManager(p, registrations);
+  await settings.load();
+
+  await p.saveData("feature-text-tools.json", { schemaVersion: 1, replacement: "a" });
+  await p.saveData("omnikit-core.json", { schemaVersion: 1, general: { debugLog: true, userAgent: "" }, featureStates: {} });
+  await p.saveData("feature-image-compressor.json", { schemaVersion: 1, globalEnabled: true, allowlist: {} });
+
+  const changed = await settings.reloadAfterExternalChange();
+  assert.deepEqual(changed, ["core", "imageCompressor", "textTools"]);
+});

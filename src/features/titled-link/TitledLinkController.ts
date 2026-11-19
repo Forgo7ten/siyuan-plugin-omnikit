@@ -31,6 +31,12 @@ interface BatchCandidate extends GroupedLinkTitleUpdate {
   fallback: boolean;
 }
 
+interface PreparedBatchItem {
+  readonly index: number;
+  readonly target: LinkOccurrenceTarget;
+  readonly token: number;
+}
+
 interface BatchOutcome {
   result: LinkActionResult;
   candidate?: BatchCandidate;
@@ -135,7 +141,35 @@ export class TitledLinkController {
       return;
     }
     this.context.logger?.debug?.("批量提取链接标题：找到候选链接", { count: links.length });
-    const outcomes = await mapWithConcurrency(links, 3, link => this.prepareBatch(link, protyle));
+    const outcomes: BatchOutcome[] = new Array(links.length);
+    const prepared: PreparedBatchItem[] = [];
+    links.forEach((link, index) => {
+      const href = link?.getAttribute?.("data-href");
+      const text = link?.textContent;
+      this.context.logger?.debug?.("批量准备链接", { href, text });
+      const target = captureLinkTarget(link, protyle);
+      if (!target) {
+        const runner = resolveTitledLinkProtyle(protyle);
+        const block = link?.closest<HTMLElement>("[data-node-id]");
+        this.context.logger?.warn?.("批量准备链接失败：无法捕获链接目标", {
+          href,
+          text,
+          hasBlock: Boolean(block),
+          blockID: block?.getAttribute?.("data-node-id") ?? undefined,
+          hasUpdateTransaction: typeof runner?.updateTransactionElement === "function",
+        });
+        outcomes[index] = { result: "failed" };
+        return;
+      }
+      const token = (this.tokens.get(link) ?? 0) + 1;
+      this.tokens.set(link, token);
+      prepared.push({ index, target, token });
+    });
+
+    const fetchedOutcomes = await mapWithConcurrency(prepared, 3, item => this.prepareBatch(item));
+    fetchedOutcomes.forEach((outcome, fetchedIndex) => {
+      outcomes[prepared[fetchedIndex].index] = outcome;
+    });
     if (!this.scope.active) return;
     const results = outcomes.map(outcome => outcome.result);
     const groups = new Map<string, Array<{ index: number; candidate: BatchCandidate }>>();
@@ -154,7 +188,11 @@ export class TitledLinkController {
 
     for (const group of groups.values()) {
       if (!this.scope.active) return;
-      const updates = group.map(({ candidate }) => ({ target: candidate.target, title: candidate.title }));
+      const updates = group.map(({ candidate }) => ({
+        target: candidate.target,
+        title: candidate.title,
+        isCurrent: () => this.current(candidate.target, candidate.token),
+      }));
       this.context.logger?.debug?.("开始批量提交块内链接标题写入", {
         blockID: group[0]?.candidate?.target?.blockID,
         count: updates.length,
@@ -196,7 +234,7 @@ export class TitledLinkController {
     return this.context.settings.getFeature<TitledLinkConfig>("titled-link");
   }
 
-  private async runLink(link: HTMLElement, protyle: any, mode: "auto" | "manual" | "batch"): Promise<LinkActionResult> {
+  private async runLink(link: HTMLElement, protyle: any, mode: "auto" | "manual"): Promise<LinkActionResult> {
     if (!this.scope.active) return "aborted";
     const href = link?.getAttribute?.("data-href");
     const text = link?.textContent;
@@ -270,6 +308,7 @@ export class TitledLinkController {
         signal: this.scope.signal,
         kernel: this.kernel,
         isComposing: this.options.isComposing,
+        isCurrent: () => this.current(target, token),
       });
       this.context.logger?.debug?.("链接标题写入完成", {
         href: target.originalHref,
@@ -277,7 +316,7 @@ export class TitledLinkController {
         title: fetched.title,
       });
       if (!this.current(target, token)) return this.scope.active ? "superseded" : "aborted";
-      if (mode === "manual" && (result === "updated" || result === "unchanged")) {
+      if (mode === "manual" && !fetched.fallback && (result === "updated" || result === "unchanged")) {
         this.cache.refresh(target.originalHref, fetched.title);
       }
       if (mode === "manual") this.notify(this.t(result === "updated"
@@ -295,30 +334,11 @@ export class TitledLinkController {
     }
   }
 
-  private async prepareBatch(link: HTMLElement, protyle: any): Promise<BatchOutcome> {
-    if (!this.scope.active) return { result: "aborted" };
-    const href = link?.getAttribute?.("data-href");
-    const text = link?.textContent;
-    this.context.logger?.debug?.("批量准备链接", { href, text });
-    const target = captureLinkTarget(link, protyle);
-    if (!target) {
-      const runner = resolveTitledLinkProtyle(protyle);
-      const block = link?.closest<HTMLElement>("[data-node-id]");
-      this.context.logger?.warn?.("批量准备链接失败：无法捕获链接目标", {
-        href,
-        text,
-        hasBlock: Boolean(block),
-        blockID: block?.getAttribute?.("data-node-id") ?? undefined,
-        hasUpdateTransaction: typeof runner?.updateTransactionElement === "function",
-      });
-      return { result: "failed" };
+  private async prepareBatch(item: PreparedBatchItem): Promise<BatchOutcome> {
+    const { target, token } = item;
+    if (!this.current(target, token)) {
+      return { result: this.scope.active ? "superseded" : "aborted" };
     }
-    if (!isHttpUrl(target.originalHref)) {
-      this.context.logger?.debug?.("批量准备链接跳过：非 HTTP(S) 链接", { href: target.originalHref });
-      return { result: "failed" };
-    }
-    const token = (this.tokens.get(link) ?? 0) + 1;
-    this.tokens.set(link, token);
     try {
       this.context.logger?.debug?.("批量抓取链接标题", { href: target.originalHref, token });
       const fetched = await this.titleFor(target, "batch");
@@ -360,7 +380,7 @@ export class TitledLinkController {
     }
     const generation = this.cache.captureGeneration(url);
     const request = this.fetchAndNormalize(url, config).then(result => {
-      if (mode === "auto" && result.status === "success" && this.scope.active) {
+      if (mode === "auto" && result.status === "success" && !result.fallback && this.scope.active) {
         this.cache.set(url, result.title, generation);
       }
       return result;

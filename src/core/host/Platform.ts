@@ -63,8 +63,7 @@ export function getFrontendKind(frontend?: string): FrontendKind {
   const reported = frontend ?? safeResolve();
   if (reported === "mobile" || reported === "browser-mobile") return "mobile";
   if (reported === "desktop" || reported === "desktop-window" || reported === "browser-desktop") return "desktop";
-  // Older builds may not expose getFrontend() to plugin code; the body class and UA remain
-  // fallbacks, but a reported browser-desktop value never reaches this branch.
+  // Fall back to DOM body class and navigator user agent when no reported frontend matches.
   if (typeof document !== "undefined" && document.body.classList.contains("body--mobile")) return "mobile";
   if (typeof navigator !== "undefined" && /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent)) return "mobile";
   return "unknown";
@@ -72,11 +71,6 @@ export function getFrontendKind(frontend?: string): FrontendKind {
 
 export function isMobileFrontend(frontend?: string): boolean {
   return getFrontendKind(frontend) === "mobile";
-}
-
-/** Treat unknown browser hosts as desktop-class for conservative worker concurrency. */
-export function isDesktopFrontend(frontend?: string): boolean {
-  return getFrontendKind(frontend) !== "mobile";
 }
 
 function safeResolve(): string | undefined {

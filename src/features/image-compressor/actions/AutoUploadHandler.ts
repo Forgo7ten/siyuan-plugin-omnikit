@@ -79,42 +79,43 @@ export function completedUploadPaths(result: UploadSuccess): string[] {
 export function registerAutoUpload(
   plugin: Plugin,
   scope: FeatureScope,
-  shouldCompress: (rootID: string) => boolean | Promise<boolean>,
+  shouldCompress: (rootID: string) => boolean,
   services: ImageProcessingServices,
   logger: DebugLogger,
   onNotice?: (notice: AutoUploadNotice) => void,
 ): void {
   const listener = (event: CustomEvent<UploadDetail>) => {
-    const detail = event.detail;
-    const rootID = detail?.protyle?.block?.rootID;
-    const notebook = detail?.protyle?.notebookId ?? detail?.protyle?.block?.box;
-    if (!scope.active || detail?.target !== "editor" || !rootID || !notebook ||
-        !detail.requestId || typeof detail.onComplete !== "function") return;
-
-    // Synchronous authorization pre-check
-    const auth = shouldCompress(rootID);
-    if (auth === false) return;
-
-    // Candidate image pre-screening
-    const config = services.config();
-    if (!hasCompressibleInput(detail.input, config)) return;
-
-    logger.debug?.("收到 before-upload-assets 事件", {
-      requestId: detail.requestId, target: detail.target, rootID, notebook,
-    });
-
-    const editor = detail.protyle?.element;
-    const observed: InsertedImage[] = [];
-    const observer = editor && typeof MutationObserver !== "undefined"
-      ? new MutationObserver(records => collectNewImages(records, rootID, notebook, services.origin, observed))
-      : undefined;
-    observer?.observe(editor!, {
-      subtree: true, childList: true, attributes: true, attributeFilter: ["src", "data-src"],
-    });
-    const releaseObserver = scope.own(() => observer?.disconnect());
-
-    let completed = false;
+    let observer: MutationObserver | undefined;
+    let releaseObserver: (() => void) | undefined;
     try {
+      const detail = event?.detail;
+      const rootID = detail?.protyle?.block?.rootID;
+      const notebook = detail?.protyle?.notebookId ?? detail?.protyle?.block?.box;
+      if (!scope.active || detail?.target !== "editor" || !rootID || !notebook ||
+          !detail.requestId || typeof detail.onComplete !== "function") return;
+
+      // Synchronous authorization pre-check
+      if (!shouldCompress(rootID)) return;
+
+      // Candidate image pre-screening
+      const config = services.config();
+      if (!hasCompressibleInput(detail.input, config)) return;
+
+      logger.debug?.("收到 before-upload-assets 事件", {
+        requestId: detail.requestId, target: detail.target, rootID, notebook,
+      });
+
+      const editor = detail.protyle?.element;
+      const observed: InsertedImage[] = [];
+      observer = editor && typeof MutationObserver !== "undefined"
+        ? new MutationObserver(records => collectNewImages(records, rootID, notebook, services.origin, observed))
+        : undefined;
+      observer?.observe(editor!, {
+        subtree: true, childList: true, attributes: true, attributeFilter: ["src", "data-src"],
+      });
+      releaseObserver = scope.own(() => observer?.disconnect());
+
+      let completed = false;
       detail.onComplete(result => {
         if (completed || result?.requestId !== detail.requestId) return;
         completed = true;
@@ -122,19 +123,25 @@ export function registerAutoUpload(
           requestId: result?.requestId, status: result?.status,
         });
         if (!scope.active || !["success", "partial"].includes(result.status)) {
-          releaseObserver();
+          releaseObserver?.();
           return;
         }
         // onComplete may run before editor DOM mutation and kernel persistence. Keep the
         // observer briefly and retry only the exact successful paths from this request.
         queueMicrotask(() => {
           void processCompletedUpload(result, rootID, notebook, observed, scope, shouldCompress,
-            services, logger, editor, onNotice).finally(releaseObserver);
+            services, logger, editor, onNotice).finally(() => releaseObserver?.());
         });
       });
     } catch (error) {
-      releaseObserver();
-      logger.warn("无法注册原生图片上传完成回调", { requestId: detail.requestId, error });
+      try {
+        if (releaseObserver) releaseObserver();
+        else observer?.disconnect();
+      } catch {
+        // Ignore cleanup failure so native upload is never interrupted
+      }
+      logger.warn("处理原生图片上传前置监听失败", { error });
+      return;
     }
   };
 
@@ -195,7 +202,7 @@ async function processCompletedUpload(
   notebook: string,
   observed: InsertedImage[],
   scope: FeatureScope,
-  shouldCompress: (rootID: string) => boolean | Promise<boolean>,
+  shouldCompress: (rootID: string) => boolean,
   services: ImageProcessingServices,
   logger: DebugLogger,
   editor?: HTMLElement,
@@ -212,8 +219,7 @@ async function processCompletedUpload(
   let successful = 0, skipped = 0, failed = 0;
   let lastSkipReason: "noBenefit" | "notAuthorized" | "conflict" | "notMatched" | "other" = "other";
 
-  const postAuth = shouldCompress(rootID);
-  const authorized = typeof postAuth === "boolean" ? postAuth : await postAuth;
+  const authorized = shouldCompress(rootID);
   logger.debug?.("检查自动压缩授权", { rootID, authorized });
   if (!authorized) {
     logger.debug?.("当前文档未在自动压缩授权列表中，跳过处理", { rootID, paths });
@@ -296,7 +302,9 @@ async function processCompletedUpload(
         successful,
         skipped,
         failed,
-        singleReason: total === 1 ? (successful === 1 ? "success" : failed === 1 ? "failed" : lastSkipReason) : undefined,
+        singleReason: total === 1
+          ? (successful === 1 ? "success" : failed === 1 ? "failed" : lastSkipReason)
+          : undefined,
       };
       onNotice?.(notice);
     } catch (error) {

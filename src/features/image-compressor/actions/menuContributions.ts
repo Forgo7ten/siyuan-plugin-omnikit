@@ -70,6 +70,16 @@ export function imageMenuContributions(deps: ImageMenuDeps): ImageMenuContributi
       provider: ctx => (ctx.rootID ? toggle(ctx) : []),
     },
     {
+      location: "doc-tree",
+      id: "compress-document",
+      provider: ctx => (ctx.rootID ? [{
+        id: "compress-document",
+        label: deps.t("menu.compressDocument"),
+        icon: deps.icon,
+        run: () => deps.runBatch(ctx),
+      }] : []),
+    },
+    {
       location: "topbar",
       id: "toggle-document",
       provider: ctx => (ctx.rootID ? toggle(ctx) : []),

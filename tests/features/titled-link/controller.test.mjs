@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { FeatureScope } from "../../../src/core/framework/FeatureScope.ts";
+import { TitleCache } from "../../../src/features/titled-link/services/title-cache.ts";
 import {
   TitledLinkController, isAutomaticLinkCandidate, isHttpUrl, mapWithConcurrency,
 } from "../../../src/features/titled-link/TitledLinkController.ts";
@@ -358,4 +359,270 @@ test("manual execution notifies failed when URL is not HTTP(S)", async () => {
   assert.equal(result, "failed");
   assert.deepEqual(notices, ["titledLink.failed"]);
   scope.dispose();
+});
+
+test("batch captures snapshots synchronously before concurrency queue so >3 links tolerate concurrent typing", async () => withBatchDOMParser(async () => {
+  const links = Array.from({ length: 5 }, (_, index) => new BatchLink(`https://example.com/${index}`));
+  let prefix = "";
+  const block = {
+    id: "block",
+    links,
+    isConnected: true,
+    getAttribute(name) { return name === "data-node-id" ? this.id : null; },
+    querySelectorAll(selector) { return selector === 'span[data-type~="a"]' ? this.links : []; },
+    querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; },
+    get outerHTML() { return `<div data-node-id="${this.id}">${prefix}${this.links.map(l => l.outerHTML).join("")}</div>`; },
+  };
+  for (const link of links) link.block = block;
+
+  const transactions = [];
+  const protyle = {
+    block: { rootID: "root", box: "notebook" },
+    notebookId: "notebook",
+    updateTransactionElement(element, oldHTML) { transactions.push({ element, oldHTML, newHTML: element.outerHTML }); },
+  };
+  const deferred = [];
+  const notices = [];
+  const scope = new FeatureScope();
+  const controller = new TitledLinkController({
+    settings: {
+      getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, maxTitleLength: 80, fallbackToHostname: true }),
+      getUserAgent: () => "UA",
+    },
+    logger: { warn() {}, debug() {} },
+  }, scope, {
+    frontend: () => "desktop",
+    notify: message => notices.push(message),
+    translate: key => key,
+    fetchImpl: url => new Promise(resolve => deferred.push({ url, resolve })),
+    kernel: { post: async () => ({ data: { rootID: "root", box: "notebook" } }) },
+  });
+
+  const batchPromise = controller.runBatch([block], protyle);
+  for (let attempt = 0; attempt < 20 && deferred.length < 3; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 2));
+  }
+  assert.equal(deferred.length, 3);
+
+  // User types in the block while links 4 and 5 are still waiting in the concurrency queue
+  prefix = "user typed ";
+  for (let i = 0; i < 3; i++) {
+    deferred[i].resolve(htmlResponse(`Title ${i}`));
+  }
+  for (let attempt = 0; attempt < 20 && deferred.length < 5; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 2));
+  }
+  assert.equal(deferred.length, 5);
+  deferred[3].resolve(htmlResponse("Title 3"));
+  deferred[4].resolve(htmlResponse("Title 4"));
+
+  await batchPromise;
+  assert.equal(transactions.length, 1);
+  assert.match(transactions[0].oldHTML, /user typed /);
+  for (let i = 0; i < 5; i++) {
+    assert.equal(links[i].textContent, `Title ${i}`);
+  }
+  assert.deepEqual(notices, ["titledLink.batchSummary"]);
+  scope.dispose();
+}));
+
+test("fallback hostname results are never written to TitleCache in manual or auto mode", async () => {
+  const prevSiyuan = globalThis.siyuan;
+  const prevGetSelection = globalThis.getSelection;
+  const prevElement = globalThis.Element;
+  try {
+    // 1. Manual fallback does not write to cache
+    {
+      const { link, protyle, url } = fixture();
+      const cache = new TitleCache();
+      const notices = [];
+      const scope = new FeatureScope();
+      const controller = new TitledLinkController({
+        settings: {
+          getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, maxTitleLength: 80, fallbackToHostname: true }),
+          getUserAgent: () => "UA",
+        },
+        logger: { warn() {}, debug() {} },
+      }, scope, {
+        frontend: () => "desktop",
+        notify: message => notices.push(message),
+        translate: key => key,
+        cache,
+        fetchImpl: async () => { throw new Error("network down"); },
+        kernel: { post: async () => ({ data: {} }) },
+      });
+
+      const result = await controller.runManual(link, protyle);
+      assert.equal(result, "updated");
+      assert.equal(link.textContent, "example.com");
+      assert.deepEqual(notices, ["titledLink.fallbackUsed"]);
+      assert.equal(cache.get(url), undefined);
+      assert.equal(cache.size, 0);
+      scope.dispose();
+    }
+
+    // 2. Auto fallback does not write to cache, allowing subsequent paste to fetch real title
+    {
+      class MockElement {}
+      globalThis.Element = MockElement;
+      globalThis.siyuan = { config: { editor: { pasteURLAutoConvert: true } } };
+
+      const url = "https://example.com/auto-fallback";
+      const anchor = new MockElement();
+      const links = [];
+      const block = {
+        isConnected: true,
+        outerHTML: '<div data-node-id="b1"></div>',
+        getAttribute: name => (name === "data-node-id" ? "b1" : null),
+        querySelectorAll: selector => (selector === 'span[data-type~="a"]' ? links : []),
+      };
+      anchor.closest = selector => (selector === "[data-node-id]" ? block : null);
+      globalThis.getSelection = () => ({ isCollapsed: true, anchorNode: anchor });
+
+      const link = {
+        isConnected: true,
+        textContent: url,
+        getAttribute: name => ({ "data-type": "a", "data-href": url }[name] ?? null),
+        closest: selector => (selector === "[data-node-id]" ? block : null),
+      };
+      const protyle = {
+        block: { rootID: "root", box: "notebook" },
+        notebookId: "notebook",
+        wysiwyg: {
+          element: {
+            isConnected: true,
+            contains: el => el === block,
+            querySelector: selector => (selector === '[data-node-id="b1"]' ? block : null),
+          },
+        },
+        updateTransactionElement() {},
+      };
+
+      const cache = new TitleCache();
+      let shouldFail = true;
+      const scope = new FeatureScope();
+      const controller = new TitledLinkController({
+        settings: {
+          getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, maxTitleLength: 80, fallbackToHostname: true }),
+          getUserAgent: () => "UA",
+        },
+        logger: { warn() {}, debug() {} },
+      }, scope, {
+        frontend: () => "desktop",
+        notify: () => {},
+        translate: key => key,
+        cache,
+        fetchImpl: async () => {
+          if (shouldFail) throw new Error("temporary failure");
+          return htmlResponse("Recovered Real Title");
+        },
+        kernel: { post: async () => ({ data: {} }) },
+      });
+
+      controller.scheduleAutoPaste({ textPlain: url, protyle });
+      links.push(link);
+      await new Promise(resolve => setTimeout(resolve, 230));
+      assert.equal(link.textContent, "example.com");
+      assert.equal(cache.get(url), undefined);
+      assert.equal(cache.size, 0);
+
+      // Reset link text and paste again when network recovers
+      shouldFail = false;
+      const secondLink = {
+        isConnected: true,
+        textContent: url,
+        getAttribute: name => ({ "data-type": "a", "data-href": url }[name] ?? null),
+        closest: selector => (selector === "[data-node-id]" ? block : null),
+      };
+      controller.scheduleAutoPaste({ textPlain: url, protyle });
+      links.push(secondLink);
+      await new Promise(resolve => setTimeout(resolve, 230));
+      assert.equal(secondLink.textContent, "Recovered Real Title");
+      assert.equal(cache.get(url), "Recovered Real Title");
+      scope.dispose();
+    }
+  } finally {
+    globalThis.siyuan = prevSiyuan;
+    globalThis.getSelection = prevGetSelection;
+    globalThis.Element = prevElement;
+  }
+});
+
+test("manual request during IME wait supersedes queued batch write inside write lease", async () => {
+  const prevSiyuan = globalThis.siyuan;
+  const prevElement = globalThis.Element;
+  try {
+    globalThis.Element = class {};
+    globalThis.siyuan = { config: { editor: { markdown: { autoSpace: false } } } };
+
+    let link;
+    const links = [];
+    const block = {
+      getAttribute: name => (name === "data-node-id" ? "20260101000000-blockime" : null),
+      querySelectorAll: selector => (selector === 'span[data-type~="a"]' ? links : []),
+      querySelector: () => null,
+      get outerHTML() { return `<div data-node-id="20260101000000-blockime">${link.textContent}</div>`; },
+    };
+    const url = "https://example.com/ime-race";
+    link = {
+      isConnected: true,
+      textContent: url,
+      getAttribute: name => ({ "data-type": "a", "data-href": url }[name] ?? null),
+      setAttribute() {},
+      removeAttribute() {},
+      closest: selector => (selector === "[data-node-id]" ? block : null),
+    };
+    links.push(link);
+
+    const transactions = [];
+    const protyle = {
+      block: { rootID: "root", box: "notebook" },
+      notebookId: "notebook",
+      updateTransactionElement(_el, oldHTML) { transactions.push({ oldHTML, text: link.textContent }); },
+    };
+
+    let composing = false;
+    let manualStarted = false;
+    const scope = new FeatureScope();
+    const notices = [];
+    const controller = new TitledLinkController({
+      settings: {
+        getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, maxTitleLength: 80, fallbackToHostname: true }),
+        getUserAgent: () => "UA",
+      },
+      logger: { warn() {}, debug() {} },
+    }, scope, {
+      frontend: () => "desktop",
+      notify: msg => notices.push(msg),
+      translate: (key, values) => values ? `${key}:${JSON.stringify(values)}` : key,
+      isComposing: () => composing,
+      fetchImpl: async () => {
+        if (!manualStarted) {
+          composing = true;
+          return htmlResponse("Old Batch Title");
+        }
+        return htmlResponse("Fresh Manual Title");
+      },
+      kernel: { post: async () => ({ data: { rootID: "root", box: "notebook" } }) },
+    });
+
+    const batchPromise = controller.runBatch([block], protyle);
+    await new Promise(resolve => setTimeout(resolve, 15));
+    manualStarted = true;
+    const manualPromise = controller.runManual(link, protyle);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    composing = false;
+    const [, manualResult] = await Promise.all([batchPromise, manualPromise]);
+
+    assert.equal(manualResult, "updated");
+    assert.equal(link.textContent, "Fresh Manual Title");
+    assert.equal(transactions.length, 1);
+    assert.equal(transactions[0].text, "Fresh Manual Title");
+    assert.ok(notices.includes('titledLink.batchSummary:{"total":1,"updated":0,"skipped":1}'));
+    assert.ok(notices.includes("titledLink.updated"));
+    scope.dispose();
+  } finally {
+    globalThis.siyuan = prevSiyuan;
+    globalThis.Element = prevElement;
+  }
 });

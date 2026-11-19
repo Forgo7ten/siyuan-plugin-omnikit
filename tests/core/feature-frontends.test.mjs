@@ -98,7 +98,7 @@ test("BaseFeature status reports unsupported on incompatible frontend and blocks
   assert.equal(feature.enabled, false);
 
   await assert.rejects(
-    async () => feature.activate({ plugin: {}, settings: {}, menus: {}, compatibility: {}, logger: noopLogger }),
+    async () => feature.activate({ plugin: {}, settings: {}, menus: {}, logger: noopLogger }),
     /unsupported frontend/
   );
   assert.equal(enabledCalled, false);

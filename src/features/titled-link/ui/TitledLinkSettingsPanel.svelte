@@ -7,7 +7,7 @@
   interface Props {
     store: JsonStore<TitledLinkConfig>;
     runtimePhase: string;
-    t: (key: string) => string;
+    t: (key: string, values?: Record<string, string | number>) => string;
   }
 
   let { store, runtimePhase, t }: Props = $props();
@@ -92,7 +92,7 @@
       </button>
     </div>
   {/if}
-  {#if runtimePhase !== "enabled"}<div class="notice">{t("settings.disabledButEditable")}</div>{/if}
+  {#if runtimePhase !== "enabled" && runtimePhase !== "configured"}<div class="notice">{t("settings.disabledButEditable")}</div>{/if}
 
   <fieldset disabled={busy || readOnly}>
     <label class="setting-row">
@@ -130,7 +130,7 @@
 
   <footer class="save-bar">
     <button type="button" class="b3-button b3-button--outline" disabled={busy || readOnly} onclick={resetDraft}>
-      {t("settings.resetDefaults")}
+      {t("settings.resetDraft")}
     </button>
     <button type="submit" class="b3-button b3-button--primary" disabled={busy || readOnly || conflict || !dirty}>
       {busy ? t("settings.saving") : t("settings.save")}

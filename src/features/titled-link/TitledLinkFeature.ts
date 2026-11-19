@@ -6,8 +6,7 @@ import type { MenuContext } from "../../core/feedback/MenuRegistry.ts";
 import type { SettingsManager } from "../../core/store/SettingsManager.ts";
 import { KernelClient } from "../../core/host/KernelClient.ts";
 import { translate } from "../../i18n/translate.ts";
-import { TitledLinkController } from "./TitledLinkController.ts";
-import { isHttpUrl } from "./TitledLinkController.ts";
+import { TitledLinkController, isHttpUrl } from "./TitledLinkController.ts";
 
 /** Host adapter for titled-link; all listeners and editor composition hooks belong to its scope. */
 export class TitledLinkFeature extends BaseFeature {
@@ -43,10 +42,9 @@ export class TitledLinkFeature extends BaseFeature {
     });
     this.controller = controller;
     scope.own(() => {
-      for (const [editor, composing] of this.composingEditors) {
+      for (const editor of this.composingEditors.keys()) {
         editor.removeEventListener("compositionstart", this.onCompositionStart);
         editor.removeEventListener("compositionend", this.onCompositionEnd);
-        if (composing) this.composingEditors.delete(editor);
       }
       this.composingEditors.clear();
       controller.clear();
@@ -55,7 +53,7 @@ export class TitledLinkFeature extends BaseFeature {
 
     const onPaste = (event: CustomEvent<any>) => {
       const detail = event.detail;
-      this.attachCompositionTracking(detail?.protyle?.element, scope);
+      this.attachCompositionTracking(detail?.protyle?.element);
       controller.scheduleAutoPaste(detail);
     };
     context.plugin.eventBus.on("paste", onPaste);
@@ -65,17 +63,19 @@ export class TitledLinkFeature extends BaseFeature {
       const detail = menu.detail;
       const link = detail?.element as HTMLElement | undefined;
       const protyle = detail?.protyle;
-      this.attachCompositionTracking(protyle?.element, scope);
+      this.attachCompositionTracking(protyle?.element);
       const isLink = link?.getAttribute?.("data-type")?.split(" ").includes("a") === true;
-      if (!link || !isLink || !protyle) {
+      const href = link?.getAttribute?.("data-href");
+      const isHttp = isHttpUrl(href ?? "");
+      if (!link || !isLink || !protyle || !isHttp) {
         context.logger?.debug("链接菜单跳过生成提取标题项", {
           hasLink: Boolean(link),
           isLink,
+          isHttp,
           hasProtyle: Boolean(protyle),
         });
         return [];
       }
-      const href = link.getAttribute?.("data-href");
       const text = link.textContent;
       context.logger?.debug("生成链接菜单项：提取链接标题", { href, text });
       return [{
@@ -94,7 +94,7 @@ export class TitledLinkFeature extends BaseFeature {
       const detail = menu.detail;
       const protyle = detail?.protyle;
       const blocks = Array.isArray(detail?.blockElements) ? detail.blockElements as HTMLElement[] : [];
-      this.attachCompositionTracking(protyle?.element, scope);
+      this.attachCompositionTracking(protyle?.element);
       const count = new Set(blocks.flatMap(block =>
         [...block.querySelectorAll<HTMLElement>('span[data-type~="a"]')])
         .filter(link => isHttpUrl(link.getAttribute("data-href") ?? ""))).size;
@@ -119,7 +119,7 @@ export class TitledLinkFeature extends BaseFeature {
     };
     context.menus.contribute(scope, this.meta.id, "blockicon", "extract-block-link-titles", onBlockMenu);
 
-    const onEditor = (event: CustomEvent<any>) => this.attachCompositionTracking(event.detail?.protyle?.element, scope);
+    const onEditor = (event: CustomEvent<any>) => this.attachCompositionTracking(event.detail?.protyle?.element);
     for (const name of ["loaded-protyle-static", "switch-protyle"] as const) {
       context.plugin.eventBus.on(name, onEditor);
       scope.own(() => context.plugin.eventBus.off(name, onEditor));
@@ -152,15 +152,10 @@ export class TitledLinkFeature extends BaseFeature {
     if (editor instanceof HTMLElement) this.composingEditors.set(editor, false);
   };
 
-  private attachCompositionTracking(editor: unknown, scope: FeatureScope): void {
+  private attachCompositionTracking(editor: unknown): void {
     if (!(editor instanceof HTMLElement) || this.composingEditors.has(editor)) return;
     this.composingEditors.set(editor, false);
     editor.addEventListener("compositionstart", this.onCompositionStart);
     editor.addEventListener("compositionend", this.onCompositionEnd);
-    scope.own(() => {
-      editor.removeEventListener("compositionstart", this.onCompositionStart);
-      editor.removeEventListener("compositionend", this.onCompositionEnd);
-      this.composingEditors.delete(editor);
-    });
   }
 }

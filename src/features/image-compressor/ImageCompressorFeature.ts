@@ -8,6 +8,7 @@ import type { Logger } from "../../core/host/Logger.ts";
 import { PageAllowlist } from "./policy/PageAllowlist.ts";
 import { isDocumentRootIdentity, type BlockIdentity } from "./policy/DocumentIdentity.ts";
 import { KernelClient } from "../../core/host/KernelClient.ts";
+import { resolveNotebookID } from "../../core/host/ProtyleAdapter.ts";
 import { NODE_ID } from "./policy/parseImageConfig.ts";
 import { TaskRegistry } from "./policy/TaskRegistry.ts";
 import { IMAGE_FEATURE_ID } from "./policy/settings.ts";
@@ -174,91 +175,73 @@ export class ImageCompressorFeature extends BaseFeature {
     scope.own(unsubscribe);
   }
 
-  private showAutoUploadNotice(ctx: FeatureContext, scope: FeatureScope, notice: AutoUploadNotice): void {
-    if (!scope.active) return;
-    if (notice.total === 1 && notice.singleReason) {
-      if (notice.singleReason === "success") {
-        showMessage(this.t(ctx, "image.autoUpload.singleSuccess"), 3000);
-      } else if (notice.singleReason === "noBenefit" || notice.singleReason === "other") {
-        showMessage(this.t(ctx, "image.autoUpload.singleNoBenefit"), 4000);
-      } else if (notice.singleReason === "notAuthorized") {
-        showMessage(this.t(ctx, "image.autoUpload.singleNotAuthorized"), 4000);
-      } else if (notice.singleReason === "conflict") {
-        showMessage(this.t(ctx, "image.autoUpload.singleConflict"), 4000);
-      } else if (notice.singleReason === "notMatched") {
-        showMessage(this.t(ctx, "image.autoUpload.singleNotMatched"), 4000);
-      } else if (notice.singleReason === "failed") {
-        showMessage(this.t(ctx, "image.autoUpload.singleFailed"), 5000, "error");
-      }
-      return;
-    }
-
-    if (notice.successful === notice.total) {
-      showMessage(this.t(ctx, "image.autoUpload.allSuccess", { count: notice.successful }), 4000);
-    } else if (notice.skipped === notice.total) {
-      showMessage(this.t(ctx, "image.autoUpload.allSkipped", { count: notice.skipped }), 4000);
-    } else {
-      const msg = this.t(ctx, "image.autoUpload.summary", {
-        successful: notice.successful,
-        skipped: notice.skipped,
-        failed: notice.failed,
-      });
-      if (notice.failed > 0) showMessage(msg, 5000, "error");
-      else showMessage(msg, 4000);
-    }
-  }
-
   /** Only a kernel-confirmed document root can be added to the allowlist. */
-  async resolveDocument(rootID: string, logger?: Logger): Promise<{
-    ok: boolean; notebookId?: string; identity?: BlockIdentity;
+  async resolveDocument(rootID: string, logger?: Logger, notebookId?: string, signal?: AbortSignal): Promise<{
+    ok: boolean; notebookId?: string; identity?: BlockIdentity; rootTitle?: string;
   }> {
     try {
-      if (!NODE_ID.test(rootID)) return { ok: false };
-      const rows = (await this.kernel.post<Array<{ id: string; type: string; box: string; rootID: string }>>("/api/query/sql", {
-        stmt: `SELECT id, type, box, root_id AS rootID FROM blocks WHERE id = '${rootID}' LIMIT 1`,
-        mode: "readonly",
-      })).data;
-      const identity = Array.isArray(rows) ? rows[0] : undefined;
+      if (!NODE_ID.test(rootID) || signal?.aborted) return { ok: false };
+      const payload = notebookId ? { id: rootID, notebook: notebookId } : { id: rootID };
+      const data = (await this.kernel.post<{
+        id?: string; type?: string; box?: string; rootID?: string; rootTitle?: string;
+      }>("/api/block/getBlockInfo", payload, signal ? { signal } : undefined)).data;
+      const identity: BlockIdentity | undefined = data
+        ? { id: data.id, type: data.type, box: data.box, rootID: data.rootID }
+        : undefined;
       const ok = isDocumentRootIdentity(identity, rootID);
       logger?.debug("文档身份校验完成", { 文档根ID: rootID, 校验通过: ok });
-      return { ok, identity, notebookId: typeof identity?.box === "string" ? identity.box : undefined };
+      return {
+        ok,
+        identity,
+        notebookId: typeof data?.box === "string" ? data.box : notebookId,
+        rootTitle: typeof data?.rootTitle === "string" && data.rootTitle.trim() ? data.rootTitle.trim() : undefined,
+      };
     } catch (error) {
-      logger?.warn("查询文档身份失败", error);
+      if (!signal?.aborted) logger?.warn("查询文档身份失败", error);
       return { ok: false };
     }
   }
 
-  async verifyDocument(rootID: string): Promise<boolean> {
-    return (await this.resolveDocument(rootID)).ok;
-  }
-
   private async toggleDocument(menu: MenuContext, ctx: FeatureContext, scope: FeatureScope): Promise<void> {
-    if (!scope.active || !menu.rootID) return;
+    if (!scope.active || scope.signal.aborted || !menu.rootID) return;
     try {
-      const verified = await this.resolveDocument(menu.rootID, ctx.logger);
-      if (!scope.active) return; // @safety Async kernel response may arrive after disable.
+      const detail = menu.detail;
+      const notebookId = resolveNotebookID(detail)
+        ?? (typeof detail?.items?.[0]?.notebookId === "string" ? detail.items[0].notebookId : undefined);
+      const verified = await this.resolveDocument(menu.rootID, ctx.logger, notebookId, scope.signal);
+      if (!scope.active || scope.signal.aborted) return; // @safety Async kernel response may arrive after disable.
       if (!verified.ok) {
         showMessage(this.t(ctx, "menu.notDocument"), 5000, "error");
         return;
       }
       let title = "";
-      try {
-        const res = await this.kernel.post<string>("/api/filetree/getFullHPathByID", { id: menu.rootID });
-        if (typeof res.data === "string" && res.data.trim()) title = res.data.trim();
-      } catch {
+      if (!this.pages.hasCached(menu.rootID)) {
         try {
-          const fallback = await this.kernel.post<string>("/api/filetree/getHPathByID", { id: menu.rootID });
-          if (typeof fallback.data === "string" && fallback.data.trim()) title = fallback.data.trim();
+          const res = await this.kernel.post<string>("/api/filetree/getFullHPathByID", { id: menu.rootID }, { signal: scope.signal });
+          if (typeof res.data === "string" && res.data.trim()) title = res.data.trim();
         } catch {
-          // Fallback to empty title
+          if (!scope.active || scope.signal.aborted) return;
+          try {
+            const fallback = await this.kernel.post<string>("/api/filetree/getHPathByID", { id: menu.rootID }, { signal: scope.signal });
+            if (typeof fallback.data === "string" && fallback.data.trim()) title = fallback.data.trim();
+          } catch {
+            if (!scope.active || scope.signal.aborted) return;
+            // Fallback to rootTitle below
+          }
+        }
+        if (!scope.active || scope.signal.aborted) return;
+        if (!title && verified.rootTitle) {
+          title = verified.rootTitle;
         }
       }
+      if (!scope.active || scope.signal.aborted) return;
       const enabled = await this.pages.toggle(menu.rootID, { title });
-      if (!scope.active) return;
+      if (!scope.active || scope.signal.aborted) return;
       showMessage(this.t(ctx, enabled ? "menu.granted" : "menu.revoked"));
     } catch (error) {
+      if (!scope.active || scope.signal.aborted) return;
       ctx.logger.error("保存文档白名单失败", error);
-      if (scope.active) showMessage(this.t(ctx, "menu.saveFailed"), 5000, "error");
+      showMessage(this.t(ctx, "menu.saveFailed"), 5000, "error");
     }
   }
 
@@ -273,7 +256,7 @@ export class ImageCompressorFeature extends BaseFeature {
   private editor(menu: MenuContext): SingleImageEditorContext | undefined {
     const protyle = menu.detail?.protyle ?? menu.detail?.editor?.protyle;
     const rootID = protyle?.block?.rootID;
-    const notebook = protyle?.notebookId ?? protyle?.block?.box;
+    const notebook = resolveNotebookID(protyle);
     if (typeof rootID !== "string" || typeof notebook !== "string" || rootID !== menu.rootID) return undefined;
     return { rootID, notebook, disabled: protyle?.disabled === true };
   }

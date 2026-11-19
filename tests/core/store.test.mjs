@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { JsonStore } from "../../src/core/store/JsonStore.ts";
+import { SettingsManager } from "../../src/core/store/SettingsManager.ts";
 
 function createPlugin(storage = new Map()) {
   const writes = [];
@@ -184,7 +185,6 @@ test("missing file via HTTP 202 code 404 initializes defaults without entering r
 
   const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
   await store.load();
-  assert.equal(store.readOnly, false);
   assert.equal(store.needsRecovery, false);
   assert.deepEqual(store.snapshot(), { schemaVersion: 1, value: 0 });
   assert.deepEqual(plugin.writes, []);
@@ -196,7 +196,6 @@ test("server error HTTP 500 triggers read-only protection and rejects load", asy
 
   const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
   await assert.rejects(store.load(), /Server error reading/);
-  assert.equal(store.readOnly, true);
   assert.equal(store.needsRecovery, true);
   assert.deepEqual(plugin.writes, []);
 
@@ -213,7 +212,6 @@ test("HTTP 202 with non-404 code triggers read-only protection", async () => {
 
   const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
   await assert.rejects(store.load(), /Kernel getFile failed: 503/);
-  assert.equal(store.readOnly, true);
   assert.equal(store.needsRecovery, true);
   assert.deepEqual(plugin.writes, []);
 });
@@ -237,7 +235,6 @@ test("storage read timeout triggers read-only protection and unblocks queue", as
   await fetchEntered;
   t.mock.timers.tick(30_000);
   await assert.rejects(pending, /Storage read timed out/);
-  assert.equal(store.readOnly, true);
   assert.equal(store.needsRecovery, true);
 
   // Subsequent queue operation executes and is not deadlocked
@@ -276,14 +273,122 @@ test("corrupt file content enters recovery mode and can recover with backup", as
   const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
   await store.load();
   assert.equal(store.needsRecovery, true);
-  assert.equal(store.readOnly, true);
 
   // Recover with backup creates a backup and resets to defaults
   await store.recoverWithBackup();
   assert.equal(store.needsRecovery, false);
-  assert.equal(store.readOnly, false);
   assert.equal(store.snapshot().value, 0);
   assert.equal(plugin.writes.length, 2);
   assert.match(plugin.writes[0], /^feature-unit-test\.backup-\d+\.json$/);
   assert.equal(plugin.writes[1], "feature-unit-test.json");
+});
+
+test("saveConfirmed timeout rejects without auto-retry and leaves queue unblocked", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const plugin = createPlugin();
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec);
+  await store.load();
+
+  let enteredSave;
+  const saveEntered = new Promise(resolve => { enteredSave = resolve; });
+  const originalSave = plugin.saveData;
+  let hangNextSave = true;
+  plugin.saveData = (path, data) => {
+    plugin.writes.push(path);
+    if (hangNextSave) {
+      enteredSave();
+      return new Promise(() => {});
+    }
+    return originalSave(path, data);
+  };
+
+  const pendingUpdate = store.update(v => { v.value = 42; });
+  await saveEntered;
+  t.mock.timers.tick(30_000);
+
+  await assert.rejects(pendingUpdate, /Storage save timed out/);
+  assert.equal(store.snapshot().value, 0);
+  assert.equal(plugin.writes.length, 1);
+
+  // Subsequent update is not deadlocked and succeeds once saveData recovers
+  hangNextSave = false;
+  plugin.saveData = originalSave;
+  const ok = await store.update(v => { v.value = 7; });
+  assert.equal(ok, true);
+  assert.equal(store.snapshot().value, 7);
+});
+
+test("legacy loadData fallback timeout triggers read-only protection and unblocks queue", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const plugin = createPlugin();
+  let enteredLoad;
+  const loadEntered = new Promise(resolve => { enteredLoad = resolve; });
+  plugin.loadData = () => {
+    enteredLoad();
+    return new Promise(() => {});
+  };
+
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec);
+  const pending = store.load();
+  await loadEntered;
+  t.mock.timers.tick(30_000);
+
+  await assert.rejects(pending, /Storage read timed out/);
+  assert.equal(store.needsRecovery, true);
+  await assert.rejects(store.update(() => {}), /read-only/);
+});
+
+test("SettingsManager.reloadAfterExternalChange settles all stores when one store reload fails", async () => {
+  const storage = new Map();
+  let failFeatureA = false;
+  const plugin = {
+    async loadData(path) {
+      if (failFeatureA && path === "feature-a-settings.json") {
+        throw new Error("disk read failed");
+      }
+      return storage.has(path) ? storage.get(path) : "";
+    },
+    async saveData(path, data) {
+      storage.set(path, structuredClone(data));
+    },
+  };
+  const registrations = [
+    {
+      id: "featureA",
+      file: "feature-a-settings.json",
+      defaultEnabled: false,
+      codec: { defaults: () => ({ schemaVersion: 1, count: 0 }), parse: x => structuredClone(x) },
+    },
+    {
+      id: "featureB",
+      file: "feature-b-settings.json",
+      defaultEnabled: false,
+      codec: { defaults: () => ({ schemaVersion: 1, label: "init" }), parse: x => structuredClone(x) },
+    },
+  ];
+
+  const settings = new SettingsManager(plugin, registrations);
+  await settings.load();
+
+  await plugin.saveData("omnikit-core.json", {
+    schemaVersion: 1,
+    general: { debugLog: true, userAgent: "" },
+    featureStates: {},
+  });
+  await plugin.saveData("feature-b-settings.json", { schemaVersion: 1, label: "updated" });
+  failFeatureA = true;
+
+  const warnings = [];
+  const origWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+  try {
+    const changed = await settings.reloadAfterExternalChange();
+    assert.deepEqual(changed, ["core", "featureB"]);
+    assert.equal(settings.getGeneral().debugLog, true);
+    assert.equal(settings.getFeature("featureB").label, "updated");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /featureA/);
+  } finally {
+    console.warn = origWarn;
+  }
 });

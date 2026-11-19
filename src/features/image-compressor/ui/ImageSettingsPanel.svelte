@@ -10,7 +10,7 @@
     runtimePhase: string;
     hostVersion: string;
     desktopFrontend?: boolean;
-    t: (key: string) => string;
+    t: (key: string, values?: Record<string, string | number>) => string;
     validateDocument: (rootID: string) => Promise<{ id: string; title: string }>;
   }
   let { store, runtimePhase, hostVersion, desktopFrontend = false, t, validateDocument }: Props = $props();
@@ -18,20 +18,23 @@
   const same = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
 
   const kernel = new KernelClient();
+  const pathLookupsStarted = new Set<string>();
+  const lookupAbort = new AbortController();
   let resolvedHPaths = $state<Record<string, string>>({});
 
-  async function resolveHPath(id: string): Promise<void> {
-    if (resolvedHPaths[id]) return;
+  async function resolveHPath(id: string, signal: AbortSignal): Promise<void> {
+    if (signal.aborted || resolvedHPaths[id]) return;
     try {
-      const res = await kernel.post<string>("/api/filetree/getFullHPathByID", { id });
-      if (typeof res.data === "string" && res.data.trim()) {
+      const res = await kernel.post<string>("/api/filetree/getFullHPathByID", { id }, { signal });
+      if (!signal.aborted && typeof res.data === "string" && res.data.trim()) {
         resolvedHPaths[id] = res.data.trim();
         return;
       }
     } catch {
+      if (signal.aborted) return;
       try {
-        const fallback = await kernel.post<string>("/api/filetree/getHPathByID", { id });
-        if (typeof fallback.data === "string" && fallback.data.trim()) {
+        const fallback = await kernel.post<string>("/api/filetree/getHPathByID", { id }, { signal });
+        if (!signal.aborted && typeof fallback.data === "string" && fallback.data.trim()) {
           resolvedHPaths[id] = fallback.data.trim();
         }
       } catch {
@@ -40,15 +43,33 @@
     }
   }
 
+  async function resolveHPathBatch(ids: string[], signal: AbortSignal): Promise<void> {
+    const concurrency = 4;
+    let next = 0;
+    const worker = async () => {
+      while (next < ids.length && !signal.aborted) {
+        const id = ids[next++];
+        await resolveHPath(id, signal);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, ids.length) }, () => worker()));
+  }
+
   $effect(() => {
     const allowlist = draft.auto.pageAllowlist;
     untrack(() => {
+      const pending: string[] = [];
       for (const [id, meta] of Object.entries(allowlist)) {
         if (meta.title && meta.title.includes("/")) {
           resolvedHPaths[id] = meta.title;
-        } else if (!resolvedHPaths[id]) {
-          void resolveHPath(id);
+          pathLookupsStarted.add(id);
+        } else if (!resolvedHPaths[id] && !pathLookupsStarted.has(id)) {
+          pathLookupsStarted.add(id);
+          pending.push(id);
         }
+      }
+      if (pending.length > 0 && !lookupAbort.signal.aborted) {
+        void resolveHPathBatch(pending, lookupAbort.signal);
       }
     });
   });
@@ -79,11 +100,17 @@
     notice = "";
   }
 
-  onMount(() => store.subscribe(value => {
-    readOnly = store.needsRecovery;
-    if (!dirty) adopt(value);
-    else if (!same(value, baseline)) conflict = true;
-  }));
+  onMount(() => {
+    const unsubscribe = store.subscribe(value => {
+      readOnly = store.needsRecovery;
+      if (!dirty) adopt(value);
+      else if (!same(value, baseline)) conflict = true;
+    });
+    return () => {
+      unsubscribe();
+      lookupAbort.abort();
+    };
+  });
 
   function resetDraft() {
     const value = defaultImageFeatureConfig();
@@ -171,7 +198,7 @@
       </button>
     </div>
   {/if}
-  {#if runtimePhase !== "enabled"}<div class="notice">{t("settings.disabledButEditable")}</div>{/if}
+  {#if runtimePhase !== "enabled" && runtimePhase !== "configured"}<div class="notice">{t("settings.disabledButEditable")}</div>{/if}
 
   <div class="capabilities"><span>{t("settings.host")}: {hostVersion}</span></div>
 

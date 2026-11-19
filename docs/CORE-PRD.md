@@ -15,7 +15,7 @@ OmniKit 是专为思源笔记（SiYuan Note）打造的多合一工具箱扩展�
 2. **宿主集成克制 (Host Restraint)**：
    - **单槽位宿主占用**：OmniKit 在思源侧边栏（Dock）中仅占用 1 个统一入口图标，内部通过 Tab 标签路由各功能视图。
    - **统一入口聚合**：全局提供单页滚动的 iPad 风格统一设置面板与 TopBar 快速入口，实现界面入口的集中管理与统一呈现。
-   - **统一动作标识与分流前缀**：注入思源外部上下文菜单的动作由 `MenuRegistry` 统一自动补齐 `[OmniKit] ` 前缀以标识功能归属；顶栏自有下拉菜单彻底移除前缀，保持界面清爽克制。禁止 Feature 层硬编码前缀。
+   - **统一动作标识与分流前缀**：注入思源外部上下文菜单的动作由 `MenuRegistry` 统一自动补齐 `[OmniKit] ` 前缀以标识功能归属；顶栏自有下拉菜单不添加前缀，保持界面简洁。Feature 层禁止硬编码前缀。
 3. **安全优先 (Safety First)**：
    - 遵循零工作区临时文件、零主动文件删除、块级精准改写与持久化前置校验等安全规范。
    - 内核块更新执行写前读回比对与并发队列管理，避免并发编辑导致的数据冲突。
@@ -55,20 +55,23 @@ stateDiagram-v2
 ```
 
 - **`onload(): Promise<void>`**：
-  - 判定当前窗口运行环境；
+  - 判定当前窗口运行环境（主工作区窗口或独立设置窗口 `body--settings`）；
   - 初始化平台环境适配器 `Platform` 与日志管理器 `Logger`；
-  - 初始化核心配置存储 `SettingsManager` 并加载 `omnikit-core.json`；
-  - 注册 Feature 元数据到 `FeatureCatalog`；
-  - 依据配置声明与平台兼容性契约串行启动 Feature：受支持且配置开启的 Feature 进入激活流程；不受当前平台支持的 Feature 保持休眠并标记状态为 `unsupported`；
-  - 注册 Unified Dock、TopBar 入口及全局设置窗口实例。
+  - 初始化核心配置存储 `SettingsManager` 并加载 `omnikit-core.json` 及各 Feature 配置；
+  - 预构建全局设置窗口实例（`onload()` 阶段仅预热实例与存储，不自动弹出设置对话框；设置对话框统一由 `openSetting()` 响应显式入口打开）；
+  - 在主工作区窗口中：注册 Feature 元数据到 `FeatureCatalog`，依据配置声明与平台兼容性契约串行启动 Feature（受支持且配置开启的 Feature 进入激活流程；不受当前平台支持的 Feature 保持休眠并标记状态为 `unsupported`），并注册 Unified Dock、MenuRouter 与 TopBar 入口。
 - **`onLayoutReady(): void`**：
   - 思源主界面 DOM 与编辑器完全渲染就绪；
   - Core 平台统筹挂载单例底栏状态栏 `PluginStatusBar`（注入 `FeatureContext.statusBar`）；
   - 触发已启用 Feature 的 `onLayoutReady` 钩子，执行依赖编辑器 DOM 的初始化检测。
-- **`onDataChanged(): void`**：
-  - 当外部环境或独立设置窗口修改并持久化了配置文件时触发；
-  - **跨端与外部业务数据同步**：在执行配置协调前，系统首先遍历所有已注册 Feature 并调用可选的 `reloadData(this)` 钩子，由 Feature 自身刷新内存中缓存的业务记录或状态索引（如 `image-compressor` 重新加载 `feature-image-compressor-records.json` 并同步更新 Dock 视图与内存索引）；
-  - 随后调用 `SettingsManager.reloadAfterExternalChange()` 从磁盘重新加载相关 JSON 配置，刷新内存缓存，并触发受影响 Feature 的动态状态切换（受支持环境下的热启用/热停用/参数热更新；不受支持平台持续保持 `unsupported` 阻断）；重新读取的数据不触发二次写盘操作。
+- **`onDataChanged(): Promise<void>`**：
+  - 当外部环境或独立设置窗口修改并持久化了配置文件或业务数据文件时触发；先等待插件初始化 `ready` 完成；
+  - **主工作区窗口同步时序**：
+    1. 首先遍历所有已注册 Feature 调用可选的 `reloadData(this)` 钩子，由 Feature 按需重载内存业务记录缓存（如 `imageCompressor` 仅对已初始化的 `ImageCompressionRecordStore` 重载 `feature-image-compressor-records.json`）；
+    2. 随后调用 `SettingsManager.reloadAfterExternalChange()` 从磁盘重载相关 JSON 配置，按变更范围执行 `reconcileFromLoadedSettings()` 与受影响 Feature 的 `notifySettingsChanged(id)`（受支持环境下的热启用/热停用/参数热更新；不受支持平台持续保持 `unsupported` 阻断）；
+    3. 最后刷新 Unified Dock 视图；
+  - **独立设置窗口同步**：调用 `SettingsManager.reloadAfterExternalChange()` 同步外部配置变更，驱动并发修改提示；
+  - 重新读取的数据不触发二次写盘操作。
 - **`onunload(): void`**：
   - 触发全系统注销流程；
   - 标记 `unloading = true`，停止接收并拒绝调度新任务；
@@ -81,11 +84,11 @@ stateDiagram-v2
 思源支持独立的设置窗口（DOM 根节点带有 `body--settings` 类名）。
 - **运行规范**：在 `body--settings` 窗口实例中，OmniKit 作为独立的配置表单渲染器运行：
   - 仅加载 `SettingsManager`、Svelte 5 设置面板组件及其依赖的 `JsonStore`；
-  - 独立设置窗口不实例化 `FeatureManager`，以保持无状态轻量表单渲染；在设置面板中，配置为开启偏好的 Feature 状态显示为 `runtime.configured`（国际化文本：“已配置启用（运行状态请看主窗口）”），客观反映多实例架构下的配置语义；
+  - 独立设置窗口不实例化 `FeatureManager`（`manager === undefined`），以保持无状态轻量表单渲染；在设置面板中，受当前平台支持且配置为开启偏好的 Feature 其 `runtimePhase` 派生为 `"configured"`（对应国际化键 `runtime.configured`：“已配置启用（运行状态请看主窗口）”），客观反映多实例架构下的配置语义，且不渲染功能停用提示条；
   - 不初始化 Unified Dock；
   - 不注册思源右键菜单路由（MenuRouter）；
   - 不启动后台业务监听器（如编辑器事件监听、上传捕获、自动观察器等）；
-  - 设置保存并写入文件后，思源内核会自动向主窗口广播 `onDataChanged` 事件，由常驻的主窗口实例负责将最新配置应用到运行时。
+  - 设置保存并写入文件后，思源内核会自动向主窗口广播 `onDataChanged` 事件，由常驻的主窗口实例负责将最新配置应用到运行时；独立设置窗口自身收到 `onDataChanged` 时同步刷新配置缓存。
 
 ---
 
@@ -114,15 +117,15 @@ export type SiyuanFrontend =
   | "all";
 
 export interface FeatureRegistration<T> {
-  /** 唯一功能标识符（小写驼峰或 kebab-case，如 "image-compressor"） */
+  /** 唯一功能标识符（小驼峰或 kebab-case，如 "imageCompressor"、"titled-link"） */
   readonly id: string;
-  
-  /** 国际化标题对应的 key（如 "features.imageCompressor.title"） */
+
+  /** 国际化标题对应的 key（如 "feature.imageCompressor.title"） */
   readonly titleKey: string;
-  
+
   /** 国际化简要描述对应的 key */
   readonly descriptionKey: string;
-  
+
   /** 功能首次安装或无持久化配置时的默认开关状态（由 Feature 自行声明） */
   readonly defaultEnabled: boolean;
 
@@ -132,36 +135,36 @@ export interface FeatureRegistration<T> {
    * 省略或为空数组时默认为全端通用支持 (即 ["all"])
    */
   readonly frontends?: readonly SiyuanFrontend[];
-  
-  /** 
+
+  /**
    * Feature 用户配置文件名，严格遵循命名约束：
-   * 格式固定为 `feature-${id}-settings.json`
+   * 格式固定为 `feature-${slug}-settings.json`（由 featureConfigFile(id) 派生）
    */
   readonly file: `feature-${string}-settings.json`;
-  
+
   /** 配置编解码与校验器，定义 defaults() 和 parse(raw) */
   readonly codec: StoreCodec<T>;
-  
-  /** 
+
+  /**
    * 可选：跨端/外部数据同步钩子
-   * 当收到思源内核 onDataChanged 广播时，Core 负责在配置检查前调用该钩子，由 Feature 自行重载业务数据
+   * 当收到思源内核 onDataChanged 广播时，Core 负责在配置协调前调用该钩子，由 Feature 自行重载业务数据
    */
   readonly reloadData?: (plugin: Plugin) => Promise<void>;
 
   /** Feature 运行时实例工厂函数 */
-  create(plugin: Plugin, context: FeatureContext): BaseFeature;
-  
+  create(plugin: Plugin, settings: SettingsManager): BaseFeature;
+
   /** Feature 归属的 Svelte 5 设置面板组件，在统一设置页中动态挂载 */
   readonly settingsView: Component<{
     store: JsonStore<T>;
-    runtimePhase: FeaturePhase;
-    t: (key: string, params?: Record<string, unknown>) => string;
+    runtimePhase: FeaturePhase | "configured";
+    t: (key: string, values?: Record<string, string | number>) => string;
   }>;
-  
+
   /** 可选：若该 Feature 提供 Dock 视图，则提供 Svelte 5 Dock 组件 */
   readonly dockView?: Component<{
     context: FeatureContext;
-    t: (key: string, params?: Record<string, unknown>) => string;
+    t: (key: string, values?: Record<string, string | number>) => string;
   }>;
 }
 
@@ -171,20 +174,18 @@ export interface FeatureRegistration<T> {
 export interface FeatureContext {
   /** 思源插件宿主实例 */
   readonly plugin: Plugin;
-  /** 当前 Feature 的生命周期作用域与 AbortSignal 广播器 */
-  readonly scope: FeatureScope;
-  /** 思源内核 REST API 安全调用门面 */
-  readonly kernel: KernelClient;
+  /** 平台多文件配置管理器 */
+  readonly settings: SettingsManager;
+  /** 平台菜单注册表 */
+  readonly menus: MenuRegistry;
   /** 动态日志记录器 */
   readonly logger: Logger;
-  /** Core 统筹的用户交互与通知反馈门面 */
-  readonly feedback: UiFeedback;
+  /** Core 统筹的用户交互与通知反馈门面（Feature 启用时绑定对应 FeatureScope） */
+  readonly feedback?: UiFeedback;
   /** 可选：Core 统筹的底栏状态栏单例（桌面端提供，移动端或设置窗口为 undefined） */
   readonly statusBar?: PluginStatusBar;
-  /** 当前运行环境是否为思源独立设置窗口 */
-  readonly isSettingsWindow: boolean;
-  /** 国际化多语言翻译函数 */
-  t(key: string, params?: Record<string, unknown>): string;
+  /** 当前 Feature 的生命周期作用域与 AbortSignal 广播器 */
+  readonly scope?: FeatureScope;
 }
 ```
 
@@ -215,7 +216,7 @@ stateDiagram-v2
   - `enabling`：初始化与启用中，正在创建 Scope、加载数据与挂载监听。
   - `enabled`：正常运行状态。
   - `disabling`：正在安全停止业务、触发 AbortSignal、注销菜单与释放资源。
-  - `error`：启停过程中遭遇未捕获异常。错误信息记录至日志并在设置面板展示告警，系统保留用户在 `omnikit-core.json` 中配置的期望启用状态不变。
+  - `error`：启停过程中遭遇未捕获异常。错误信息记录至日志并在设置面板展示告警，系统保留用户在 `omnikit-core.json` 中配置的期望启用状态不变；执行 `deactivate()` 时清除错误态并继续执行 `onDisable()` 完成资源清理。
 
 ### 3.3 平台兼容性生命周期设防与云同步偏好保护 (Platform Compatibility Guard)
 
@@ -278,7 +279,7 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
     "userAgent": ""
   },
   "featureStates": {
-    "image-compressor": { "enabled": false },
+    "imageCompressor": { "enabled": false },
     "titled-link": { "enabled": true }
   }
 }
@@ -287,31 +288,35 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 - **`general.debugLog`**：全局调试日志开关，默认 `false`；
 - **`general.userAgent`**：全局网络请求 User-Agent 伪装配置（默认空字符串 `""`）：
   - 当为空时，Core 与下游特性默认回退使用内置的现代 Chrome 浏览器 User-Agent（例如 `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36`）；
-  - **跨特性复用机制**：由 Core 平台统一集中维护并提供访问能力，供下游需要外网访问的特性（如 `titled-link` 标题抓取伪装、`image-compressor` 远程外链图片防盗链下载等）共同复用，避免在各个 Feature 设置中重复配置与碎片化管理；
+  - **跨特性复用机制**：由 Core 平台统一集中维护并提供访问能力，供下游需要外网访问的特性（如 `titled-link` 标题抓取、`imageCompressor` 远程外链图片下载等）共同复用，避免在各个 Feature 设置中重复配置与碎片化管理；
 - **`featureStates`**：各 Feature 在平台中的期望启用偏好状态，由 Core 统一管理与持久化。
 
-### 4.2 底层存储引擎 `JsonStore<T>`
+### 4.2 底层存储引擎 `JsonStore<T>` 与并发协调
 
 所有 JSON 文件统一通过 `JsonStore<T>` 进行读写，提供以下可靠性与容灾机制：
-1. **精简存储模型与单文件独占串行队列**：基于单文件 Promise 串行队列（Promise Queue）调度所有写操作，配合思源原生 `Plugin.loadData` / `saveData` 实现持久化，杜绝写竞争；
+1. **精简存储模型与单文件独占串行队列**：基于单文件 Promise 串行队列（Promise Queue）调度所有读写操作，配合思源原生 `Plugin.loadData` / `saveData` 实现持久化，杜绝写竞争；
 2. **内容指纹防抖**：内存维护序列化内容指纹（Fingerprint），相同数据重复保存自动跳过实际磁盘 I/O；
-3. **安全确定性读取与容灾契约 (`readPluginJSON`)**：
-   - 读取操作规范使用思源内核 `/api/file/getFile` REST API，精确区分文件缺失与系统故障；
+3. **读写双路径 30 秒超时保护与不重试契约**：
+   - **读路径超时保护**：主读取通道 `/api/file/getFile` 与 `Plugin.loadData` 降级路径均实施 30 秒超时保护；
+   - **写路径超时保护与不重试**：`saveConfirmed` 调用 `plugin.saveData` 实施 30 秒超时保护；写入超时后直接抛出错误且不执行重试，防止宿主异步 API 永久挂起而冻结单文件串行队列；
+4. **安全确定性读取与容灾契约 (`readPluginJSON`)**：
+   - 读取操作规范使用思源内核 `/api/file/getFile` REST API（并在特定宿主条件下降级至 `Plugin.loadData`），精确区分文件缺失与系统故障；
    - **缺失与正常初始化**：当内核响应 HTTP 202 且思源返回体 `code === 404` 时，确认为新安装或文件不存在，安全返回 `codec.defaults()` 并允许后续正常初始化写入；
-   - **错误设防与安全只读保护**：当读取遭遇网络错误、请求超时（超时时限设为 30 秒）或思源返回其他业务错误码（如 HTTP 202 且 `code` 为 500、503、403 等）时，系统判定为读取失败，立即将当前 Store 锁定为安全只读状态（`readOnlyReason`），保留上一次内存有效数据，严格禁止使用默认值或空对象静默覆盖用户的现有持久化文件；
+   - **错误设防与只读状态暴露**：当读取遭遇网络错误、请求超时（30 秒超时时限）或思源返回其他业务错误码（如 HTTP 202 且 `code` 为 500、503、403 等）时，系统判定为读取失败，立即将当前 Store 锁定为安全只读状态；Store 仅暴露 `needsRecovery` 只读状态标记与 `readOnlyReason`，保留上一次内存有效数据，严格禁止使用默认值或空对象静默覆盖用户的现有持久化文件；
    - **损坏保护与非空备份隔离**：当文件内容存在 JSON 语法损坏且确认已成功读取到非空物理字节时，系统不使用默认值静默覆盖，而是将损坏文件重命名备份为 `.backup` 容灾文件，并在设置界面展示明确的故障提示以供用户确认修复；未读取到有效物理字节的系统错误严禁创建假备份或触发覆盖；
-   - **状态变动驱动重载**：`reload()` 方法在内容指纹变动或只读保护状态变动时均返回 `true`，确保外部状态协调准确响应。
+   - **状态变动驱动重载**：`reload()` 方法在内容指纹变动或只读保护状态变动时均返回 `true`，确保外部状态协调准确响应；
+5. **多 Store 并发容错重载 (`SettingsManager.reloadAfterExternalChange`)**：
+   - `SettingsManager.reloadAfterExternalChange()` 采用 `Promise.allSettled` 并发重载核心配置与各 Feature 设置 Store，确保单个 Store 读取异常不阻塞其余 Store 的配置刷新与宿主 `onDataChanged` 事件响应，并按固定顺序汇总变更列表。
 
-### 4.3 重置边界与“数据管理”专区
+### 4.3 重置边界与业务数据隔离
 
 1. **设置重置作用域边界**：
    - 单功能重置（Reset Feature Settings）：仅将对应的 `feature-{id}-settings.json` 重置为默认值。
    - 全局设置重置（Reset All Settings）：仅重置 `omnikit-core.json` 与所有已注册的 `feature-*-settings.json`。
    - 设置重置操作的作用域严格限定于设置文件，底层存储引擎在重置过程中不读取、修改或删除任何 `feature-*-{dataname}.json` 业务数据文件。
-2. **“数据管理 (Data Management)”专区**：
-   - 在 OmniKit 统一总设置底部提供独立的“数据管理专区”；
-   - 扫描并展示当前已持久化的业务数据文件列表、条目数量及磁盘占用；
-   - 提供二次确认对话框的“清空数据”操作，支持用户自主选择清除特定 Feature 的业务数据（如清空图片压缩映射记录）。
+2. **业务数据清理与隔离边界**：
+   - 统一设置面板中各 Feature 卡片当前仅开放设置重置（`settings.resetDraft`），不附带抹除业务数据的隐藏动作；
+   - 业务数据记录（如 `feature-image-compressor-records.json` 的映射条目）当前通过各自 Feature 提供的专用交互入口（如 Unified Dock 记录面板中的单条“移除记录”）显式手动移除；在设置窗口集中展示并清空插件业务数据的专用能力见第 9 节后续规划。
 
 ---
 
@@ -352,8 +357,8 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 ### 5.2 统一设置面板 (Unified Settings Panel)
 
 - **iPad 风格双栏联动**：
-  - **左侧导航栏**：列出“全局设置（General）”、所有已注册的 Feature 项以及底部的“数据管理（Data Management）”；
-  - **左侧导航分组与国际化规范**：左侧导航按“全局设置”、“功能模块（Features）”分组以及底部的“数据管理”规范化分区编排；功能模块分组标题必须规范化使用国际化键 `nav.features`（中文：“功能模块”，英文：“Features”），统一通过 `t("nav.features")` 进行多语言文本解析，**绝对杜绝任何硬编码字符串或在模板/逻辑中编写三元表达式（如 `{t("status") ? "功能模块" : "Features"}`）**；
+  - **左侧导航栏**：列出“全局设置（General）”及所有已注册的 Feature 项；
+  - **左侧导航分组与国际化规范**：左侧导航按“全局设置（`general.title`）”、“功能模块（`nav.features`）”规范化分区编排；所有界面文案统一通过 `t(...)` 从语言包解析，不在模板或逻辑中硬编码自然语言字符串；
   - **右侧单页滚动区**：所有选项以卡片分区形式在右侧连续排布；点击左侧导航平滑滚动到指定卡片，右侧滚动时根据视口可见性实时高亮左侧导航对应项；
   - 采用本地缓冲编辑与显式保存机制，支持实时输入校验；检测到外部 `onDataChanged` 时提示用户重新载入。
 - **特性重置文案规范**：
@@ -378,11 +383,11 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 
 - **通用上下文转换与业务解耦架构 (MenuRouter & Matcher Contract)**：
   - `MenuRouter` 作为通用宿主事件到上下文转换层，统一监听思源 EventBus 菜单事件（如 `click-blockicon`、`open-menu-doctree`、`open-menu-link` 等）；
-  - **通用上下文提取**：`MenuRouter` 仅负责从原生 detail 中提取标准通用上下文（例如 `selectedDocumentIDs: string[]`、`selectedDocumentCount: number`、`protyle?: IProtyle`、`targetElement?: HTMLElement` 等），平台核心代码中严禁包含任何特定业务的条件分支（例如针对图片的直接判断、针对 2 篇文档的硬编码业务判定等）；
+  - **通用上下文提取**：`MenuRouter` 仅负责从原生 detail 中提取标准通用上下文（例如 `selectedDocumentIDs: string[]`、`selectedDocumentCount: number`、`protyle?: IProtyle`、`targetElement?: HTMLElement` 等）；在 `open-menu-doctree` 中，严格过滤笔记本节点（包括 `detail.type === "notebook" || detail.type === "notebooks"`、`item.path === "/"` 与 `nodeType === "navigation-closed"`），仅保留文档节点（含 `boxDocEnabled` 模式下 `path === "/<id>.sy"` 的笔记本文档）；平台核心代码中不含任何特定业务条件分支；
   - **Feature 自主注册 Matcher**：具体的业务匹配规则与菜单项由各 Feature 在自身模块内自主注册的 Matcher 函数判定。Matcher 接收标准通用上下文，自主决定是否激活菜单项、动态计算菜单标题与绑定点击动作；
 - **前缀分流权威收口规范 (Context-Aware Prefix via MenuRegistry)**：
-  - 由 `MenuRegistry` 作为菜单项注册与派发的唯一权威分流收口，**严禁 Feature 层在菜单标题中硬编码 `[OmniKit]` 前缀**；
-  - **顶栏自有菜单 (`location === "topbar"`)**：**彻底移除 `[OmniKit]` 前缀**（例如呈现为 `压缩当前文档图片`、`开启当前文档图片自动压缩`），与顶栏环境深度融合，保持清爽克制；
+  - 由 `MenuRegistry` 作为菜单项注册与派发的唯一权威分流收口，Feature 层不得在菜单标题中硬编码 `[OmniKit]` 前缀；
+  - **顶栏自有菜单 (`location === "topbar"`)**：不包含 `[OmniKit]` 前缀（例如呈现为 `压缩当前文档全部图片`、`开启当前文档图片自动压缩`），与顶栏环境融合；
   - **外部宿主上下文菜单 (`location === "doc-tree" | "doc-title" | "image" | "link" | "blockicon"`)**：由 `MenuRegistry` **自动统一补齐 `[OmniKit] ` 前缀**（例如 `[OmniKit] 压缩此图片`、`[OmniKit] 提取链接标题`、`[OmniKit] 批量提取链接标题 (共 N 个)`），帮助用户清晰区分思源原生菜单与其他第三方插件菜单。
 - **轻量状态感知与路由防护**：
   - 通过 `MenuRouter` 与 `MenuRegistry` 集中管理菜单派发；
@@ -410,8 +415,8 @@ Core 平台提供轻量级 `UiFeedback` 服务（注入 `FeatureContext.feedback
   - 对外发送通知气泡时由 `UiFeedback` 自动统一补齐 `[OmniKit] ` 前缀（例如 `[OmniKit] 已替换当前引用为 WebP`）；
   - Feature 业务层调用时仅传递领域文案，严禁 Feature 业务代码硬编码通知前缀。
 - **生命周期绑定与静默设防**：
-  - `UiFeedback` 实例与对应 Feature 的生命周期作用域（`scope.active`）深度绑定；
-  - 当 Feature 处于未激活（`disabled` / `unsupported`）或插件正在卸载（`unloading`）时，自动静默丢弃未决的通知调用，防止失活的回调向界面弹出残存气泡。
+  - `BaseFeature.activate()` 在激活时创建当前激活专属的 `FeatureScope`，并通过 `feedback.forScope(scope)` 将 `UiFeedback` 与该 `scope` 深度绑定；
+  - 当 Feature 处于未激活（`disabled` / `unsupported`）或插件正在卸载（`unloading`）时，自动静默丢弃未决的通知调用（包括 `copyable` 异步写入剪贴板完成后对 `scope.active` 的二次核验），防止失活回调向界面弹出残存气泡。
 - **`AbortError` 与取消信号自动拦截吞咽**：
   - 异步任务在遭遇用户按 Esc、切换编辑器标签页、关闭面板或触发 `signal.abort` 中止时，底层抛出的标准 `AbortError` 或传入的中止信号由 `UiFeedback` 自动拦截并静默吞咽；
   - 严禁向用户弹出错误气泡，保障正常中止时界面完全静默退出。
@@ -420,11 +425,11 @@ Core 平台提供轻量级 `UiFeedback` 服务（注入 `FeatureContext.feedback
   - 短时间内同一事件源触发的完全相同文本自动抑制二次弹出，防止高频事件或批量处理时在屏幕右上角堆叠大量重复 Snackbar 气泡。
 - **通用交互能力封装**：
   - `notify(message: string, type?: "info" | "error", options?: { timeout?: number })`: 规范化气泡通知调度；
-  - `copyable(text: string, label?: string)`: 统一封装文本复制至系统剪贴板功能，并在复制成功后自动触发轻量提示（如 `[OmniKit] 已复制路径`），下游业务特性直接复用；
+  - `copyable(text: string, notice?: string)`: 统一封装文本复制至系统剪贴板功能（由 `forScope(scope)` 绑定上下文作用域，不提供额外参数嗅探重载，并在剪贴板异步返回后再次校验 `scope.active`），复制成功后触发轻量提示（如 `[OmniKit] 已复制路径`），下游业务特性直接复用；
 - **局域网 HTTP 环境与无 WebCrypto 兼容规范**：
   - 在非 HTTPS/局域网 HTTP 部署环境下，宿主浏览器不暴露 `crypto.randomUUID()` 与 `crypto.subtle` 安全上下文 API；
   - 平台任务 ID 生成采用进程内时间戳与自增序列号，确保全网络环境可用；
-  - `copyable` 统一提供兼容性兜底：当 `navigator.clipboard` 在非安全 HTTP 环境不可用或写入被拒绝时，自动聚焦并选中文本输入框，向用户弹出明确的手动复制提示（`image.copySelectedPrompt`，如“已选中路径，请按 Ctrl+C 复制”），保证复制操作的确定性闭环。
+  - 当 `navigator.clipboard` 在非安全 HTTP 环境不可用或写入被拒绝时，交互层（如 `ImageTaskUI` / `ImageRecordsDock`）安全回退为选中可复制文本路径或弹窗引导手动 `Ctrl+C` 复制，保证复制操作的确定性闭环。
 
 ### 5.6 通用底栏状态栏管理 (`PluginStatusBar`)
 
@@ -455,7 +460,7 @@ Core 平台在思源主工作区状态栏区域提供通用的轻量任务进度
 
 对思源原生 REST API（`fetchPost` / `fetchSyncPost`）进行封装与防御性处理：
 - **请求超时与真实连接中止 (Timeout & Abort Propagation)**：默认设置 30 秒超时，支持透传 `AbortSignal`；内部集成专属 `AbortController`，当超时定时器触发或外部取消时，不仅终止 Promise 等待并拒绝返回 `KernelRequestError`，同时显式调用底层内部控制器的 `abort()`，将中止信号传播到底层 `fetchSyncPost` 与物理网络连接，释放连接套接字；
-- **响应错误归一化**：自动检查 HTTP 状态码与思源返回体中的 `code !== 0`，提取并包装为标准 `KernelError`；
+- **响应错误归一化**：自动检查 HTTP 状态码与思源返回体中的 `code !== 0`，提取并包装为标准 `KernelRequestError`；
 - **网络异常容灾**：网络断开或内核异常时不针对非幂等修改请求执行自动重试，避免向内核制造重复提交。
 
 ### 6.2 `Platform` 运行环境判断与平台兼容性判定算法
@@ -470,7 +475,7 @@ Core 平台在思源主工作区状态栏区域提供通用的轻量任务进度
     2. **目标匹配与通配符支持**：若列表包含通配符 `"all"` 或包含当前宿主前端类型 `current`，判定为受支持（返回 `true`）；
     3. **不匹配拦截**：若以上条件均不满足，判定为不受支持（返回 `false`）；
 - **前端平台友好标签格式化**：
-  - 提供 `formatFrontendLabel(frontend: SiyuanFrontend, t: (key: string) => string): string` 工具函数，用于将前端标识符格式化为人类可读的多语言标签（例如：桌面端、桌面拆分窗口、移动端 App、桌面浏览器、移动浏览器、全端通用），供统一设置面板 Badge 及说明文本展示。
+  - 统一设置面板（`SettingsRoot`）通过 `platform.*` 语言包键名将前端标识符（如 `desktop`、`desktop-window`、`mobile`、`browser-desktop`、`browser-mobile`、`all`）格式化为人类可读的多语言标签，并通过插值参数 `t(key, { platforms })` 呈现兼容性提示。
 
 ### 6.3 `Logger` 动态日志体系
 
@@ -481,9 +486,9 @@ Core 平台在思源主工作区状态栏区域提供通用的轻量任务进度
 ### 6.4 `ProtyleAdapter` 宿主通用数据提取器
 
 为抹平思源不同事件与触发源的数据结构差异，Core 提供标准化的 `ProtyleAdapter`：
-- **标准属性直接提取**：直接从思源标准事件对象提取核心上下文（如 `detail.protyle.block.rootID` 与 `detail.protyle.element`）；
-- **确定性数据流**：依赖思源原生稳定的数据结构，不设立多层冗余的兜底空值回退链，保障宿主适配层的精简、高效与确定性；
-- **只读辅助**：适配器仅执行结构化属性解构与类型守卫，不产生任何副作用。
+- **标准属性提取**：从思源标准事件对象及编辑器实例提取核心上下文（如 `detail.protyle.block.rootID`、`detail.protyle.element` 与 `getInstance()`）；
+- **确定性数据流**：以思源原生数据结构为准，直接解构所需字段并执行类型守卫，保持宿主适配层精简、确定；
+- **只读辅助**：适配器仅执行结构化属性解构与信号组合（`combineSignals`），不产生任何副作用。
 
 ---
 
@@ -491,7 +496,7 @@ Core 平台在思源主工作区状态栏区域提供通用的轻量任务进度
 
 | Feature ID | 中文名称 | 支持端 (Frontends) | 业务规范文档 | 默认状态 | 说明 |
 |---|---|---|---|---|---|
-| `image-compressor` | 图片压缩 | 全端通用 (`all`) | [PRD](features/image-compressor/PRD.md) · [DESIGN](features/image-compressor/DESIGN.md) | 关闭 (`false`) | 针对思源新插入图片与文档已有图片的无损/高质 WebP 压缩，含统一 Dock 记录与引用回溯 |
+| `imageCompressor` | 图片压缩 | 全端通用 (`all`) | [PRD](features/image-compressor/PRD.md) · [DESIGN](features/image-compressor/DESIGN.md) | 关闭 (`false`) | 针对思源新插入图片与文档已有图片的无损/高质 WebP 压缩，含统一 Dock 记录与引用回溯 |
 | `titled-link` | 自动标题链接 | 全端通用 (`all`) | [PRD](features/titled-link/PRD.md) · [DESIGN](features/titled-link/DESIGN.md) | 开启 (`true`) | 针对思源行内超链接异步获取并填充网页标题，支持非网页文件免抓取、单链右键菜单与块级批量提取，具备双轨网络、流式截断、万国码嗅探与并发冲突保护 |
 
 *(后续新增 Feature 需在完成需求规范编写与冻结后，补充更新至本索引表)*
@@ -502,7 +507,7 @@ Core 平台在思源主工作区状态栏区域提供通用的轻量任务进度
 
 ### 8.1 插件版本权威源与双清单一致性
 - **单一版本权威源**：思源笔记插件生态将 `plugin.json` 中的 `version` 作为识别插件元数据与集市版本的唯一官方权威源；
-- **最低思源版本基准**：插件最低运行环境要求统一规范为思源笔记 `3.8.4`（`minAppVersion: "3.8.4"`），以对齐内核 API 契约（包括 `/api/asset/findAssetReferences` 引用反查、`before-upload-assets` 事件管道及 `/api/block/getBlockDOMs` 等能力）；
+- **最低思源版本基准**：插件最低运行环境要求统一规范为思源笔记 `3.8.4`（`plugin.json` 中声明 `minAppVersion: "3.8.4"`，由思源宿主统一保障版本下限），以对齐内核 API 契约（包括 `/api/asset/findAssetReferences` 引用反查与 `before-upload-assets` 事件管道等能力）；
 - **开发清单同步**：`package.json` 中的 `version` 保持原子同步一致，确保 Node.js/pnpm 工具链与思源宿主元数据强一致；
 - **语义化版本规范**：版本号严格采用标准三段式 `X.Y.Z` 语义化版本（SemVer），无多余前缀或预发布后缀。
 
@@ -516,3 +521,12 @@ Core 平台在思源主工作区状态栏区域提供通用的轻量任务进度
 - 通过 `.github/dependabot.yml` 实施 `npm` 与 `github-actions` 双生态月度监控；
 - `npm` 依赖升级遵循 `lockfile-only` 策略，仅更新锁文件，保全项目声明依赖范围；
 - Actions 核心大版本防御，自动化生成分组 PR 提升审查效率。
+
+---
+
+## 9. 后续演进与规划功能 (Future Enhancements)
+
+1. **设置窗口「数据管理 (Data Management)」专区**：
+   - 在统一设置面板（`SettingsRoot`）左侧导航与右侧视图中新增独立的「数据管理」专区；
+   - 列出全部 `feature-*-{dataname}.json` 业务数据文件名、记录条数及占用体积；
+   - 提供经二次确认的显式「清空数据」操作，允许用户集中清空插件全部或指定 Feature 的持久化业务数据（仍严守不主动删除思源物理附件的底线）。

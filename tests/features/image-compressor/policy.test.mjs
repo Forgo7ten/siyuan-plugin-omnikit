@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { shouldAutoCompress } from "../../../src/features/image-compressor/policy/AutoPolicy.ts";
-import { analyzeDocTreeTarget } from "../../../src/core/feedback/MenuRouter.ts";
+import { extractDocTreeDocumentIDs } from "../../../src/core/feedback/MenuRouter.ts";
 
 const basic = { featureEnabled: true, globalEnabled: false, allowlisted: false, hostSupportsUpload: true, rootID: "20250101000000-abcdefg" };
 test("OmniKit auto-compression truth table", () => {
@@ -14,25 +14,50 @@ test("OmniKit auto-compression truth table", () => {
   assert.equal(shouldAutoCompress({ ...basic, rootID: "", globalEnabled: true }), false);
 });
 
-test("document tree target accepts one file and rejects notebooks or selections", () => {
+test("extractDocTreeDocumentIDs handles SiYuan navigation.ts payloads and boxDocEnabled documents", () => {
   const menu = {};
-  assert.deepEqual(analyzeDocTreeTarget({
+  assert.deepEqual(extractDocTreeDocumentIDs({
     menu,
     type: "doc",
-    items: [{ id: "20250101000000-abcdefg", type: "navigation-file" }],
-  }), { target: { rootID: "20250101000000-abcdefg" } });
-  assert.equal(analyzeDocTreeTarget({
+    items: [{ id: "20250101000000-abcdefg", notebookId: "box-1", path: "/20250101000000-abcdefg.sy" }],
+  }), ["20250101000000-abcdefg"]);
+
+  assert.deepEqual(extractDocTreeDocumentIDs({
     menu,
     type: "doc",
-    items: [{ id: "doc-a" }, { id: "doc-b" }],
-  }).target, undefined);
-  assert.equal(analyzeDocTreeTarget({
+    items: [{ id: "box-1", notebookId: "box-1", path: "/box-1.sy" }],
+  }), ["box-1"]);
+
+  assert.deepEqual(extractDocTreeDocumentIDs({
+    menu,
+    type: "notebooks",
+    items: [
+      { id: "box-1", notebookId: "box-1", path: "/" },
+      { id: "box-2", notebookId: "box-2", path: "/" },
+    ],
+  }), []);
+
+  assert.deepEqual(extractDocTreeDocumentIDs({
     menu,
     type: "notebook",
-    items: [{ id: "notebook-id" }],
-  }).target, undefined);
-  assert.equal(analyzeDocTreeTarget({
+    items: [{ id: "box-1", notebookId: "box-1", path: "/" }],
+  }), []);
+
+  assert.deepEqual(extractDocTreeDocumentIDs({
     menu,
-    elements: [{ getAttribute: key => key === "data-type" ? "navigation-root" : "box-id" }],
-  }).target, undefined);
+    type: "items",
+    items: [
+      { id: "box-1", notebookId: "box-1", path: "/" },
+      { id: "doc-a", notebookId: "box-1", path: "/doc-a.sy" },
+    ],
+  }), ["doc-a"]);
+
+  assert.deepEqual(extractDocTreeDocumentIDs({
+    menu,
+    elements: [
+      { getAttribute: key => key === "data-type" ? "navigation-root" : "box-1" },
+      { getAttribute: key => key === "data-type" ? "navigation-closed" : "box-2" },
+      { getAttribute: key => key === "data-type" ? "navigation-file" : "doc-c" },
+    ],
+  }), ["doc-c"]);
 });

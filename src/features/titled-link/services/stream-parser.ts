@@ -13,7 +13,9 @@ export interface ReadTitleResourceOptions {
 }
 
 const DEFAULT_MAX_BYTES = 64 * 1024;
+const OVERLAP_TAIL_CHARS = 64;
 const CLOSING_TAG_PATTERN = /<\/(?:title|head)\s*>/i;
+const LATIN1_DECODER = new TextDecoder("latin1");
 
 export async function readAndDecodeTitleResource(
   resource: TitleResource,
@@ -37,6 +39,7 @@ export async function readAndDecodeStream(
   const limit = maxBytes(options.maxBytes);
   const chunks: Uint8Array[] = [];
   let total = 0;
+  let tail = "";
   let truncated = false;
   const onAbort = () => {
     void reader.cancel(options.signal?.reason).catch(() => undefined);
@@ -54,12 +57,16 @@ export async function readAndDecodeStream(
       chunks.push(chunk);
       total += chunk.byteLength;
 
-      const accumulated = concatenate(chunks, total);
-      if (CLOSING_TAG_PATTERN.test(new TextDecoder("latin1").decode(accumulated))) {
+      const windowText = tail + LATIN1_DECODER.decode(chunk);
+      if (CLOSING_TAG_PATTERN.test(windowText)) {
         truncated = true;
         await reader.cancel("HTML head metadata captured");
-        return decodeHtmlBytes(accumulated, contentType, truncated);
+        break;
       }
+      tail = windowText.length > OVERLAP_TAIL_CHARS
+        ? windowText.slice(-OVERLAP_TAIL_CHARS)
+        : windowText;
+
       if (chunk.byteLength < result.value.byteLength || total >= limit) {
         truncated = true;
         await reader.cancel("HTML read limit reached");
@@ -95,7 +102,7 @@ export function decodeHtmlBytes(bytes: Uint8Array, contentType = "", truncated =
 export function sniffCharset(bytes: Uint8Array, contentType = ""): string {
   const header = contentType.match(/charset\s*=\s*["']?\s*([^\s;"']+)/i)?.[1];
   if (header) return normalizeCharset(header);
-  const prefix = new TextDecoder("latin1").decode(bytes.subarray(0, Math.min(bytes.byteLength, 8 * 1024)));
+  const prefix = LATIN1_DECODER.decode(bytes.subarray(0, Math.min(bytes.byteLength, 8 * 1024)));
   const directMeta = prefix.match(/<meta\b[^>]*\bcharset\s*=\s*["']?\s*([^\s;"'/>]+)/i)?.[1];
   if (directMeta) return normalizeCharset(directMeta);
   const httpEquiv = prefix.match(/<meta\b[^>]*\bcontent\s*=\s*["'][^"']*charset\s*=\s*([^\s;"']+)/i)?.[1];

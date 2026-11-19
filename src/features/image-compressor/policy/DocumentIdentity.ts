@@ -7,13 +7,6 @@ export interface BlockIdentity {
   box?: string;
 }
 
-/** Block ids are `yyyyMMddHHmmss-xxxxxxx`; anything else is rejected before it reaches SQL. */
-const BLOCK_ID = /^[0-9a-zA-Z-]{1,64}$/;
-
-export function isSafeBlockId(id: string): boolean {
-  return BLOCK_ID.test(id);
-}
-
 /**
  * @safety A document root is proven by an explicit `type === "d"`, or - when the kernel
  * omits the type - by the block reporting itself as its own root. A descendant block always

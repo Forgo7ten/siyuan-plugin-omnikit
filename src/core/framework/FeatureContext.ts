@@ -3,7 +3,6 @@ import type { FeatureScope } from "./FeatureScope.ts";
 import type { SettingsManager } from "../store/SettingsManager.ts";
 import type { MenuRegistry } from "../feedback/MenuRegistry.ts";
 import type { Logger } from "../host/Logger.ts";
-import type { Compatibility } from "../host/Compatibility.ts";
 import type { SiyuanFrontend } from "../host/Platform.ts";
 import type { UiFeedback } from "../feedback/UiFeedback.ts";
 import type { PluginStatusBar } from "../feedback/PluginStatusBar.ts";
@@ -23,7 +22,6 @@ export interface FeatureContext {
   plugin: Plugin;
   settings: SettingsManager;
   menus: MenuRegistry;
-  compatibility: Compatibility;
   logger: Logger;
   feedback?: UiFeedback;
   statusBar?: PluginStatusBar;

@@ -135,3 +135,12 @@ test('ImageCompressorFeature wires active editor and destroy-protyle lifecycle',
   assert.match(featureSource, /"destroy-protyle"/, 'Must listen to destroy-protyle');
   assert.match(featureSource, /entry\.handle\?\.reconcile\(\)/, 'Must reconcile on settings store subscription');
 });
+
+test('RemoteImageWatcher removes record capacity throttling and resolves persisted target in a single DOM parse', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const watcher = await readFile(new URL('../../../src/features/image-compressor/actions/RemoteImageWatcher.ts', import.meta.url), 'utf8');
+
+  assert.doesNotMatch(watcher, /capacityReached|isRecordCapacityError|lastRecordCount|unsubscribeRecords/);
+  assert.doesNotMatch(watcher, /resolveImageOccurrence/);
+  assert.match(watcher, /const target: OccurrenceTarget = \{/);
+});

@@ -14,7 +14,7 @@ export interface HostMenuContext {
   /** Original host detail, for feature actions that need the full host context. */
   detail?: any;
 
-  // Preserved for backward compatibility
+  /** Resolved image element and URL when triggered from an image menu. */
   imageElement?: HTMLElement;
   imageURL?: string;
 }
@@ -169,15 +169,5 @@ export class MenuRegistry {
       rootID: normalizedContext.rootID,
       hasImage: Boolean(normalizedContext.imageURL),
     });
-  }
-
-  list(owner: string): readonly OmniMenuItem[] {
-    return this.entries
-      .filter(entry => entry.owner === owner)
-      .flatMap(entry => entry.provider({
-        location: entry.location,
-        selectedDocumentIDs: [],
-        selectedDocumentCount: 0,
-      }));
   }
 }

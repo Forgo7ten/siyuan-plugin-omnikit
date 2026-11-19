@@ -7,7 +7,7 @@ import type { FeatureManager } from "../../core/framework/FeatureManager.ts";
 
 /**
  * @design Svelte controls only view lifetime. It never starts Feature runtime or registers
- * menus. Future SiYuan 3.8.7+ settings-window instances mount only this view and stores.
+ * menus. Independent `body--settings` window instances mount only this view and stores.
  */
 export function createSettingsWindow(deps: {
   registrations: readonly FeatureRegistration<any>[];

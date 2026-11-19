@@ -43,9 +43,14 @@ export abstract class BaseFeature {
     const generation = ++this.generation;
     const scope = new FeatureScope();
     this.scope = scope;
+    const scopedContext: FeatureContext = {
+      ...context,
+      scope,
+      feedback: context.feedback?.forScope?.(scope) ?? context.feedback,
+    };
     const promise = (async () => {
       try {
-        await this.onEnable(context, scope);
+        await this.onEnable(scopedContext, scope);
         if (!scope.active || generation !== this.generation) {
           throw new Error(`Feature frozen during initialization: ${this.meta.id}`);
         }
@@ -68,24 +73,36 @@ export abstract class BaseFeature {
    * @safety Wait for pending onEnable to settle before running onDisable.
    * No old menu/task callback can operate because freeze disposed the scope first.
    */
-  async deactivate(): Promise<void> {
-    if (this.phase === "disabled") return;
-    if (this.phase === "disabling") return this.shutdown;
-    if (this.phase === "enabling") {
-      await this.activation?.catch(() => undefined);
-    }
-    if ((this.phase as FeaturePhase) === "disabled") return;
-    this.phase = "disabling";
-    this.generation++;
-    this.scope?.dispose();
-    this.scope = undefined;
-    const promise = (async () => {
+  deactivate(): Promise<void> {
+    if (this.phase === "disabled") return Promise.resolve();
+    if (this.shutdown) return this.shutdown;
+    let resolveShutdown!: () => void;
+    let rejectShutdown!: (reason?: unknown) => void;
+    const promise = new Promise<void>((resolve, reject) => {
+      resolveShutdown = resolve;
+      rejectShutdown = reject;
+    });
+    this.shutdown = promise;
+    void this.performDeactivate(promise).then(resolveShutdown, rejectShutdown);
+    return promise;
+  }
+
+  private async performDeactivate(promise: Promise<void>): Promise<void> {
+    try {
+      if (this.phase === "enabling") {
+        await this.activation?.catch(() => undefined);
+      }
+      if ((this.phase as FeaturePhase) === "disabled") return;
+      this.phase = "disabling";
+      this.generation++;
+      this.failure = undefined;
+      this.scope?.dispose();
+      this.scope = undefined;
       try { await this.onDisable(); }
       finally { this.phase = "disabled"; }
-    })();
-    this.shutdown = promise;
-    try { await promise; }
-    finally { if (this.shutdown === promise) this.shutdown = undefined; }
+    } finally {
+      if (this.shutdown === promise) this.shutdown = undefined;
+    }
   }
 
   /** Synchronous gate for unload; async cleanup remains the job of deactivate(). */

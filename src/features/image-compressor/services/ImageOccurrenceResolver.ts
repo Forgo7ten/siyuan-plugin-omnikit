@@ -40,13 +40,7 @@ export async function waitForPersistedImageOccurrence(
       }, { signal });
       if (response.data?.id === evidence.blockID && typeof response.data.dom === "string") {
         const target = resolveImageOccurrence(response.data.dom, evidence);
-        if (target) {
-          const info = await kernel.post<{ rootID: string; box?: string }>("/api/block/getBlockInfo", {
-            id: evidence.blockID, notebook: evidence.notebook,
-          }, { signal });
-          if (info.data?.rootID === evidence.rootID && info.data.box === evidence.notebook) return target;
-          return undefined;
-        }
+        if (target) return target;
       }
     } catch {
       if (signal?.aborted) return undefined;

@@ -3,13 +3,14 @@
   import { getFrontend } from "siyuan";
   import type { JsonStore } from "../../../core/store/JsonStore.ts";
   import { KernelClient } from "../../../core/host/KernelClient.ts";
-  import type { ImageFeatureConfig } from "../policy/parseImageConfig.ts";
+  import { isDocumentRootIdentity } from "../policy/DocumentIdentity.ts";
+  import { NODE_ID, type ImageFeatureConfig } from "../policy/parseImageConfig.ts";
   import ImageSettingsPanel from "./ImageSettingsPanel.svelte";
 
   interface Props {
     store: JsonStore<ImageFeatureConfig>;
     runtimePhase: string;
-    t: (key: string) => string;
+    t: (key: string, values?: Record<string, string | number>) => string;
   }
   let { store, runtimePhase, t }: Props = $props();
   let hostVersion = $state("unknown");
@@ -29,7 +30,18 @@
   });
 
   async function validateDocument(rootID: string): Promise<{ id: string; title: string }> {
-    if (!/^\d{14}-[a-z0-9]{7}$/.test(rootID)) throw new Error(t("settings.invalidDocument"));
+    if (!NODE_ID.test(rootID)) throw new Error(t("settings.invalidDocument"));
+    const infoResponse = await kernel.post<{
+      id?: string;
+      rootID?: string;
+      type?: string;
+      box?: string;
+      rootTitle?: string;
+    }>("/api/block/getBlockInfo", { id: rootID });
+    const info = infoResponse.data;
+    if (!isDocumentRootIdentity(info, rootID)) {
+      throw new Error(t("settings.invalidDocument"));
+    }
     let title = "";
     try {
       const hpathRes = await kernel.post<string>("/api/filetree/getFullHPathByID", { id: rootID });
@@ -43,22 +55,11 @@
           title = fallbackRes.data.trim();
         }
       } catch {
-        // Fallback to SQL block query
+        // Fallback to rootTitle below
       }
     }
-    const response = await kernel.post<unknown>("/api/query/sql", {
-      stmt: `SELECT id, root_id, content FROM blocks WHERE id = '${rootID}' AND type = 'd' LIMIT 1`,
-      mode: "readonly",
-    });
-    const rows = response.data;
-    if (!Array.isArray(rows) || rows.length !== 1 || !rows[0] || typeof rows[0] !== "object") {
-      throw new Error(t("settings.invalidDocument"));
-    }
-    const row = rows[0] as { id?: unknown; root_id?: unknown; content?: unknown };
-    if (row.id !== rootID || row.root_id !== rootID || typeof row.content !== "string") {
-      throw new Error(t("settings.invalidDocument"));
-    }
-    return { id: rootID, title: title || row.content.slice(0, 512) };
+    const fallbackTitle = typeof info?.rootTitle === "string" ? info.rootTitle.trim().slice(0, 512) : "";
+    return { id: rootID, title: title || fallbackTitle };
   }
 </script>
 

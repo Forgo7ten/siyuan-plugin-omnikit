@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { compressOccurrence, RecordPersistenceError } from "../../../src/features/image-compressor/services/ImageProcessingServices.ts";
+import { compressOccurrence, persistEncodedImage, RecordPersistenceError } from "../../../src/features/image-compressor/services/ImageProcessingServices.ts";
 import { defaultImageFeatureConfig } from "../../../src/features/image-compressor/policy/parseImageConfig.ts";
 
 const target = {
@@ -50,4 +50,28 @@ test("confirmed record write precedes occurrence update", async () => {
     { replace: true });
   assert.deepEqual(result, { status: "saved", path: "assets/output.webp", reference: "replaced", originalBytes: 8, compressedBytes: 4 });
   assert.ok(calls.indexOf("record") < calls.indexOf("updateBlock"));
+});
+
+test("persistEncodedImage normalizes relative asset path and exposes uploaded path without capacity key on failure", async () => {
+  const copyCalls = [];
+  const upserts = [];
+  const service = {
+    origin: "http://localhost:6806",
+    assets: { async upload() { return "assets/output.webp"; } },
+    recordsReady: Promise.resolve(),
+    records: {
+      async upsert(orig, comp) {
+        upserts.push([orig, comp]);
+        throw new Error("write failed");
+      },
+    },
+    ui: { copyablePath(path, key) { copyCalls.push({ path, key }); } },
+  };
+  const webp = new File(["webp"], "image.webp", { type: "image/webp" });
+  await assert.rejects(
+    persistEncodedImage(service, "./assets/original.png", webp, target.rootID, new AbortController().signal),
+    error => error instanceof RecordPersistenceError && error.uploadedPath === "assets/output.webp",
+  );
+  assert.deepEqual(upserts, [["assets/original.png", "assets/output.webp"]]);
+  assert.deepEqual(copyCalls, [{ path: "assets/output.webp", key: undefined }]);
 });

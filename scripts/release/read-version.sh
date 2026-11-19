@@ -14,7 +14,7 @@ fi
 # 思源插件的发布版本以 plugin.json 为准。
 version="$(jq -r '.version // empty' plugin.json)"
 
-# 采用 X.Y.Z 版本格式，与 MicLock 的版本读取逻辑一致。
+# 校验版本是否符合 X.Y.Z SemVer 格式。
 if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "::error::plugin.json 中的 version 必须使用 X.Y.Z 格式" >&2
   exit 1

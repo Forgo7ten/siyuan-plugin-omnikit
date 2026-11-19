@@ -199,6 +199,7 @@
         {@const runtime = runtimeStatuses.find(status => status.id === entry.id)}
         {@const isSupported = isFrontendSupported(entry.frontends)}
         {@const isRunning = isSupported && enabled && runtime?.status === "enabled"}
+        {@const isConfigured = !manager && isSupported && enabled}
         {@const isError = isSupported && runtime?.status === "error"}
 
         <button
@@ -210,6 +211,7 @@
             <span
               class="status-indicator"
               class:running={isRunning}
+              class:configured={isConfigured}
               class:error={isError}
               class:unsupported={!isSupported}
               class:disabled={!enabled && isSupported}></span>
@@ -247,7 +249,7 @@
         <header class="card-header">
           <div class="card-title-group">
             <h2 class="card-title">{t("general.title")}</h2>
-            <p class="card-desc">{t("general.debugLogNote") || "管理插件全局偏好与运行行为"}</p>
+            <p class="card-desc">{t("general.description")}</p>
           </div>
         </header>
 
@@ -264,7 +266,7 @@
           <div class="setting-row">
             <div class="setting-info">
               <span class="setting-title">{t("general.debugLog")}</span>
-              <span class="setting-hint">仅输出到浏览器开发者工具控制台，不写入工作空间文件</span>
+              <span class="setting-hint">{t("general.debugLogNote")}</span>
             </div>
             <input
               class="b3-switch"
@@ -296,6 +298,8 @@
         {@const runtime = runtimeStatuses.find(status => status.id === entry.id)}
         {@const isSupported = isFrontendSupported(entry.frontends)}
         {@const isRunning = isSupported && enabled && runtime?.status === "enabled"}
+        {@const isConfigured = !manager && isSupported && enabled}
+        {@const derivedPhase = !isSupported ? "unsupported" : (runtime?.status ?? (isConfigured ? "configured" : "disabled"))}
 
         <section
           id="section-{entry.id}"
@@ -311,8 +315,13 @@
                     {t("runtime.unsupported")}
                   </span>
                 {:else}
-                  <span class="pill-badge" class:pill-active={isRunning} class:pill-error={runtime?.status === "error"} class:pill-muted={!enabled}>
-                    {t(`runtime.${runtime?.status ?? "disabled"}`)}
+                  <span
+                    class="pill-badge"
+                    class:pill-active={isRunning}
+                    class:pill-configured={isConfigured}
+                    class:pill-error={derivedPhase === "error"}
+                    class:pill-muted={!enabled && derivedPhase !== "error"}>
+                    {t(`runtime.${derivedPhase}`)}
                   </span>
                 {/if}
               </div>
@@ -345,7 +354,7 @@
             {/if}
 
             <div class="view-wrapper" class:view-dimmed={!enabled || !isSupported}>
-              <View store={settings.store(entry.id)} runtimePhase={runtime?.status ?? (!isSupported ? "unsupported" : "disabled")} {t} />
+              <View store={settings.store(entry.id)} runtimePhase={derivedPhase} {t} />
             </div>
           </div>
         </section>
@@ -481,6 +490,11 @@
     &.running {
       background: var(--b3-theme-success, #2ba471);
       box-shadow: 0 0 6px var(--b3-theme-success, #2ba471);
+    }
+
+    &.configured {
+      background: var(--b3-theme-primary, #3b82f6);
+      opacity: 0.85;
     }
 
     &.error {
@@ -619,6 +633,10 @@
     &.pill-active {
       background: var(--b3-theme-success-light, rgba(43, 164, 113, 0.15));
       color: var(--b3-theme-success, #2ba471);
+    }
+    &.pill-configured {
+      background: var(--b3-theme-primary-light, rgba(59, 130, 246, 0.12));
+      color: var(--b3-theme-primary, #3b82f6);
     }
     &.pill-error {
       background: var(--b3-theme-error-light, rgba(224, 62, 62, 0.15));

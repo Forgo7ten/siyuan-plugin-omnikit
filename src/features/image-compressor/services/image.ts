@@ -164,6 +164,7 @@ export type EncodeResult =
 export interface EncodeOptions {
   enforceSavings?: boolean;
   onSearchProgress?: (progress: any) => void;
+  originalInfo?: ImageInfo;
 }
 
 /**
@@ -248,7 +249,7 @@ export class BicEncoder implements ImageCodec {
     if (mode !== "manual-dialog" && blob.size < c.minInputBytes) return { kind: "skipped", reason: "below-minimum-input" };
     if (blob.size > c.maxInputBytes) throw new Error("Input exceeds byte limit");
 
-    const info = inspectImage(new Uint8Array(await blob.arrayBuffer()));
+    const info = options.originalInfo ?? inspectImage(new Uint8Array(await blob.arrayBuffer()));
     if (info.animated) return { kind: "skipped", reason: "animation-protected" };
     const declared = blob.type.split(";")[0].toLowerCase();
     if (declared.startsWith("image/") && declared !== info.mime) throw new Error("Image MIME/signature mismatch");

@@ -3,15 +3,18 @@ import type { Logger } from "../host/Logger.ts";
 import type { HostMenuContext, MenuRegistry } from "./MenuRegistry.ts";
 import { resolveEditorRootID } from "../host/ProtyleAdapter.ts";
 
-export interface SingleDocumentTarget {
-  rootID: string;
+function isNotebookDocTreeItem(item: any): boolean {
+  if (!item || typeof item !== "object") return false;
+  return item.type === "notebook"
+    || item.type === "navigation-root"
+    || item.type === "navigation-closed"
+    || item.kind === "notebook"
+    || item.path === "/";
 }
 
-export interface ImageMenuTarget {
-  element: HTMLImageElement;
-  url: string;
-  blockID?: string;
-  rootID?: string;
+function isNotebookDocTreeElement(el: any): boolean {
+  const nodeType = el?.getAttribute?.("data-type");
+  return nodeType === "navigation-root" || nodeType === "navigation-closed" || nodeType === "notebook";
 }
 
 /**
@@ -20,13 +23,13 @@ export interface ImageMenuTarget {
  */
 export function extractDocTreeDocumentIDs(detail: any): string[] {
   if (!detail) return [];
+  if (detail.type === "notebook" || detail.type === "notebooks") return [];
   const ids: string[] = [];
 
   if (Array.isArray(detail.items)) {
     for (const item of detail.items) {
-      if (item && typeof item.id === "string") {
-        const itemType = item.type;
-        if (itemType === "notebook" || itemType === "navigation-root" || detail.type === "notebook") {
+      if (item && typeof item.id === "string" && item.id) {
+        if (isNotebookDocTreeItem(item)) {
           continue;
         }
         ids.push(item.id);
@@ -35,8 +38,7 @@ export function extractDocTreeDocumentIDs(detail: any): string[] {
   } else if (detail.elements) {
     const elements = Array.from(detail.elements as ArrayLike<HTMLElement>);
     for (const el of elements) {
-      const nodeType = el?.getAttribute?.("data-type");
-      if (nodeType && (nodeType === "navigation-root" || nodeType === "notebook")) {
+      if (isNotebookDocTreeElement(el)) {
         continue;
       }
       const id = el?.getAttribute?.("data-node-id") ?? (el as any)?.dataset?.id;
@@ -81,8 +83,11 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
     if (!detail?.menu) return;
     const selectedDocumentIDs = extractDocTreeDocumentIDs(detail);
     const selectedDocumentCount = selectedDocumentIDs.length;
-    const rootID = selectedDocumentCount === 1 ? selectedDocumentIDs[0] : undefined;
-    const targetElement = detail.elements?.[0] ?? detail.element;
+    const rootID = detail.type !== "items" && selectedDocumentCount === 1 ? selectedDocumentIDs[0] : undefined;
+    const rawElements = detail.elements ? Array.from(detail.elements as ArrayLike<HTMLElement>) : [];
+    const targetElement = detail.type === "notebook" || detail.type === "notebooks"
+      ? undefined
+      : (rawElements.find(el => !isNotebookDocTreeElement(el)) ?? (detail.elements ? undefined : detail.element));
     const protyle = detail.protyle;
 
     logger?.debug("打开文档树菜单", { selectedDocumentIDs, selectedDocumentCount, rootID });
@@ -182,65 +187,5 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
     plugin.eventBus.off("open-menu-image", imageHandler);
     plugin.eventBus.off("open-menu-link", linkHandler);
     plugin.eventBus.off("click-blockicon", blockIconHandler);
-  };
-}
-
-/**
- * Backward compatibility helper for analyzing a doc tree target expecting a single document.
- */
-export function analyzeDocTreeTarget(detail: any): { target?: SingleDocumentTarget; reason?: string } {
-  if (!detail?.menu) return { reason: "no-menu" };
-
-  const items = Array.isArray(detail.items) ? detail.items : undefined;
-  const elements = detail.elements ? Array.from(detail.elements as ArrayLike<HTMLElement>) : undefined;
-
-  if (items && items.length !== 1) return { reason: `multi-selection:${items.length}` };
-  if (elements && elements.length !== 1) return { reason: `multi-selection:${elements.length}` };
-  if (!items && !elements) return { reason: "no-target" };
-
-  if (detail.type && detail.type !== "doc") return { reason: `not-a-document:${detail.type}` };
-
-  const element = elements?.[0];
-  const nodeType = element?.getAttribute?.("data-type");
-  if (nodeType && nodeType !== "navigation-file") return { reason: `not-a-document-node:${nodeType}` };
-
-  const ids = extractDocTreeDocumentIDs(detail);
-  if (ids.length !== 1) return { reason: ids.length === 0 ? "no-id" : `multi-selection:${ids.length}` };
-  return { target: { rootID: ids[0] } };
-}
-
-export function resolveSingleDocTreeItem(detail: any): SingleDocumentTarget | undefined {
-  return analyzeDocTreeTarget(detail).target;
-}
-
-/** Compact, log-safe summary of an unknown host detail shape. */
-export function describeDocTreeDetail(detail: any): Record<string, unknown> {
-  const items = Array.isArray(detail?.items) ? detail.items : undefined;
-  const elements = detail?.elements ? Array.from(detail.elements as ArrayLike<HTMLElement>) : undefined;
-  return {
-    keys: detail && typeof detail === "object" ? Object.keys(detail) : undefined,
-    items: items?.length,
-    elements: elements?.length,
-    type: detail?.type,
-    nodeType: elements?.[0]?.getAttribute?.("data-type"),
-    hasMenu: Boolean(detail?.menu),
-  };
-}
-
-/** Backward compatibility helper for image menu target resolution. */
-export function resolveImageMenuTarget(detail: any): ImageMenuTarget | undefined {
-  const element = detail?.element as HTMLElement | undefined;
-  if (!element) return undefined;
-  const image = element.tagName?.toLowerCase() === "img"
-    ? element as unknown as HTMLImageElement
-    : element.querySelector?.("img") as HTMLImageElement | null;
-  if (!image) return undefined;
-  const url = image.getAttribute("data-src") || image.getAttribute("src") || "";
-  if (!url) return undefined;
-  return {
-    element: image,
-    url,
-    blockID: image.closest("[data-node-id]")?.getAttribute("data-node-id") ?? undefined,
-    rootID: resolveEditorRootID(detail),
   };
 }

@@ -42,8 +42,8 @@ Asynchronously fetches webpage titles in the background and populates hyperlink 
 - **Preserves Custom Text**: If the pasted content is a Markdown link with an existing title (e.g. `[title](url)`) or the link text has been manually edited, no modification is made.
 - **Static File Link Detection**: Links pointing to common non-web files (such as `.pdf`, `.zip`, `.exe`, etc.) extract and decode filenames directly from the URL without making network requests.
 - **Context Menu Actions**:
-  - Right-click an individual link and choose `[OmniKit] Fetch Page Title` to manually trigger re-fetching;
-  - Right-click a block icon and choose `[OmniKit] Fetch Link Titles in Current Block` to process all hyperlinks in the block.
+  - Right-click an individual link and choose `[OmniKit] Fetch link title` to manually trigger re-fetching;
+  - Right-click a block icon and choose `[OmniKit] Fetch link titles (N)` to process all HTTP/HTTPS hyperlinks in the block.
 - **Undo Support**: Title insertion is performed through SiYuan's native editor transaction and can be undone with `Ctrl+Z`.
 
 ## 2. Image Compressor & Localization
@@ -52,10 +52,10 @@ Converts images into WebP format and downloads remote image URLs into local work
 
 - **Automatic Compression for New Images**: Newly pasted or dropped images are compressed into WebP in the background. Can be configured to run globally or restricted to an allowlist of specific documents.
 - **Manual Single Image Compression & Preview**:
-  - Right-click an image in the editor and choose `[OmniKit] Compress Image` for immediate conversion;
-  - Choose `[OmniKit] Compress...` to open a preview dialog where compression quality can be adjusted while comparing visual quality and file sizes, with options to save as an asset only or replace the document reference.
-- **Document Batch Compression**: Right-click a document node in the file tree or on the document title bar and choose `[OmniKit] Compress Images in Document` to process all images in the document.
-- **Remote Image Localization**: Detects external HTTP/HTTPS images in documents and downloads them into the local `assets/` directory.
+  - Right-click an image in the editor and choose `[OmniKit] Compress this image` for immediate conversion;
+  - Choose `[OmniKit] Compress…` to open a preview dialog where compression quality can be adjusted while comparing visual quality and file sizes, with options to save as an asset only or replace the document reference.
+- **Document Batch Compression**: Right-click a document node in the file tree, on the document title bar (`[OmniKit] Compress all images in this document`), or select **Compress all images in this document** from the top-bar menu to process all images in the document.
+- **Remote Image Localization**: Detects newly inserted external HTTP/HTTPS images in authorized documents and downloads them into the local `assets/` directory.
 - **Records Dock & Reference Revert**:
   - Open the OmniKit Dock in the sidebar to view historical compression mappings and statuses;
   - Jump to and highlight corresponding image blocks in the editor;
@@ -65,11 +65,12 @@ Converts images into WebP format and downloads remote image URLs into local work
 
 # Usage & Settings
 
-1. Click the OmniKit icon in the SiYuan top bar and select **OmniKit Settings**;
+1. Click the OmniKit icon in the SiYuan top bar and select **OmniKit settings**;
 2. Toggle individual feature modules on or off;
 3. Available options:
-   - **Image Compressor**: smart compression toggle (MS-SSIM adaptive search), target similarity, fixed compression quality, maximum dimension limit, remote image localization, global mode, and document allowlists;
-   - **Titled Link**: sync to tooltip attribute (`data-title`), network timeout, and fallback display behavior on request failure.
+   - **General**: console debug logging and shared network `User-Agent`;
+   - **Image Compressor**: global automatic compression toggle, document allowlist, smart compression toggle (MS-SSIM adaptive search), target similarity, initial quality, and manual maximum edge limit;
+   - **Titled Link**: fetch link titles on paste, sync hover title attribute (`data-title`), fallback to hostname on fetch failure, and maximum title length.
 
 ---
 

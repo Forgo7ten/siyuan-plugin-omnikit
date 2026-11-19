@@ -6,7 +6,6 @@ import { SettingsManager } from "./store/SettingsManager.ts";
 import { MenuRegistry } from "./feedback/MenuRegistry.ts";
 import { installMenuRouter } from "./feedback/MenuRouter.ts";
 import { Logger } from "./host/Logger.ts";
-import { Compatibility } from "./host/Compatibility.ts";
 import { UiFeedback } from "./feedback/UiFeedback.ts";
 import { PluginStatusBar } from "./feedback/PluginStatusBar.ts";
 import { imageCompressorRegistration } from "../features/image-compressor/registration.ts";
@@ -23,14 +22,13 @@ import "../styles/index.scss";
 const registrations = [imageCompressorRegistration, titledLinkRegistration];
 
 /**
- * @migration-settings-window SiYuan 3.8.7+: a body--settings instance may mount stores
- * and Svelte SettingsRoot only; never initialize host menus, Dock or auto-upload listeners.
- * Settings changes synchronize through onDataChanged, not shared JS memory.
+ * @design A `body--settings` instance mounts stores and Svelte `SettingsRoot` only;
+ * host menus, Dock, and feature runtime run exclusively in main window instances.
+ * Settings changes synchronize across instances via `onDataChanged` rather than shared memory.
  */
 export class OmniKitPlugin extends Plugin {
   private readonly catalog = new FeatureCatalog();
   private readonly logger = Logger.shared;
-  private readonly compatibility = new Compatibility();
   private settingsManager?: SettingsManager;
   private manager?: FeatureManager;
   private menuRegistry?: MenuRegistry;
@@ -92,7 +90,6 @@ export class OmniKitPlugin extends Plugin {
         plugin: this,
         settings,
         menus,
-        compatibility: this.compatibility,
         logger: this.logger,
         feedback,
         statusBar: this.statusBar,
@@ -101,11 +98,10 @@ export class OmniKitPlugin extends Plugin {
       this.disposeStatusSubscription = this.manager.subscribeStatus(() => this.refreshDock?.());
     }
     this.settingsWindow = createSettingsWindow({
-      registrations, settings, manager: this.manager, t: key => this.t(key),
+      registrations, settings, manager: this.manager, t: (key, values) => this.t(key, values),
     });
 
     if (this.settingsInstance) {
-      this.settingsWindow.open();
       return;
     }
     if (this.unloading) return;
@@ -141,19 +137,11 @@ export class OmniKitPlugin extends Plugin {
   }
 
   async onDataChanged(): Promise<void> {
+    await this.ready?.catch(() => undefined);
     if (this.unloading || !this.settingsManager) return;
-    const changed = await this.settingsManager.reloadAfterExternalChange();
-    if (this.unloading) return;
     if (!this.settingsInstance && this.manager) {
-      if (changed.length > 0) {
-        if (changed.includes("core")) await this.manager.reconcileFromLoadedSettings();
-        for (const id of changed) {
-          if (id !== "core") await this.manager.notifySettingsChanged(id);
-        }
-        this.refreshDock?.();
-      }
       for (const registration of registrations) {
-        if (registration.reloadData && this.manager.isRunning(registration.id)) {
+        if (registration.reloadData) {
           try {
             await registration.reloadData(this);
           } catch (error) {
@@ -161,7 +149,17 @@ export class OmniKitPlugin extends Plugin {
           }
         }
       }
+      if (this.unloading) return;
+      const changed = await this.settingsManager.reloadAfterExternalChange();
+      if (this.unloading) return;
+      if (changed.includes("core")) await this.manager.reconcileFromLoadedSettings();
+      for (const id of changed) {
+        if (id !== "core") await this.manager.notifySettingsChanged(id);
+      }
+      this.refreshDock?.();
+      return;
     }
+    await this.settingsManager.reloadAfterExternalChange();
   }
 
   async onunload(): Promise<void> {

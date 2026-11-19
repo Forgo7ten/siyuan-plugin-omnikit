@@ -13,7 +13,7 @@ function setup() {
   const services = { origin: "https://siyuan.test", config: () => ({}) };
   let compressCalls = 0;
   services.compressOccurrence = async () => { compressCalls++; return { status: "skipped" }; };
-  registerAutoUpload(plugin, scope, async () => true, services,
+  registerAutoUpload(plugin, scope, () => true, services,
     { warn() {}, debug() {} });
   return { listener: listeners.get("before-upload-assets"), scope, services, get compressCalls() { return compressCalls; } };
 }
@@ -90,12 +90,18 @@ test("unauthorized document upload remains completely silent without emitting no
     off(name) { listeners.delete(name); },
   } };
   const scope = new FeatureScope();
-  const services = { origin: "https://siyuan.test", config: () => ({}) };
+  let compressCalls = 0;
+  const services = {
+    origin: "https://siyuan.test",
+    config: () => ({}),
+    compressOccurrence: async () => { compressCalls++; return { status: "skipped" }; },
+  };
   const notices = [];
+  let authorized = true;
   registerAutoUpload(
     plugin,
     scope,
-    async () => false, // unauthorized!
+    () => authorized,
     services,
     { warn() {}, debug() {} },
     notice => notices.push(notice),
@@ -112,6 +118,8 @@ test("unauthorized document upload remains completely silent without emitting no
     },
   });
 
+  // Revoke authorization before native upload completes
+  authorized = false;
   completeCallback({
     requestId: "upload-unauth",
     status: "success",
@@ -119,6 +127,7 @@ test("unauthorized document upload remains completely silent without emitting no
   });
 
   await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(compressCalls, 0);
   assert.equal(notices.length, 0);
   scope.dispose();
 });
@@ -130,6 +139,7 @@ test("upload where all images are skipped remains completely silent without emit
     off(name) { listeners.delete(name); },
   } };
   const scope = new FeatureScope();
+  let compressCalls = 0;
   const services = {
     origin: "https://siyuan.test",
     config: () => ({}),
@@ -141,57 +151,85 @@ test("upload where all images are skipped remains completely silent without emit
         return { data: {} };
       },
     },
-    compressOccurrence: async () => ({ status: "skipped" }),
+    compressOccurrence: async () => {
+      compressCalls++;
+      return { status: "skipped" };
+    },
   };
   const notices = [];
-  registerAutoUpload(
-    plugin,
-    scope,
-    async () => true, // authorized
-    services,
-    { warn() {}, debug() {} },
-    notice => notices.push(notice),
-  );
-
-  const mockEditor = {
-    querySelectorAll() {
-      const img = {
-        hasAttribute(attr) { return attr === "src"; },
-        getAttribute(attr) { return attr === "src" ? "assets/skipped.png" : null; },
-        closest() {
-          return {
-            dataset: { nodeId: "block-1" },
-            querySelectorAll() { return [img]; },
-          };
-        },
+  const priorDocument = globalThis.document;
+  const makeImgNode = () => ({
+    hasAttribute(attr) { return attr === "src"; },
+    getAttribute(attr) { return attr === "src" ? "assets/skipped.png" : null; },
+  });
+  const makeBlockNode = () => ({
+    getAttribute(attr) { return attr === "data-node-id" ? "block-1" : null; },
+    querySelector(selector) { return selector === "[data-node-id]" ? null : null; },
+    querySelectorAll(selector) { return selector === "img" ? [makeImgNode()] : []; },
+  });
+  globalThis.document = {
+    createElement(name) {
+      assert.equal(name, "template");
+      return {
+        content: { children: [makeBlockNode()] },
+        set innerHTML(_) {},
       };
-      return [img];
     },
   };
 
-  const listener = listeners.get("before-upload-assets");
-  let completeCallback;
-  listener({
-    detail: {
-      requestId: "upload-skip",
-      target: "editor",
-      protyle: {
-        element: mockEditor,
-        block: { rootID: "doc-skip", box: "box-1" },
+  try {
+    registerAutoUpload(
+      plugin,
+      scope,
+      () => true, // authorized
+      services,
+      { warn() {}, debug() {} },
+      notice => notices.push(notice),
+    );
+
+    const mockEditor = {
+      querySelectorAll() {
+        const img = {
+          hasAttribute(attr) { return attr === "src"; },
+          getAttribute(attr) { return attr === "src" ? "assets/skipped.png" : null; },
+          closest() {
+            return {
+              dataset: { nodeId: "block-1" },
+              querySelectorAll() { return [img]; },
+            };
+          },
+        };
+        return [img];
       },
-      onComplete(cb) { completeCallback = cb; },
-    },
-  });
+    };
 
-  completeCallback({
-    requestId: "upload-skip",
-    status: "success",
-    succFiles: [{ index: 0, path: "assets/skipped.png" }],
-  });
+    const listener = listeners.get("before-upload-assets");
+    let completeCallback;
+    listener({
+      detail: {
+        requestId: "upload-skip",
+        target: "editor",
+        protyle: {
+          element: mockEditor,
+          block: { rootID: "doc-skip", box: "box-1" },
+        },
+        onComplete(cb) { completeCallback = cb; },
+      },
+    });
 
-  await new Promise(resolve => setTimeout(resolve, 50));
-  assert.equal(notices.length, 0);
-  scope.dispose();
+    completeCallback({
+      requestId: "upload-skip",
+      status: "success",
+      succFiles: [{ index: 0, path: "assets/skipped.png" }],
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 140));
+    assert.equal(compressCalls, 1);
+    assert.equal(notices.length, 0);
+  } finally {
+    globalThis.document = priorDocument;
+    scope.dispose();
+  }
 });
 
 test("synchronously unauthorized document upload does not register onComplete or observer", () => {
@@ -250,4 +288,88 @@ test("AssetStore verifies upload persistence from kernel upload contract without
   };
   const storeFailed = new AssetStore(kernelFailed, "https://siyuan.test");
   await assert.rejects(storeFailed.upload(testFile, "20240101000000-abcdefg"), UploadOutcomeUnknown);
+});
+
+test("H1: before-upload-assets listener swallows synchronous errors from services.config() without breaking native upload", () => {
+  const listeners = new Map();
+  const plugin = { eventBus: {
+    on(name, handler) { listeners.set(name, handler); },
+    off(name) { listeners.delete(name); },
+  } };
+  const scope = new FeatureScope();
+  const warnings = [];
+  registerAutoUpload(
+    plugin,
+    scope,
+    () => true,
+    { origin: "https://siyuan.test", config() { throw new Error("boom in config"); } },
+    { warn(msg, data) { warnings.push({ msg, data }); }, debug() {} },
+  );
+
+  const listener = listeners.get("before-upload-assets");
+  assert.doesNotThrow(() => {
+    listener({
+      detail: {
+        requestId: "upload-err-config",
+        target: "editor",
+        protyle: { block: { rootID: "20240101000000-abcdefg", box: "20240101000000-abcdefg" } },
+        onComplete() {},
+      },
+    });
+  });
+  assert.equal(warnings.length, 1);
+  scope.dispose();
+});
+
+test("H1: before-upload-assets listener disconnects MutationObserver and swallows errors if onComplete registration throws", () => {
+  const listeners = new Map();
+  const plugin = { eventBus: {
+    on(name, handler) { listeners.set(name, handler); },
+    off(name) { listeners.delete(name); },
+  } };
+  const scope = new FeatureScope();
+  const warnings = [];
+  const priorObserver = globalThis.MutationObserver;
+  const instances = [];
+  globalThis.MutationObserver = class {
+    constructor() {
+      this.observed = false;
+      this.disconnected = false;
+      instances.push(this);
+    }
+    observe() { this.observed = true; }
+    disconnect() { this.disconnected = true; }
+  };
+
+  try {
+    registerAutoUpload(
+      plugin,
+      scope,
+      () => true,
+      { origin: "https://siyuan.test", config: () => ({}) },
+      { warn(msg, data) { warnings.push({ msg, data }); }, debug() {} },
+    );
+
+    const listener = listeners.get("before-upload-assets");
+    assert.doesNotThrow(() => {
+      listener({
+        detail: {
+          requestId: "upload-err-observer",
+          target: "editor",
+          protyle: {
+            element: {},
+            block: { rootID: "20240101000000-abcdefg", box: "20240101000000-abcdefg" },
+          },
+          onComplete() { throw new Error("onComplete failed"); },
+        },
+      });
+    });
+    assert.equal(instances.length, 1);
+    assert.equal(instances[0].observed, true);
+    assert.equal(instances[0].disconnected, true);
+    assert.equal(warnings.length, 1);
+  } finally {
+    globalThis.MutationObserver = priorObserver;
+    scope.dispose();
+  }
 });

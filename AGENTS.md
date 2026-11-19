@@ -26,9 +26,9 @@ OmniKit 是面向思源笔记（SiYuan Note）的生产级多合一工具箱插�
 - **文档是唯一的真理之源**：业务代码（`src/` 目录下所有实现）必须且只能是 PRD 与架构规范的物理落地。代码实现绝不能超前于文档，更不允许“先写代码，后补文档”。
 - **严禁擅自臆想功能**：严禁脱离 PRD 文档自行增减功能行为、修改交互流程、随意添加用户界面元素（例如未定义的按钮、快捷键或菜单项）、擅自增加设置选项或更改持久化路径。
 - **新功能准入流程**：
-  1. 在 `docs/features/<feature-name>.md` 编写完整的特性业务与约束 PRD；
+  1. 在 `docs/features/<feature-name>/PRD.md` 编写完整的特性业务与约束 PRD；
   2. 经过评审并完成需求冻结（Spec-Freeze）；
-  3. 按照 PRD 规划技术实现架构，并在 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 完成技术设计；
+  3. 按照 PRD 规划技术实现架构，在 `docs/features/<feature-name>/DESIGN.md` 与 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 完成技术设计；
   4. 方可启动 `src/features/<feature-name>/` 下的代码开发与自动化测试。
 
 ### 1.2 变更同步要求
@@ -115,7 +115,7 @@ OmniKit 的持久化文件严格划分为 **Core 平台配置**、**Feature 用�
 - **规则 1：设置重置绝对严禁触碰数据文件 (Reset Settings Scope Guard)**  
   无论是单个 Feature 的“重置设置”，还是插件全局的“恢复默认设置”，**操作作用域严格限定为 `omnikit-core.json` 与 `feature-*-settings.json`**。任何设置重置逻辑在代码层面绝对禁止读取、覆盖或删除任何 `feature-*-{dataname}.json` 业务数据文件！
 - **规则 2：业务数据必须独立管理与确认 (Isolated Data Management)**  
-  业务数据记录的清理必须且只能在插件总设置中专门开辟的**“数据管理 (Data Management)”专区**中进行。系统必须向用户清晰列出数据文件名、记录条数、占用体积，并在用户二次确认后方可显式清空或归档。
+  业务数据记录的清理绝对禁止与设置重置混杂，且不主动删除任何物理图片或资源资产。现行单条业务记录移除由对应特性提供的专门视图（如 Dock 记录面板“移除记录”）显式操作；插件总设置内面向数据文件级的集中清空界面（展示数据文件名、记录条数、占用体积并经二次确认清空全部插件业务数据）作为独立的“数据管理 (Data Management)”专区规划能力进行演进，详见 [`docs/CORE-PRD.md`](docs/CORE-PRD.md)。
 
 ---
 
@@ -155,7 +155,7 @@ OmniKit 的持久化文件严格划分为 **Core 平台配置**、**Feature 用�
 
 在提交任何代码前，AI Agent 与人类开发者必须逐项核对以下清单：
 
-- [ ] **PRD 依从性**：新增或修改的代码是否严格符合对应的 [`docs/CORE-PRD.md`](docs/CORE-PRD.md) 或 [`docs/features/*.md`](docs/features/)？是否有私自增加的 UI 按钮、未定义的设置项或未记录的副作用？
+- [ ] **PRD 依从性**：新增或修改的代码是否严格符合对应的 [`docs/CORE-PRD.md`](docs/CORE-PRD.md) 或 [`docs/features/*/PRD.md`](docs/features/)？是否有私自增加的 UI 按钮、未定义的设置项或未记录的副作用？
 - [ ] **解耦性**：新增的 Feature 代码是否完全自包含在自己的目录中？是否存在对其他 Feature 的直接 import？
 - [ ] **存储合规**：新引入的持久化文件是否严格符合 `feature-{featureid}-settings.json` 或 `feature-{featureid}-{dataname}.json` 的命名规范？重置设置时是否绝对不会影响数据文件？
 - [ ] **资源安全性**：代码中是否不存在任何主动删除用户文件或资产产物的行为？是否存在向思源工作区写入非必要临时文件的行为？

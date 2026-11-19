@@ -19,10 +19,6 @@ let defaultShowMessage: ShowMessageFn = (message, timeout, type) => {
   }
 };
 
-export function setDefaultShowMessage(fn: ShowMessageFn): void {
-  defaultShowMessage = fn;
-}
-
 export function isAbortError(error: unknown): boolean {
   if (!error) return false;
   if (typeof error === "object") {
@@ -91,26 +87,8 @@ export class UiFeedback {
     this.notify(msg, "error");
   }
 
-  async copyable(
-    scopeOrText?: FeatureScope | string,
-    textOrNotice?: string,
-    maybeNotice?: string,
-  ): Promise<boolean> {
-    let targetScope: FeatureScope | undefined;
-    let text: string;
-    let notice: string | undefined;
-
-    if (typeof scopeOrText === "object" && scopeOrText !== null && "active" in scopeOrText) {
-      targetScope = scopeOrText as FeatureScope;
-      text = textOrNotice ?? "";
-      notice = maybeNotice;
-    } else {
-      targetScope = this.scope;
-      text = typeof scopeOrText === "string" ? scopeOrText : (textOrNotice ?? "");
-      notice = typeof scopeOrText === "string" ? textOrNotice : maybeNotice;
-    }
-
-    if (targetScope && !targetScope.active) return false;
+  async copyable(text: string, notice?: string): Promise<boolean> {
+    if (this.scope && !this.scope.active) return false;
     if (!text) return false;
 
     try {
@@ -121,6 +99,7 @@ export class UiFeedback {
       } else {
         return false;
       }
+      if (this.scope && !this.scope.active) return false;
       if (notice) {
         this.notify(notice);
       }

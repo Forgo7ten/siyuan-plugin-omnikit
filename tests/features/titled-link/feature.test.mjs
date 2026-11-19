@@ -83,15 +83,20 @@ test("feature lifecycle activates event listeners, contributes menus, and dispos
   assert.ok(linkMenu, "Link menu must be contributed");
   assert.ok(blockMenu, "Block menu must be contributed");
 
-  // Test link menu callback returns item for link element
-  const mockLink = {
-    getAttribute(attr) { return attr === "data-type" ? "a" : attr === "data-href" ? "https://example.com" : null; },
-    textContent: "https://example.com",
-  };
+  // Test link menu callback returns item for HTTP/HTTPS and skips non-HTTP(S) schemes
+  const makeLink = href => ({
+    getAttribute(attr) { return attr === "data-type" ? "a" : attr === "data-href" ? href : null; },
+    textContent: href,
+  });
   const mockProtyle = { element: { addEventListener() {}, removeEventListener() {} } };
-  const singleItems = linkMenu.handler({ detail: { element: mockLink, protyle: mockProtyle } });
-  assert.equal(singleItems.length, 1);
-  assert.equal(singleItems[0].id, "extract-link-title");
+  const singleHttps = linkMenu.handler({ detail: { element: makeLink("https://example.com"), protyle: mockProtyle } });
+  assert.equal(singleHttps.length, 1);
+  assert.equal(singleHttps[0].id, "extract-link-title");
+  assert.equal(linkMenu.handler({ detail: { element: makeLink("http://example.com"), protyle: mockProtyle } }).length, 1);
+  assert.deepEqual(linkMenu.handler({ detail: { element: makeLink("mailto:user@example.com"), protyle: mockProtyle } }), []);
+  assert.deepEqual(linkMenu.handler({ detail: { element: makeLink("siyuan://blocks/20260101000000-abcdefg"), protyle: mockProtyle } }), []);
+  assert.deepEqual(linkMenu.handler({ detail: { element: makeLink("javascript:alert(1)"), protyle: mockProtyle } }), []);
+  assert.deepEqual(linkMenu.handler({ detail: { element: makeLink(""), protyle: mockProtyle } }), []);
 
   // Deactivate feature and verify cleanup
   await feature.deactivate();

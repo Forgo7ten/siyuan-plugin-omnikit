@@ -31,6 +31,7 @@ export interface FetchTitleResourceOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 8_000;
+const DEFAULT_MAX_BYTES = 64 * 1024;
 
 export async function fetchTitleResource(options: FetchTitleResourceOptions): Promise<TitleResource> {
   const timeoutMs = positiveTimeout(options.timeoutMs);
@@ -81,9 +82,8 @@ async function fetchDirect(options: FetchTitleResourceOptions, timeoutMs: number
 }
 
 async function fetchThroughProxy(options: FetchTitleResourceOptions, timeoutMs: number): Promise<TitleResource> {
-  // TODO(titled-link 3.3): SiYuan forwardProxy calls response.Bytes() before returning JSON.
-  // Its current API cannot expose a stream or cancel the remote TCP connection at </title>.
-  // Keep this transport limitation visible until a host API supports bounded streaming.
+  // SiYuan's /api/network/forwardProxy returns a complete base64-encoded body rather than a stream;
+  // decode only the bounded prefix required for head/title inspection.
   const response = await options.kernelClient.post<ForwardProxyData>("/api/network/forwardProxy", {
     url: options.url,
     method: "GET",
@@ -103,12 +103,65 @@ async function fetchThroughProxy(options: FetchTitleResourceOptions, timeoutMs: 
     status: data.status,
     ok: data.status >= 200 && data.status < 300,
     contentType: data.contentType ?? "",
-    body: decodeBase64(data.body),
+    body: decodeBase64(data.body, DEFAULT_MAX_BYTES),
   };
 }
 
-function decodeBase64(value: string): Uint8Array {
-  const decoded = globalThis.atob(value);
+export function decodeBase64(value: string, maxBytes = DEFAULT_MAX_BYTES): Uint8Array {
+  const boundedBytes = Number.isInteger(maxBytes) && maxBytes > 0 ? maxBytes : DEFAULT_MAX_BYTES;
+  const maxChars = Math.ceil((boundedBytes + 1) / 3) * 4;
+  let cleaned = "";
+  let padding = 0;
+  let runStart = -1;
+
+  for (let index = 0; index < value.length && cleaned.length + (runStart >= 0 ? index - runStart : 0) < maxChars; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code === 9 || code === 10 || code === 12 || code === 13 || code === 32) {
+      if (runStart >= 0) {
+        cleaned += value.slice(runStart, index);
+        runStart = -1;
+      }
+      continue;
+    }
+
+    const isBase64Digit =
+      (code >= 65 && code <= 90) ||
+      (code >= 97 && code <= 122) ||
+      (code >= 48 && code <= 57) ||
+      code === 43 ||
+      code === 47;
+
+    if (isBase64Digit) {
+      if (padding > 0) {
+        throw new Error("Invalid base64 data after padding");
+      }
+      if (runStart < 0) runStart = index;
+      continue;
+    }
+
+    if (code === 61) {
+      const currentLength = cleaned.length + (runStart >= 0 ? index - runStart : 0);
+      if (currentLength % 4 < 2 || padding >= 2) {
+        throw new Error("Invalid base64 padding");
+      }
+      padding += 1;
+      if (runStart < 0) runStart = index;
+      continue;
+    }
+
+    throw new Error(`Invalid base64 character at index ${index}`);
+  }
+
+  if (runStart >= 0) {
+    const remaining = maxChars - cleaned.length;
+    cleaned += value.slice(runStart, Math.min(value.length, runStart + remaining));
+  }
+
+  if (cleaned.length % 4 !== 0) {
+    throw new Error("Invalid base64 length");
+  }
+
+  const decoded = globalThis.atob(cleaned);
   const bytes = new Uint8Array(decoded.length);
   for (let index = 0; index < decoded.length; index += 1) bytes[index] = decoded.charCodeAt(index);
   return bytes;

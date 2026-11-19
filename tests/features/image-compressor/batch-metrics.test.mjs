@@ -26,3 +26,14 @@ test('rewritten references count individually while resource bytes count once pe
   assert.equal(result.newReferencedBytes, 700);
   assert.equal(result.logicalReductionBytes, 800);
 });
+
+test('DocumentBatchAction does not call ui.notify directly or emit capacityReached', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const [batch, controller] = await Promise.all([
+    readFile(new URL('../../../src/features/image-compressor/actions/DocumentBatchAction.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../../../src/features/image-compressor/ImageController.ts', import.meta.url), 'utf8'),
+  ]);
+  assert.doesNotMatch(batch, /capacityReached|isRecordCapacityError/);
+  assert.doesNotMatch(batch, /services\.ui\.notify\(/);
+  assert.doesNotMatch(controller, /capacityReached|capacityNotice/);
+});

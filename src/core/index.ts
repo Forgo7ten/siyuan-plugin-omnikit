@@ -7,7 +7,6 @@ export * from "./framework/FeatureRegistration.ts";
 export * from "./framework/FeatureScope.ts";
 
 // Host & Kernel Adapters
-export * from "./host/Compatibility.ts";
 export * from "./host/KernelClient.ts";
 export * from "./host/Logger.ts";
 export * from "./host/Platform.ts";

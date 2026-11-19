@@ -12,9 +12,20 @@ test("uses title before OpenGraph and Twitter metadata and normalizes entities a
   assert.deepEqual(extractNormalizedTitle(html, "https://example.com", defaults), { title: "Main & Title", source: "title" });
 });
 
-test("ignores SVG title in body and extracts title from head", () => {
+test("ignores SVG title in body and extracts title from head or unclosed streamed head", () => {
   const html = '<html><head><title>Actual Page Title</title></head><body><svg><title>Close Button</title></svg></body></html>';
   assert.deepEqual(extractNormalizedTitle(html, "https://example.com", defaults), { title: "Actual Page Title", source: "title" });
+
+  // Stream parser cancels right after </title>, before </head> arrives
+  const streamedHead = '<html><head><title>Streamed Title</title>';
+  assert.deepEqual(extractNormalizedTitle(streamedHead, "https://example.com", defaults), { title: "Streamed Title", source: "title" });
+
+  // Headless HTML or body-only SVG icon <title> must not leak into page title
+  const bodySvgOnly = '<html><body><svg><title>Close Icon</title></svg><p>hello</p></body></html>';
+  assert.deepEqual(extractNormalizedTitle(bodySvgOnly, "https://example.com", defaults), { title: "example.com", source: "hostname" });
+
+  const headlessWithSvg = '<svg><title>Icon</title></svg><title>Real Headless Title</title>';
+  assert.deepEqual(extractNormalizedTitle(headlessWithSvg, "https://example.com", defaults), { title: "Real Headless Title", source: "title" });
 });
 
 test("supports metadata attribute order variations and fallback priority", () => {

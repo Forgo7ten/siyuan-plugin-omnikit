@@ -86,8 +86,10 @@ export class SettingsManager {
   }
 
   async load(): Promise<void> {
-    await this.core.load();
-    for (const store of this.featureStores.values()) await store.load();
+    const stores = [this.core, ...this.featureStores.values()];
+    const results = await Promise.allSettled(stores.map(store => store.load()));
+    const firstFailure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (firstFailure) throw firstFailure.reason;
   }
 
   get needsRecovery(): boolean {
@@ -137,10 +139,18 @@ export class SettingsManager {
 
   /** Called on SiYuan onDataChanged. Never writes files back. */
   async reloadAfterExternalChange(): Promise<string[]> {
+    const entries: Array<[string, JsonStore<any>]> = [["core", this.core], ...this.featureStores.entries()];
+    const results = await Promise.allSettled(
+      entries.map(async ([id, store]) => ({ id, changed: await store.reload() })),
+    );
     const changed: string[] = [];
-    if (await this.core.reload()) changed.push("core");
-    for (const [id, store] of this.featureStores) {
-      if (await store.reload()) changed.push(id);
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      if (result.status === "fulfilled") {
+        if (result.value.changed) changed.push(result.value.id);
+      } else {
+        console.warn(`[OmniKit][warn] 重载配置失败 (${entries[i][0]}):`, result.reason);
+      }
     }
     return changed;
   }

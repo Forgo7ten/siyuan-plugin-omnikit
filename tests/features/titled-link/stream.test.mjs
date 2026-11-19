@@ -60,3 +60,25 @@ test("aborting a stream read cancels the underlying reader", async () => {
   await assert.rejects(pending, /scope ended/);
   assert.equal(cancelled, true);
 });
+
+test("detects split closing tag with whitespace across multiple chunks using 64-char overlap window", async () => {
+  let cancelled = false;
+  const encoder = new TextEncoder();
+  const c1 = encoder.encode("<html><head><title>Split Title</ti");
+  const c2 = encoder.encode(`tle${" ".repeat(40)}`);
+  const c3 = encoder.encode(`${" ".repeat(10)}>`);
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(c1);
+      controller.enqueue(c2);
+      controller.enqueue(c3);
+      controller.enqueue(new Uint8Array(80_000));
+    },
+    cancel() { cancelled = true; },
+  });
+  const result = await readAndDecodeStream(stream, "text/html; charset=utf-8");
+  assert.equal(cancelled, true);
+  assert.equal(result.truncated, true);
+  assert.equal(result.bytesRead, c1.byteLength + c2.byteLength + c3.byteLength);
+  assert.match(result.html, /Split Title/);
+});

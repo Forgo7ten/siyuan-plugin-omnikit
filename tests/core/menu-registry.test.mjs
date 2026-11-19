@@ -202,5 +202,23 @@ test("menu router dispatches multi-document selection to context without droppin
   assert.equal(receivedContext.selectedDocumentCount, 2);
   assert.equal(receivedContext.rootID, undefined);
 
+  const docEl = { getAttribute: key => key === "data-type" ? "navigation-file" : key === "data-node-id" ? "doc-alpha" : null };
+  const boxEl = { getAttribute: key => key === "data-type" ? "navigation-root" : key === "data-node-id" ? "box-1" : null };
+  listeners.get("open-menu-doctree")({
+    detail: {
+      type: "items",
+      elements: [boxEl, docEl],
+      items: [
+        { id: "box-1", notebookId: "box-1", path: "/" },
+        { id: "doc-alpha", notebookId: "box-1", path: "/doc-alpha.sy" },
+      ],
+      menu: { addItem: () => {} },
+    },
+  });
+  assert.deepEqual(receivedContext.selectedDocumentIDs, ["doc-alpha"]);
+  assert.equal(receivedContext.selectedDocumentCount, 1);
+  assert.equal(receivedContext.rootID, undefined);
+  assert.equal(receivedContext.targetElement, docEl);
+
   dispose();
 });

@@ -6,7 +6,6 @@ export interface ReadOptions {
   signal?: AbortSignal;
   /** Desktop-only remote request User-Agent. Browsers cannot set this header. */
   userAgent?: string;
-  allowedOrigins?: ReadonlySet<string>;
   providedFiles?: ReadonlyMap<string, File>;
 }
 export interface DesktopBridge {
@@ -16,7 +15,7 @@ export interface DesktopBridge {
 function abort(signal?: AbortSignal): void {
   if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
 }
-export function requireRemotePermission(raw: string, _origins?: ReadonlySet<string>): URL {
+export function requireRemotePermission(raw: string): URL {
   const u = new URL(raw);
   if (!["https:", "http:"].includes(u.protocol) || u.username || u.password) {
     throw new Error("Only HTTP(S) image links are supported");

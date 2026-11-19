@@ -156,8 +156,6 @@ export class FeatureManager {
         } else if (!desired && current.status !== "disabled") {
           this.startupErrors.delete(current.meta.id);
           await current.deactivate().catch(error => this.context.logger.error(`停用功能失败：${current.meta.id}`, error));
-        } else if (current.enabled) {
-          await current.notifySettingsChanged().catch(error => this.context.logger.error(`更新功能设置失败：${current.meta.id}`, error));
         }
         return true;
       });

@@ -1,8 +1,6 @@
 import type { SettingsManager } from "../../../core/store/SettingsManager.ts";
 import { IMAGE_FEATURE_ID } from "./settings.ts";
-import type { ImageFeatureConfig, PagePermission } from "../registration.ts";
-
-export interface DocumentPermission extends PagePermission { rootId: string; }
+import type { ImageFeatureConfig } from "../registration.ts";
 
 /**
  * @design The allowlist belongs to feature-image-compressor.json, never core settings.
@@ -12,30 +10,12 @@ export interface DocumentPermission extends PagePermission { rootId: string; }
 export class PageAllowlist {
   constructor(private readonly settings: SettingsManager) {}
 
-  get needsRecovery(): boolean {
-    return this.settings.store(IMAGE_FEATURE_ID).needsRecovery;
-  }
-
-  async recoverCorruptData(): Promise<void> {
-    await this.settings.store(IMAGE_FEATURE_ID).recoverWithBackup();
-  }
-
   hasCached(rootId: string): boolean {
     return Boolean(this.settings.getFeature<ImageFeatureConfig>(IMAGE_FEATURE_ID)
       .auto.pageAllowlist[rootId]);
   }
 
-  async has(rootId: string): Promise<boolean> { return this.hasCached(rootId); }
-
-  async list(): Promise<DocumentPermission[]> {
-    const pages = this.settings.getFeature<ImageFeatureConfig>(IMAGE_FEATURE_ID)
-      .auto.pageAllowlist;
-    return Object.entries(pages)
-      .map(([rootId, value]) => ({ rootId, ...value }))
-      .sort((a, b) => a.rootId.localeCompare(b.rootId));
-  }
-
-  async toggle(rootId: string, meta: Partial<Omit<DocumentPermission, "rootId" | "grantedAt">> = {}): Promise<boolean> {
+  async toggle(rootId: string, meta: { title?: string } = {}): Promise<boolean> {
     let added = false;
     await this.settings.updateFeature<ImageFeatureConfig>(IMAGE_FEATURE_ID, draft => {
       const pages = draft.auto.pageAllowlist;
@@ -49,11 +29,5 @@ export class PageAllowlist {
       }
     });
     return added;
-  }
-
-  async remove(rootId: string): Promise<void> {
-    await this.settings.updateFeature<ImageFeatureConfig>(IMAGE_FEATURE_ID, draft => {
-      delete draft.auto.pageAllowlist[rootId];
-    });
   }
 }

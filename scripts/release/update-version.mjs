@@ -83,7 +83,8 @@ export async function updateVersion(bumpTypeOrVersion, { projectRoot = root, log
     throw new Error(`Version mismatch: package.json has ${pkg.version}, plugin.json has ${manifest.version}`);
   }
 
-  const newVersion = calculateNextVersion(pkg.version, bumpTypeOrVersion);
+  const oldVersion = pkg.version;
+  const newVersion = calculateNextVersion(oldVersion, bumpTypeOrVersion);
 
   pkg.version = newVersion;
   manifest.version = newVersion;
@@ -91,7 +92,7 @@ export async function updateVersion(bumpTypeOrVersion, { projectRoot = root, log
   await writeFile(pkgPath, JSON.stringify(pkg, null, 2) + "\n", "utf8");
   await writeFile(manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
 
-  log(`Updated version: ${pkg.version} -> ${newVersion} in package.json and plugin.json`);
+  log(`Updated version: ${oldVersion} -> ${newVersion} in package.json and plugin.json`);
   return newVersion;
 }
 

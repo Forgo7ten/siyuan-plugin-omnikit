@@ -23,21 +23,3 @@ export function button(
   node.addEventListener("click", onClick);
   return node;
 }
-
-export function checkbox(
-  label: string,
-  checked: boolean,
-  onChange: (checked: boolean) => void,
-  options: { disabled?: boolean; note?: string } = {},
-): HTMLLabelElement {
-  const wrap = el("label", "omnikit-option");
-  wrap.append(el("span", undefined, label));
-  const input = el("input");
-  input.type = "checkbox";
-  input.checked = checked;
-  input.disabled = options.disabled === true;
-  input.addEventListener("change", () => onChange(input.checked));
-  wrap.append(input);
-  if (options.note) wrap.append(el("small", undefined, options.note));
-  return wrap;
-}

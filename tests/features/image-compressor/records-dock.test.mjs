@@ -27,10 +27,19 @@ test("dock lookups are user-triggered and restore is occurrence-scoped with pers
   assert.match(dock, /onclick=\{\(\) => toggleOriginalReferences\(record\)\}/);
   assert.match(dock, /onclick=\{\(\) => locateRestoreOccurrences\(record\)\}/);
   assert.match(dock, /\/api\/asset\/findAssetReferences/);
-  assert.match(dock, /\/api\/block\/getBlockInfo/);
+  assert.match(dock, /\/api\/block\/getBlockDOMs/);
   assert.match(dock, /\/api\/block\/getBlockDOM/);
-  assert.match(dock, /info\?\.rootID !== row\.rootID \|\| info\.box !== row\.notebook/);
-  assert.match(dock, /references\.commitOccurrence\(item\.target, record\.originalPath(?:,\s*context\.scope\?\.signal)?\)/);
+  assert.match(dock, /error instanceof KernelRequestError && error\.code === 1\) return "missing"/);
+  assert.match(dock, /image\.records\.encryptedLookupUnsupported/);
+  assert.match(dock, /image\.records\.skippedNotebooks/);
+  assert.match(dock, /image\.records\.incompleteLookup/);
+  assert.match(dock, /unavailableAttributeViews/);
+  assert.match(dock, /metadataIncomplete/);
+  assert.match(dock, /lastLocateComplete/);
+  assert.match(dock, /const nextOp: OperationKind = lastLocateComplete && occurrences\.length === 0 && conflicts === 0 \? resolvedOp : "incomplete"/);
+  assert.match(dock, /store\.markOperation\(record\.originalPath, record\.compressedPath, nextOp\)/);
+  assert.match(dock, /const nextPath = isReplace \? record\.compressedPath : record\.originalPath/);
+  assert.match(dock, /references\.commitOccurrence\(item\.target, nextPath(?:,\s*dockAbort\?\.signal)?\)/);
   assert.match(dock, /\/api\/asset\/statAsset/);
   assert.match(dock, /openTab\(/);
   assert.match(dock, /jumpToBlock\(/);
@@ -51,6 +60,7 @@ test("dock lookups are user-triggered and restore is occurrence-scoped with pers
   assert.doesNotMatch(dock, /relinkAsset|\/api\/asset\/removeAsset|removeAsset\(/);
   assert.doesNotMatch(dock, /prunedNotice/);
   assert.doesNotMatch(dock, /noSafeOccurrences/);
+  assert.doesNotMatch(dock, /MAX_RECORDS|CAPACITY_WARNING_COUNT|capacityBanner/);
 });
 
 test("image records dock i18n defines contextual empty strings and omits obsolete negative text", async () => {
@@ -85,9 +95,11 @@ test("dock reference lookup distinguishes user_click and post_action, preserves 
   // post_action preserves action message and auto-collapses expanded drawer when empty (Option B)
   assert.match(dock, /else\s*\{\s*if\s*\(!targets\.length\)\s*\{\s*expanded = null;\s*occurrences = \[\];\s*\}\s*\}/);
 
-  // Single and bulk actions invoke locateOccurrences with post_action
-  assert.match(dock, /await locateOccurrences\(record, "original", "post_action"\)/);
-  assert.match(dock, /await locateOccurrences\(record, "compressed", "post_action"\)/);
+  // Single and bulk actions invoke unified applyOccurrenceAction and locateOccurrences with post_action
+  assert.match(dock, /async function applyOccurrenceAction\(/);
+  assert.match(dock, /await locateOccurrences\(record, mode, "post_action"\)/);
+  assert.match(dock, /applyOccurrenceAction\(record, expanded\.mode, \[item\]\)/);
+  assert.match(dock, /applyOccurrenceAction\(record, expanded\.mode, occurrences\)/);
 
   // Reference buttons invoke locateOccurrences with user_click
   assert.match(dock, /await locateOccurrences\(record, "original", "user_click"\)/);

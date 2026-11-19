@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ImageCompressionRecordStore } from "../../../src/features/image-compressor/store/ImageCompressionRecordStore.ts";
+import {
+  ImageCompressionRecordStore,
+  imageRecordsFor,
+  reloadLoadedImageRecords,
+} from "../../../src/features/image-compressor/store/ImageCompressionRecordStore.ts";
 
 function createPlugin(storage = new Map()) {
   const writes = [];
@@ -101,5 +105,70 @@ test("a failed save leaves memory unchanged and does not deadlock subsequent wri
   assert.equal(store.snapshot().length, 1);
   assert.equal(store.snapshot()[0].originalPath, "assets/b.png");
   assert.deepEqual(plugin.writes, ["feature-image-compressor-records.json", "feature-image-compressor-records.json"]);
+});
+
+test("record store enforces lightweight 10,000 record limit on new inserts without evicting or locking existing records", async () => {
+  const count = 10_000;
+  const existingRecords = Array.from({ length: count }, (_, i) => ({
+    originalPath: `assets/orig-${i}.png`,
+    compressedPath: `assets/comp-${i}.webp`,
+    updatedAt: 1000 + i,
+    lastOperation: "replaced",
+  }));
+  const plugin = createPlugin(new Map([[
+    "feature-image-compressor-records.json",
+    { schemaVersion: 1, records: existingRecords },
+  ]]));
+  const store = new ImageCompressionRecordStore(plugin);
+  await store.init();
+
+  assert.equal(store.store.needsRecovery, false);
+  assert.equal(store.snapshot().length, count);
+
+  const writesAtCap = plugin.writes.length;
+  await assert.rejects(store.upsert("assets/new-extra.png", "assets/new-extra.webp"), /10000/);
+  assert.equal(store.snapshot().length, count);
+  assert.equal(plugin.writes.length, writesAtCap);
+
+  // In-place update of an existing originalPath succeeds without eviction
+  await store.upsert("assets/orig-0.png", "assets/comp-0-v2.webp");
+  assert.equal(store.snapshot().length, count);
+  const updated = store.snapshot().find(r => r.originalPath === "assets/orig-0.png");
+  assert.equal(updated?.compressedPath, "assets/comp-0-v2.webp");
+
+  // Identical original and compressed identities are rejected before writing
+  const writesBefore = plugin.writes.length;
+  await assert.rejects(store.upsert("assets/same.png", "assets/same.png"), /distinct/);
+  assert.equal(plugin.writes.length, writesBefore);
+});
+
+test("reloadLoadedImageRecords skips uninitialized plugin and reloads initialized store", async () => {
+  let loadCalls = 0;
+  const uninitializedPlugin = {
+    async loadData() { loadCalls++; return ""; },
+    async saveData() {},
+  };
+  await reloadLoadedImageRecords(uninitializedPlugin);
+  assert.equal(loadCalls, 0);
+
+  const storage = new Map([[
+    "feature-image-compressor-records.json",
+    { schemaVersion: 1, records: [{ originalPath: "assets/init.png", compressedPath: "assets/init.webp", updatedAt: 1, lastOperation: "saved-only" }] },
+  ]]);
+  const initializedPlugin = createPlugin(storage);
+  const origLoadData = initializedPlugin.loadData.bind(initializedPlugin);
+  initializedPlugin.loadData = async path => { loadCalls++; return origLoadData(path); };
+
+  const { store, ready } = imageRecordsFor(initializedPlugin);
+  await ready;
+  assert.equal(store.snapshot().length, 1);
+
+  storage.set("feature-image-compressor-records.json", {
+    schemaVersion: 1,
+    records: [{ originalPath: "assets/init.png", compressedPath: "assets/init-v2.webp", updatedAt: 2, lastOperation: "replaced" }],
+  });
+  await reloadLoadedImageRecords(initializedPlugin);
+  assert.equal(store.snapshot()[0].compressedPath, "assets/init-v2.webp");
+  assert.ok(loadCalls >= 2);
 });
 

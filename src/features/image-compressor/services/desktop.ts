@@ -99,7 +99,13 @@ export function createDesktopBridge(load: NodeRequire, approve: LocalConsent): D
           continue;
         }
         const fileName = current.pathname.split("/").pop() || "image";
-        return { blob: result.blob!, name: decodeURIComponent(fileName) };
+        let decodedName = fileName;
+        try {
+          decodedName = decodeURIComponent(fileName);
+        } catch {
+          // Keep raw segment when percent-encoding is malformed
+        }
+        return { blob: result.blob!, name: decodedName };
       }
       throw new Error("Download did not complete");
     },

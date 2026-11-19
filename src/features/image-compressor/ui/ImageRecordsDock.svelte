@@ -5,7 +5,7 @@
   import { imageRecordsFor } from "../store/ImageCompressionRecordStore.ts";
   import { ReferenceService } from "../services/references.ts";
   import type { FeatureContext } from "../../../core/framework/FeatureContext.ts";
-  import type { CompressionRecord, OccurrenceTarget } from "../policy/contracts.ts";
+  import type { CompressionRecord, OccurrenceTarget, OperationKind } from "../policy/contracts.ts";
 
   interface LocatedAssetReference {
     type: string;
@@ -31,6 +31,8 @@
   const kernel = new KernelClient();
   const references = new ReferenceService(kernel, location.origin);
 
+  const DOM_BATCH_SIZE = 50;
+
   let records = $state<CompressionRecord[]>([]);
   let assetStatuses = $state<Record<string, "checking" | "present" | "missing" | "unknown">>({});
   let expanded = $state<{ path: string; mode: "original" | "compressed" } | null>(null);
@@ -39,6 +41,12 @@
   let busy = $state(false);
   let message = $state("");
   let mounted = false;
+  let lastLocateOk = false;
+  let lastLocateComplete = false;
+
+  function isAbortError(error: unknown, signal?: AbortSignal): boolean {
+    return Boolean(signal?.aborted) || (error instanceof Error && error.name === "AbortError");
+  }
 
   function format(key: string, values: Record<string, string | number>): string {
     return t(key, values);
@@ -59,25 +67,28 @@
 
   onMount(() => {
     const unsubscribe = store.store.subscribe(next => {
+      const prevByOriginal = new Map(records.map(r => [r.originalPath, r.compressedPath]));
       const prevKeys = new Set(Object.keys(assetStatuses));
       records = [...next.records];
       const nextStatuses = { ...assetStatuses };
-      let hasNew = false;
+      const changedRecords: CompressionRecord[] = [];
       for (const record of next.records) {
-        if (!prevKeys.has(record.originalPath)) {
-          hasNew = true;
+        const origNew = !prevKeys.has(record.originalPath);
+        const compChanged = prevByOriginal.get(record.originalPath) !== record.compressedPath || !prevKeys.has(record.compressedPath);
+        if (origNew || compChanged) {
+          changedRecords.push(record);
           const isRecent = Date.now() - record.updatedAt < 300_000;
-          nextStatuses[record.originalPath] = isRecent ? "present" : "unknown";
-          nextStatuses[record.compressedPath] = isRecent ? "present" : "unknown";
+          if (origNew) nextStatuses[record.originalPath] = isRecent ? "present" : "unknown";
+          if (compChanged) nextStatuses[record.compressedPath] = isRecent ? "present" : "unknown";
         }
       }
       assetStatuses = nextStatuses;
-      if (mounted && hasNew) {
-        void verifyRecords(next.records.filter(r => !prevKeys.has(r.originalPath)), dockAbort?.signal);
+      if (mounted && changedRecords.length > 0) {
+        void verifyRecords(changedRecords, dockAbort?.signal);
       }
     });
     mounted = true;
-    const handleTabActivate = () => { void refresh(); };
+    const handleTabActivate = () => { if (!busy) void refresh(); };
     window.addEventListener("omnikit-dock-tab-activated", handleTabActivate);
     void refresh();
     return () => {
@@ -91,7 +102,8 @@
     try {
       const res = await kernel.post<unknown>("/api/asset/statAsset", { path }, { signal });
       return res.code === 0 ? "present" : "unknown";
-    } catch {
+    } catch (error) {
+      if (error instanceof KernelRequestError && error.code === 1) return "missing";
       return "unknown";
     }
   }
@@ -157,21 +169,108 @@
     }
   }
 
-  async function findReferences(path: string): Promise<LocatedAssetReference[]> {
-    const response = await kernel.post<unknown>("/api/asset/findAssetReferences", { paths: [path] }, { timeout: 120_000 });
-    const data = response.data as { references?: unknown } | undefined;
+  async function findReferences(path: string, signal?: AbortSignal): Promise<{
+    references: LocatedAssetReference[];
+    skippedNotebooks: string[];
+    unavailableAttributeViews: number;
+    metadataIncomplete: boolean;
+  }> {
+    const response = await kernel.post<unknown>("/api/asset/findAssetReferences", { paths: [path] }, { timeout: 120_000, signal });
+    const data = response.data as {
+      references?: unknown;
+      skippedNotebooks?: unknown;
+      unavailableAttributeViews?: unknown;
+    } | undefined;
     if (!data || !Array.isArray(data.references)) throw new Error("Reference response is incomplete");
-    return data.references.map((row): LocatedAssetReference => {
-      if (!row || typeof row !== "object") throw new Error("Invalid reference row");
+    let rowFiltered = false;
+    const references = data.references.filter((row): row is LocatedAssetReference => {
+      if (!row || typeof row !== "object") { rowFiltered = true; return false; }
       const item = row as Partial<LocatedAssetReference>;
-      if (typeof item.type !== "string" || typeof item.rootID !== "string" ||
-          typeof item.reference !== "string" || typeof item.relinkable !== "boolean" ||
-          (item.notebook !== undefined && typeof item.notebook !== "string") ||
-          (item.blockID !== undefined && typeof item.blockID !== "string")) {
-        throw new Error("Invalid reference row");
-      }
-      return item as LocatedAssetReference;
+      const valid = typeof item.rootID === "string"
+        && (item.relinkable === undefined || typeof item.relinkable === "boolean")
+        && (item.notebook === undefined || typeof item.notebook === "string")
+        && (item.blockID === undefined || typeof item.blockID === "string");
+      if (!valid) rowFiltered = true;
+      return valid;
     });
+    const skippedValid = Array.isArray(data.skippedNotebooks);
+    const skippedNotebooks = skippedValid
+      ? (data.skippedNotebooks as unknown[]).filter((item): item is string => typeof item === "string" && item.length > 0)
+      : [];
+    const avValid = data.unavailableAttributeViews === undefined || Array.isArray(data.unavailableAttributeViews);
+    const unavailableAttributeViews = Array.isArray(data.unavailableAttributeViews)
+      ? data.unavailableAttributeViews.length
+      : 0;
+    return {
+      references,
+      skippedNotebooks,
+      unavailableAttributeViews,
+      metadataIncomplete: !skippedValid || !avValid || rowFiltered,
+    };
+  }
+
+  async function loadBatchBlockDOMs(notebook: string, blockIDs: string[], signal?: AbortSignal): Promise<{ doms: Map<string, string>; incomplete: boolean }> {
+    const doms = new Map<string, string>();
+    let incomplete = false;
+    for (let offset = 0; offset < blockIDs.length; offset += DOM_BATCH_SIZE) {
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      const chunk = blockIDs.slice(offset, offset + DOM_BATCH_SIZE);
+      try {
+        const res = await kernel.post<Record<string, unknown>>("/api/block/getBlockDOMs", { ids: chunk, notebook }, { signal });
+        const data = res.data;
+        if (!data || typeof data !== "object") {
+          incomplete = true;
+          continue;
+        }
+        for (const id of chunk) {
+          const dom = data[id];
+          if (typeof dom === "string" && dom.trim()) doms.set(id, dom);
+          else incomplete = true;
+        }
+      } catch (error) {
+        if (isAbortError(error, signal)) throw error;
+        for (const id of chunk) {
+          if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+          try {
+            const single = await kernel.post<{ id?: unknown; dom?: unknown }>("/api/block/getBlockDOM", { id, notebook }, { signal });
+            if (single.data?.id === id && typeof single.data.dom === "string" && single.data.dom.trim()) {
+              doms.set(id, single.data.dom);
+            } else {
+              incomplete = true;
+            }
+          } catch (singleErr) {
+            if (isAbortError(singleErr, signal)) throw singleErr;
+            incomplete = true;
+          }
+        }
+      }
+    }
+    return { doms, incomplete };
+  }
+
+  async function resolveDocumentTitle(rootID: string, cache: Map<string, string>, signal?: AbortSignal): Promise<string> {
+    const cached = cache.get(rootID);
+    if (cached) return cached;
+    let docTitle = "";
+    try {
+      const fullRes = await kernel.post<string>("/api/filetree/getFullHPathByID", { id: rootID }, { signal });
+      if (typeof fullRes.data === "string" && fullRes.data.trim()) {
+        docTitle = fullRes.data.trim();
+      }
+    } catch (error) {
+      if (isAbortError(error, signal)) throw error;
+      try {
+        const fallbackRes = await kernel.post<string>("/api/filetree/getHPathByID", { id: rootID }, { signal });
+        if (typeof fallbackRes.data === "string" && fallbackRes.data.trim()) {
+          docTitle = fallbackRes.data.trim();
+        }
+      } catch (fallbackErr) {
+        if (isAbortError(fallbackErr, signal)) throw fallbackErr;
+      }
+    }
+    docTitle = docTitle || rootID;
+    cache.set(rootID, docTitle);
+    return docTitle;
   }
 
   async function locateOccurrences(
@@ -182,49 +281,60 @@
     expanded = { path: record.originalPath, mode };
     occurrences = [];
     busy = true;
+    lastLocateOk = false;
+    lastLocateComplete = false;
     if (source === "user_click") {
       message = "";
     }
     const searchPath = mode === "original" ? record.originalPath : record.compressedPath;
+    const signal = dockAbort?.signal;
     try {
-      const rows = await findReferences(searchPath);
-      const targets: OccurrenceItem[] = [];
+      if (searchPath.includes("?box=")) {
+        if (source === "user_click") {
+          message = t("image.records.encryptedLookupUnsupported");
+        }
+        return;
+      }
+      const { references: rows, skippedNotebooks, unavailableAttributeViews, metadataIncomplete } = await findReferences(searchPath, signal);
+      let complete = skippedNotebooks.length === 0 && unavailableAttributeViews === 0 && !metadataIncomplete;
+      const distinctRows: Array<LocatedAssetReference & { blockID: string; notebook: string }> = [];
       const seen = new Set<string>();
-      const docPathCache = new Map<string, string>();
+      const idsByNotebook = new Map<string, string[]>();
       for (const row of rows) {
-        if (!row.blockID || !row.rootID || !row.notebook || !row.relinkable) continue;
+        if (!row.blockID || !row.rootID || !row.notebook || !row.relinkable) {
+          complete = false;
+          continue;
+        }
         const identityKey = `${row.notebook}/${row.blockID}`;
         if (seen.has(identityKey)) continue;
         seen.add(identityKey);
-        const [infoResponse, domResponse] = await Promise.all([
-          kernel.post<unknown>("/api/block/getBlockInfo", { id: row.blockID, notebook: row.notebook }),
-          kernel.post<unknown>("/api/block/getBlockDOM", { id: row.blockID, notebook: row.notebook }),
-        ]);
-        const info = infoResponse.data as { rootID?: unknown; box?: unknown; rootTitle?: unknown } | undefined;
-        const block = domResponse.data as { id?: unknown; dom?: unknown } | undefined;
-        if (info?.rootID !== row.rootID || info.box !== row.notebook || block?.id !== row.blockID ||
-            typeof block.dom !== "string" || !block.dom.trim()) continue;
-        const template = document.createElement("template");
-        template.innerHTML = block.dom;
-        const roots = [...template.content.children].filter(node => node.getAttribute("data-node-id") === row.blockID);
-        if (template.content.children.length !== 1 || roots.length !== 1 || roots[0].querySelector("[data-node-id]")) continue;
-        const images = [...roots[0].querySelectorAll("img")];
+        distinctRows.push(row as LocatedAssetReference & { blockID: string; notebook: string });
+        const list = idsByNotebook.get(row.notebook) ?? [];
+        list.push(row.blockID);
+        idsByNotebook.set(row.notebook, list);
+      }
 
-        let docTitle = docPathCache.get(row.rootID);
-        if (!docTitle) {
-          if (typeof info.rootTitle === "string" && info.rootTitle.trim()) {
-            docTitle = info.rootTitle.trim();
-          } else {
-            try {
-              const hpathRes = await kernel.post<string>("/api/filetree/getHPathByID", { id: row.rootID });
-              if (typeof hpathRes.data === "string" && hpathRes.data.trim()) {
-                docTitle = hpathRes.data.trim();
-              }
-            } catch {}
-          }
-          docTitle = docTitle || row.rootID;
-          docPathCache.set(row.rootID, docTitle);
+      const domsByNotebook = new Map<string, Map<string, string>>();
+      for (const [notebook, blockIDs] of idsByNotebook) {
+        const batchResult = await loadBatchBlockDOMs(notebook, blockIDs, signal);
+        if (batchResult.incomplete) complete = false;
+        domsByNotebook.set(notebook, batchResult.doms);
+      }
+
+      const targets: OccurrenceItem[] = [];
+      const docPathCache = new Map<string, string>();
+      for (const row of distinctRows) {
+        const dom = domsByNotebook.get(row.notebook)?.get(row.blockID);
+        if (!dom) { complete = false; continue; }
+        const template = document.createElement("template");
+        template.innerHTML = dom;
+        const roots = [...template.content.children].filter(node => node.getAttribute("data-node-id") === row.blockID);
+        if (template.content.children.length !== 1 || roots.length !== 1 || roots[0].querySelector("[data-node-id]")) {
+          complete = false;
+          continue;
         }
+        const images = [...roots[0].querySelectorAll("img")];
+        const docTitle = await resolveDocumentTitle(row.rootID, docPathCache, signal);
 
         for (let imageOrdinal = 0; imageOrdinal < images.length; imageOrdinal++) {
           const image = images[imageOrdinal];
@@ -237,7 +347,7 @@
             blockID: row.blockID,
             imageOrdinal,
             oldPath,
-            baselineBlockDOM: block.dom,
+            baselineBlockDOM: dom,
           };
           const key = `${target.notebook}/${target.blockID}/${target.imageOrdinal}`;
           if (targets.some(item => item.key === key)) continue;
@@ -249,11 +359,24 @@
         }
       }
       occurrences = targets;
+      lastLocateOk = true;
+      lastLocateComplete = complete;
+      const lookupWarnings = () => {
+        const list: string[] = [];
+        if (skippedNotebooks.length > 0) list.push(format("image.records.skippedNotebooks", { count: skippedNotebooks.length }));
+        if (unavailableAttributeViews > 0 || metadataIncomplete) list.push(t("image.records.incompleteLookup"));
+        return list.join(" ");
+      };
       if (source === "user_click") {
         if (!targets.length) {
           message = mode === "original"
             ? t("image.records.noOriginalReferences")
             : t("image.records.noCompressedReferences");
+          const warnText = lookupWarnings();
+          if (warnText) message = `${message} ${warnText}`;
+        } else {
+          const warnText = lookupWarnings();
+          if (warnText) message = warnText;
         }
       } else {
         if (!targets.length) {
@@ -261,8 +384,10 @@
           occurrences = [];
         }
       }
-    } catch {
-      message = t("image.records.lookupFailed");
+    } catch (error) {
+      if (!isAbortError(error, signal)) {
+        message = t("image.records.lookupFailed");
+      }
     } finally {
       busy = false;
     }
@@ -291,121 +416,54 @@
     await locateOccurrences(record, "compressed", "user_click");
   }
 
-  async function replaceOccurrence(record: CompressionRecord, item: OccurrenceItem): Promise<void> {
-    busy = true;
-    message = "";
-    try {
-      await kernel.post<unknown>("/api/asset/statAsset", { path: record.compressedPath });
-      const current = store.snapshot().find(r => r.originalPath === record.originalPath && r.compressedPath === record.compressedPath);
-      if (!current) throw new Error("Record changed");
-      if (item.target.oldPath !== record.originalPath) {
-        const msg = format("image.records.replaceResult", { replaced: 0, conflicts: 1 });
-        message = msg;
-        showMessage(msg, 3000);
-        await locateOccurrences(record, "original", "post_action");
-        return;
-      }
-      const res = await references.commitOccurrence(item.target, record.compressedPath, context.scope?.signal);
-      const replaced = res === "replaced" ? 1 : 0;
-      const conflicts = res === "replaced" ? 0 : 1;
-      const msg = format("image.records.replaceResult", { replaced, conflicts });
-      message = msg;
-      showMessage(msg, 3000);
-      await locateOccurrences(record, "original", "post_action");
-    } catch {
-      message = t("image.records.lookupFailed");
-      showMessage(t("image.records.lookupFailed"), 3000, "error");
-    } finally {
-      busy = false;
-    }
+  async function syncOperationAfterAction(record: CompressionRecord, resolvedOp: OperationKind, conflicts: number): Promise<void> {
+    if (!lastLocateOk || dockAbort?.signal.aborted) return;
+    const nextOp: OperationKind = lastLocateComplete && occurrences.length === 0 && conflicts === 0 ? resolvedOp : "incomplete";
+    await store.markOperation(record.originalPath, record.compressedPath, nextOp).catch(() => undefined);
   }
 
-  async function replaceAllOccurrences(record: CompressionRecord): Promise<void> {
-    if (!occurrences.length) return;
+  async function applyOccurrenceAction(
+    record: CompressionRecord,
+    mode: "original" | "compressed",
+    items: OccurrenceItem[],
+  ): Promise<void> {
+    if (!items.length) return;
+    const isReplace = mode === "original";
+    const expectedOldPath = isReplace ? record.originalPath : record.compressedPath;
+    const nextPath = isReplace ? record.compressedPath : record.originalPath;
+    const resultKey = isReplace ? "image.records.replaceResult" : "image.records.restoreResult";
+    const countVar = isReplace ? "replaced" : "restored";
+    const failKey = isReplace ? "image.records.lookupFailed" : "image.records.restoreFailed";
+    const resolvedOp: OperationKind = isReplace ? "replaced" : "saved-only";
+
     busy = true;
     message = "";
     try {
-      await kernel.post<unknown>("/api/asset/statAsset", { path: record.compressedPath });
+      await kernel.post<unknown>("/api/asset/statAsset", { path: nextPath }, { signal: dockAbort?.signal });
       const current = store.snapshot().find(r => r.originalPath === record.originalPath && r.compressedPath === record.compressedPath);
       if (!current) throw new Error("Record changed");
-      let replaced = 0;
+      let changed = 0;
       let conflicts = 0;
-      for (const item of occurrences) {
-        if (item.target.oldPath !== record.originalPath) {
+      for (const item of items) {
+        if (dockAbort?.signal.aborted) return;
+        if (item.target.oldPath !== expectedOldPath) {
           conflicts++;
           continue;
         }
-        const res = await references.commitOccurrence(item.target, record.compressedPath, context.scope?.signal);
-        if (res === "replaced") replaced++;
+        const res = await references.commitOccurrence(item.target, nextPath, dockAbort?.signal);
+        if (res === "replaced") changed++;
         else conflicts++;
       }
-      const msg = format("image.records.replaceResult", { replaced, conflicts });
+      const msg = format(resultKey, { [countVar]: changed, conflicts });
       message = msg;
       showMessage(msg, 3000);
-      await locateOccurrences(record, "original", "post_action");
+      await locateOccurrences(record, mode, "post_action");
+      await syncOperationAfterAction(record, resolvedOp, conflicts);
     } catch {
-      message = t("image.records.lookupFailed");
-      showMessage(t("image.records.lookupFailed"), 3000, "error");
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function restoreOccurrence(record: CompressionRecord, item: OccurrenceItem): Promise<void> {
-    busy = true;
-    message = "";
-    try {
-      await kernel.post<unknown>("/api/asset/statAsset", { path: record.originalPath });
-      const current = store.snapshot().find(r => r.originalPath === record.originalPath && r.compressedPath === record.compressedPath);
-      if (!current) throw new Error("Record changed");
-      if (item.target.oldPath !== record.compressedPath) {
-        const msg = format("image.records.restoreResult", { restored: 0, conflicts: 1 });
-        message = msg;
-        showMessage(msg, 3000);
-        await locateOccurrences(record, "compressed", "post_action");
-        return;
-      }
-      const res = await references.commitOccurrence(item.target, record.originalPath, context.scope?.signal);
-      const restored = res === "replaced" ? 1 : 0;
-      const conflicts = res === "replaced" ? 0 : 1;
-      const msg = format("image.records.restoreResult", { restored, conflicts });
-      message = msg;
-      showMessage(msg, 3000);
-      await locateOccurrences(record, "compressed", "post_action");
-    } catch {
-      message = t("image.records.restoreFailed");
-      showMessage(t("image.records.restoreFailed"), 3000, "error");
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function restoreAllOccurrences(record: CompressionRecord): Promise<void> {
-    if (!occurrences.length) return;
-    busy = true;
-    message = "";
-    try {
-      await kernel.post<unknown>("/api/asset/statAsset", { path: record.originalPath });
-      const current = store.snapshot().find(r => r.originalPath === record.originalPath && r.compressedPath === record.compressedPath);
-      if (!current) throw new Error("Record changed");
-      let restored = 0;
-      let conflicts = 0;
-      for (const item of occurrences) {
-        if (item.target.oldPath !== record.compressedPath) {
-          conflicts++;
-          continue;
-        }
-        const res = await references.commitOccurrence(item.target, record.originalPath, context.scope?.signal);
-        if (res === "replaced") restored++;
-        else conflicts++;
-      }
-      const msg = format("image.records.restoreResult", { restored, conflicts });
-      message = msg;
-      showMessage(msg, 3000);
-      await locateOccurrences(record, "compressed", "post_action");
-    } catch {
-      message = t("image.records.restoreFailed");
-      showMessage(t("image.records.restoreFailed"), 3000, "error");
+      if (dockAbort?.signal.aborted) return;
+      const errText = t(failKey);
+      message = errText;
+      showMessage(errText, 3000, "error");
     } finally {
       busy = false;
     }
@@ -633,7 +691,7 @@
                           type="button"
                           class="b3-button b3-button--outline image-records__action-btn"
                           disabled={busy}
-                          onclick={() => expanded?.mode === "original" ? replaceOccurrence(record, item) : restoreOccurrence(record, item)}
+                          onclick={() => expanded && applyOccurrenceAction(record, expanded.mode, [item])}
                         >
                           {expanded.mode === "original" ? t("image.records.replaceThis") : t("image.records.restoreThis")}
                         </button>
@@ -646,7 +704,7 @@
                       type="button"
                       class="b3-button"
                       disabled={busy || !occurrences.length}
-                      onclick={() => expanded?.mode === "original" ? replaceAllOccurrences(record) : restoreAllOccurrences(record)}
+                      onclick={() => expanded && applyOccurrenceAction(record, expanded.mode, occurrences)}
                     >
                       {expanded.mode === "original" ? t("image.records.replaceAll") : t("image.records.restoreAll")}
                     </button>

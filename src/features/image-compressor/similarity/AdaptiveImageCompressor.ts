@@ -2,7 +2,7 @@ import { adaptiveQualitySearch, type QualitySearchProgress } from "./adaptive-qu
 import { SimilarityWorkerSession, type WorkerFactory } from "./SimilarityWorkerSession.ts";
 import { getSimilarityPolicy } from "./similarity-policy.ts";
 import type { CompressionMode } from "../policy/contracts.ts";
-import type { EncodeOptions, EncodeResult, ImageCodec } from "../services/image.ts";
+import { inspectImage, type EncodeOptions, type EncodeResult, type ImageCodec } from "../services/image.ts";
 import type { ImageConfig } from "../policy/parseImageConfig.ts";
 
 export interface AdaptiveImageCompressorOptions {
@@ -51,6 +51,25 @@ export class AdaptiveImageCompressor implements ImageCodec {
     if (blob.size > c.maxInputBytes) {
       return { kind: "skipped", reason: "exceeds_max_bytes" };
     }
+    if (signal?.aborted) {
+      throw new DOMException("Operation cancelled", "AbortError");
+    }
+
+    const originalInfo = options.originalInfo ?? inspectImage(new Uint8Array(await blob.arrayBuffer()));
+    if (originalInfo.animated) {
+      return { kind: "skipped", reason: "animation-protected" };
+    }
+    const declared = blob.type.split(";")[0].toLowerCase();
+    if (declared.startsWith("image/") && declared !== originalInfo.mime) {
+      throw new Error("Image MIME/signature mismatch");
+    }
+    const expected: Record<string, string> = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp" };
+    if (expected[ext] && expected[ext] !== originalInfo.mime) {
+      throw new Error("Image extension/signature mismatch");
+    }
+    if (!Number.isSafeInteger(originalInfo.width * originalInfo.height) || originalInfo.width * originalInfo.height > c.maxPixels) {
+      throw new Error("Decoded pixel limit exceeded");
+    }
 
     const policy = getSimilarityPolicy();
     const worker = new SimilarityWorkerSession({
@@ -78,14 +97,21 @@ export class AdaptiveImageCompressor implements ImageCodec {
           };
           const encoded = await this.codec.encode(blob, name, tunedConfig, signal, onProgress, mode, {
             enforceSavings: false,
+            originalInfo,
           });
-          if (encoded.kind === "skipped") throw new Error(encoded.reason);
+          if (encoded.kind === "skipped") {
+            return { kind: "skipped", reason: encoded.reason };
+          }
           encodedByQuality.set(quality, encoded.value);
           return encoded.value.file;
         },
         evaluate: candidate => worker.evaluate(candidate),
         onProgress: options.onSearchProgress as (progress: QualitySearchProgress) => void,
       });
+
+      if (search.status === "skipped") {
+        return { kind: "skipped", reason: search.reason };
+      }
 
       if (search.status === "unreachable") {
         return {

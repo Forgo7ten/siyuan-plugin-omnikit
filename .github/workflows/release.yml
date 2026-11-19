@@ -1,11 +1,11 @@
 name: Release OmniKit
 
 on:
-  # 保留原有 Tag 自动发布。
+  # Tag 自动发布。
   push:
     tags: ["v*"]
 
-  # 新增手动发布入口。
+  # 手动发布入口。
   workflow_dispatch:
 
 permissions:
@@ -36,7 +36,7 @@ jobs:
           node-version: 24
           cache: pnpm
 
-      # 只有手动发布时，才从 plugin.json 读取版本。
+      # 手动发布时从 plugin.json 读取版本。
       - name: Read release version from plugin.json
         id: version
         if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -48,7 +48,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # 保留原有版本一致性检查和测试。
+      # 版本一致性检查与自动化测试。
       - name: Validate version and test
         shell: bash
         env:
@@ -59,7 +59,7 @@ jobs:
           pnpm check
           pnpm test
 
-      # 保留原有构建与安装包检查。
+      # 构建与安装包校验。
       - name: Build archive
         run: |
           pnpm build:app
@@ -87,7 +87,7 @@ jobs:
             --title "OmniKit ${RELEASE_TAG}" \
             --generate-notes
 
-      # Tag 自动发布：保留原有 ncipollo 发布方式。
+      # Tag 自动发布。
       - name: Publish tag release
         if: ${{ github.event_name == 'push' }}
         uses: ncipollo/release-action@v1

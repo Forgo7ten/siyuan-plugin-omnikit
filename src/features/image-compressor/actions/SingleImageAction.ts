@@ -1,6 +1,5 @@
 import type { FeatureContext } from "../../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../../core/framework/FeatureScope.ts";
-import { translate } from "../../../i18n/translate.ts";
 import { blockDOM } from "../services/references.ts";
 import { resolveImageOccurrence, type ImageOccurrenceEvidence } from "../services/ImageOccurrenceResolver.ts";
 import type { OccurrenceTarget } from "../policy/contracts.ts";
@@ -9,8 +8,9 @@ import type { Downloaded } from "../services/download.ts";
 import { NODE_ID } from "../policy/parseImageConfig.ts";
 import { resolveSource } from "../policy/source.ts";
 import { imagePath } from "../services/ImageOccurrenceResolver.ts";
-import { assertImagePayload, safeFileName } from "./RemoteImageWatcher.ts";
+import { assertImagePayload, calibrateRemoteImageFile } from "./RemoteImageWatcher.ts";
 import { classifyImageCandidate } from "../policy/ImageCandidateClassifier.ts";
+import { translate } from "../../../i18n/translate.ts";
 
 export type ImageActionOutcome =
   | { kind: "notify"; key: string; values?: Record<string, string | number> }
@@ -44,12 +44,15 @@ export async function resolveSelectedOccurrence(
   signal: AbortSignal,
 ): Promise<OccurrenceTarget | undefined> {
   const image = findTargetImage(menuDetail);
-  const owner = image?.closest("[data-node-id]");
+  if (!image || image.closest("[data-type='NodeBlockQueryEmbed'], .protyle-wysiwyg__embed, pre, code, script, style, [data-type='NodeCodeBlock']")) {
+    return undefined;
+  }
+  const owner = image.closest("[data-node-id]");
   const blockID = owner?.getAttribute("data-node-id");
   const images = owner ? [...owner.querySelectorAll("img")] : [];
-  const imageOrdinal = image ? images.indexOf(image) : -1;
-  const oldPath = image ? imagePath(image) : undefined;
-  if (!image || !blockID || !NODE_ID.test(blockID) || !NODE_ID.test(editor.rootID)
+  const imageOrdinal = images.indexOf(image);
+  const oldPath = imagePath(image);
+  if (!blockID || !NODE_ID.test(blockID) || !NODE_ID.test(editor.rootID)
     || !NODE_ID.test(editor.notebook) || imageOrdinal < 0 || !oldPath || editor.disabled) return undefined;
 
   const evidence: ImageOccurrenceEvidence = {
@@ -60,13 +63,7 @@ export async function resolveSelectedOccurrence(
     oldPath,
   };
   const dom = await blockDOM(services.kernel, blockID, editor.notebook, signal);
-  const target = resolveImageOccurrence(dom, evidence);
-  if (!target) return undefined;
-  const info = (await services.kernel.post<{ rootID?: string; box?: string }>(
-    "/api/block/getBlockInfo", { id: blockID, notebook: editor.notebook }, { signal },
-  )).data;
-  if (info?.rootID !== editor.rootID || info.box !== editor.notebook) return undefined;
-  return target;
+  return resolveImageOccurrence(dom, evidence);
 }
 
 /** The quick action uses defaults and changes only the clicked occurrence. */
@@ -79,22 +76,26 @@ export async function compressSelectedImageQuick(
 ): Promise<ImageActionOutcome | void> {
   const signal = scope.signal;
   if (!scope.active || signal.aborted) return;
-  if (editor.disabled) return notify(context, services, "image.single.invalidTarget");
+  if (editor.disabled) return { kind: "notify", key: "image.single.invalidTarget" };
   try {
     let target = await resolveSelectedOccurrence(menuDetail, editor, services, signal);
     if (!scope.active || signal.aborted) return;
-    if (!target) return notify(context, services, "image.single.unmappable");
+    if (!target) return { kind: "notify", key: "image.single.unmappable" };
     const candidateDecision = classifyImageCandidate({
       path: target.oldPath,
       mode: "manual-quick",
       excludedExtensions: services.config().compression.excludedExtensions,
     });
-    if (!candidateDecision.eligible) return notify(context, services, "image.single.noBenefit");
-    target = await localizeRemoteOccurrence(target, services, signal, true);
+    if (!candidateDecision.eligible) return { kind: "notify", key: "image.single.noBenefit" };
+    let providedFile: File | undefined;
+    target = await localizeRemoteOccurrence(target, services, signal, true, undefined, file => {
+      providedFile = file;
+    });
     if (!scope.active || signal.aborted) return;
     const result = await services.compressOccurrence(target, services.config(), signal, {
       replace: true,
       mode: "manual-quick",
+      ...(providedFile ? { providedFile } : {}),
     });
     if (!scope.active || signal.aborted) return;
     const outcomeKey = result.status === "skipped"
@@ -102,13 +103,14 @@ export async function compressSelectedImageQuick(
       : result.reference === "replaced"
         ? "image.single.quickSuccess"
         : "image.single.conflict";
-    services.ui.notify(translate(context.plugin.i18n, outcomeKey));
     return { kind: "notify", key: outcomeKey };
   } catch (error) {
     if (!signal.aborted) {
       context.logger.warn("压缩所选图片失败", error);
-      services.ui.notify(translate(context.plugin.i18n, "image.single.failed"));
-      return { kind: "notify", key: "image.single.failed" };
+      return {
+        kind: "notify",
+        key: "image.single.failed",
+      };
     }
   }
 }
@@ -123,17 +125,17 @@ export async function compressSelectedImageCustom(
 ): Promise<ImageActionOutcome | void> {
   const signal = scope.signal;
   if (!scope.active || signal.aborted) return;
-  if (editor.disabled) return notify(context, services, "image.single.invalidTarget");
+  if (editor.disabled) return { kind: "notify", key: "image.single.invalidTarget" };
   try {
     const target = await resolveSelectedOccurrence(menuDetail, editor, services, signal);
     if (!scope.active || signal.aborted) return;
-    if (!target) return notify(context, services, "image.single.unmappable");
+    if (!target) return { kind: "notify", key: "image.single.unmappable" };
     const candidateDecision = classifyImageCandidate({
       path: target.oldPath,
       mode: "manual-dialog",
       excludedExtensions: services.config().compression.excludedExtensions,
     });
-    if (!candidateDecision.eligible) return notify(context, services, "image.single.noBenefit");
+    if (!candidateDecision.eligible) return { kind: "notify", key: "image.single.noBenefit" };
     const source = resolveSource(target.oldPath, services.origin);
     const config = services.config();
     let previewOriginal: Downloaded | undefined;
@@ -156,13 +158,18 @@ export async function compressSelectedImageCustom(
             ...config,
             compression: { ...config.compression, initialQuality: quality, manualMaxEdge },
           };
-          const original = previewOriginal ?? await services.reader.read(source, {
+          const rawOriginal = previewOriginal ?? await services.reader.read(source, {
             maxBytes: source.kind === "remote" ? Math.min(config.compression.maxInputBytes, 32 * 1024 * 1024) : config.compression.maxInputBytes,
             timeoutMs: 30_000,
             signal: previewAbort.signal,
             userAgent: services.userAgent(),
           });
-          if (!previewOriginal && source.kind === "remote") await assertImagePayload(original.blob);
+          let original = rawOriginal;
+          if (!previewOriginal && source.kind === "remote") {
+            await assertImagePayload(rawOriginal.blob);
+            const calibrated = await calibrateRemoteImageFile(rawOriginal.blob, rawOriginal.name);
+            original = { blob: calibrated, name: calibrated.name };
+          }
           previewOriginal = original;
           const encoded = await services.encoder.encode(original.blob, original.name, tunedConfig,
             previewAbort.signal, undefined, "manual-dialog");
@@ -203,7 +210,10 @@ export async function compressSelectedImageCustom(
   } catch (error) {
     if (!signal.aborted) {
       context.logger.warn("准备单图压缩预览失败", error);
-      services.ui.notify(translate(context.plugin.i18n, "image.single.failed"));
+      return {
+        kind: "notify",
+        key: "image.single.failed",
+      };
     }
   }
 }
@@ -214,6 +224,7 @@ export async function localizeRemoteOccurrence(
   signal: AbortSignal,
   replace: boolean = true,
   suppliedOriginal?: Downloaded,
+  onFile?: (file: File) => void,
 ): Promise<OccurrenceTarget> {
   const source = resolveSource(target.oldPath, services.origin);
   if (source.kind !== "remote") return target;
@@ -225,23 +236,15 @@ export async function localizeRemoteOccurrence(
     userAgent: services.userAgent(),
   });
   await assertImagePayload(original.blob);
-  const file = new File([original.blob], safeFileName(original.name), { type: original.blob.type });
+  const file = await calibrateRemoteImageFile(original.blob, original.name);
   const localPath = await services.assets.upload(file, target.rootID, signal);
+  onFile?.(file);
   if (!replace) {
     return { ...target, oldPath: localPath };
   }
   const committed = await services.references.commitOccurrence(target, localPath, signal);
   if (committed !== "replaced") throw new Error("Remote image localization could not be verified");
-  const updatedDOM = await blockDOM(services.kernel, target.blockID, target.notebook, signal);
-  const evidence = { ...target, oldPath: localPath };
-  const updatedTarget = resolveImageOccurrence(updatedDOM, evidence);
-  if (!updatedTarget) throw new Error("Localized image occurrence could not be re-read");
-  return updatedTarget;
-}
-
-function notify(context: FeatureContext, services: ImageProcessingServices, key: string): ImageActionOutcome {
-  services.ui.notify(translate(context.plugin.i18n, key));
-  return { kind: "notify", key };
+  return { ...target, oldPath: localPath };
 }
 
 function findTargetImage(detail: unknown): HTMLImageElement | undefined {

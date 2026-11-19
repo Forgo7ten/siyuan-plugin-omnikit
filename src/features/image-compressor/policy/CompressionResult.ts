@@ -31,16 +31,6 @@ export interface CompressionProgress {
 
 export type CompressionBatchSummary = Omit<CompressionProgress, "currentFile">;
 
-export type CompressionItemState = "success" | "skipped" | "failed";
-
-export interface CompressionItemResult {
-  path: string;
-  next?: string;
-  state: CompressionItemState;
-  originalBytes: number;
-  compressedBytes: number;
-}
-
 /** Records one successfully rewritten reference and counts resource size once per source path. */
 export function recordRewrittenReference(
   summary: Pick<CompressionBatchSummary, "referencesRewritten" | "succeeded" | "originalReferencedBytes" | "newReferencedBytes" | "logicalReductionBytes">,

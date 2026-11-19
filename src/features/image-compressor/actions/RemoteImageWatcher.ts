@@ -1,11 +1,15 @@
 import type { FeatureScope } from "../../../core/framework/FeatureScope.ts";
-import { waitForPersistedImageOccurrence, type ImageOccurrenceEvidence } from "../services/ImageOccurrenceResolver.ts";
+import { imagePath } from "../services/ImageOccurrenceResolver.ts";
 import type { ImageProcessingServices } from "../services/ImageProcessingServices.ts";
+import { inspectImage, type ImageInfo } from "../services/image.ts";
+import type { OccurrenceTarget } from "../policy/contracts.ts";
 import { autoAllowed, type ImageConfig } from "../policy/parseImageConfig.ts";
 import { blockDOM, type DocumentRow } from "../services/references.ts";
 import { scanDOM } from "../policy/dom.ts";
 import { resolveSource, type ImageSource } from "../policy/source.ts";
 import { classifyImageCandidate } from "../policy/ImageCandidateClassifier.ts";
+
+const PROTECTED_SELECTOR = "pre, code, script, style, [data-type='NodeCodeBlock'], [data-type='NodeBlockQueryEmbed'], .protyle-wysiwyg__embed";
 
 interface Candidate { blockID: string; source: ImageSource; count: number }
 export type RemoteWatcherLogger = Pick<Console, "warn">;
@@ -29,11 +33,7 @@ export function addedRemoteCandidates(
       mode: "auto",
       excludedExtensions: config.compression.excludedExtensions,
     });
-    if (!decision.eligible) return [];
-    try {
-      const url = new URL(candidate.source.url);
-      return ["https:", "http:"].includes(url.protocol) ? [candidate] : [];
-    } catch { return []; }
+    return decision.eligible ? [candidate] : [];
   });
 }
 
@@ -49,6 +49,7 @@ export async function watchRemoteImages(
   const signal = owned.signal;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false, paused = false, rebasing = false, reading = false, rerun = false;
+  let pendingInsertConfirm = false;
   let observing = false;
   let previous: Map<string, Candidate> = new Map();
   const inFlight = new Set<string>();
@@ -68,10 +69,27 @@ export async function watchRemoteImages(
     return result;
   };
 
-  const hasImage = (node: Node): boolean => node instanceof Element && (node.matches("img") || !!node.querySelector("img"));
+  const hasUnprotectedImage = (node: Node): boolean => {
+    if (!(node instanceof Element) || node.closest(PROTECTED_SELECTOR)) return false;
+    if (node.matches("img")) return true;
+    return [...node.querySelectorAll("img")].some(img => !img.closest(PROTECTED_SELECTOR));
+  };
   const observer = new MutationObserver(records => {
-    if (records.some(record => record.type === "attributes" && record.target instanceof HTMLImageElement
-      || [...record.addedNodes, ...record.removedNodes].some(hasImage))) schedule();
+    let hasInsert = false;
+    let hasRemoval = false;
+    for (const record of records) {
+      if (record.type === "attributes") {
+        if (record.target instanceof HTMLImageElement && !record.target.closest(PROTECTED_SELECTOR)) {
+          hasInsert = true;
+        }
+        continue;
+      }
+      if (record.target instanceof Element && record.target.closest(PROTECTED_SELECTOR)) continue;
+      if ([...record.addedNodes].some(hasUnprotectedImage)) hasInsert = true;
+      else if ([...record.removedNodes].some(hasUnprotectedImage)) hasRemoval = true;
+    }
+    if (hasInsert) schedule(450, true);
+    else if (hasRemoval) schedule(450, false);
   });
   const observe = () => {
     if (observing || disposed || paused || !scope.active || signal.aborted) return;
@@ -117,12 +135,6 @@ export async function watchRemoteImages(
     if (disposed || paused || !scope.active || signal.aborted || oldCount !== 0 || candidate.count !== 1) return;
     const config = services.config();
     if (!autoAllowed(config, doc.id)) return;
-    const decision = classifyImageCandidate({
-      path: candidate.source.raw,
-      mode: "auto",
-      excludedExtensions: config.compression.excludedExtensions,
-    });
-    if (!decision.eligible) return;
     const taskKey = keyOf(candidate.blockID, candidate.source.key);
     if (inFlight.has(taskKey)) return;
     inFlight.add(taskKey);
@@ -133,25 +145,37 @@ export async function watchRemoteImages(
     hasPersistedTarget.set(task, false);
     try {
       const persistedDOM = await blockDOM(services.kernel, candidate.blockID, doc.box, task.signal);
+      if (!persistedDOM.trim()) return;
       const template = document.createElement("template");
       template.innerHTML = persistedDOM;
-      const roots = [...template.content.querySelectorAll("[data-node-id]")]
+      const roots = [...template.content.children]
         .filter(node => node.getAttribute("data-node-id") === candidate.blockID);
-      if (roots.length !== 1 || roots[0].querySelector("[data-node-id]")) return;
+      if (template.content.children.length !== 1 || roots.length !== 1 || roots[0].querySelector("[data-node-id]")) return;
       const images = [...roots[0].querySelectorAll("img")];
-      const matching = images.filter(image => {
-        const raw = image.hasAttribute("data-src") ? image.getAttribute("data-src") : image.getAttribute("src");
-        try { return raw && resolveSource(raw, services.origin).key === candidate.source.key; }
-        catch { return false; }
-      });
-      if (matching.length !== 1) return;
-      const imageOrdinal = images.indexOf(matching[0]);
-      const evidence: ImageOccurrenceEvidence = {
-        rootID: doc.id, notebook: doc.box, blockID: candidate.blockID,
-        imageOrdinal, oldPath: candidate.source.raw,
+      let matchedOrdinal = -1;
+      let matchedRaw = "";
+      for (let i = 0; i < images.length; i++) {
+        const raw = imagePath(images[i]);
+        if (!raw) continue;
+        try {
+          if (resolveSource(raw, services.origin).key === candidate.source.key) {
+            if (matchedOrdinal >= 0) return;
+            matchedOrdinal = i;
+            matchedRaw = raw;
+          }
+        } catch {
+          // Ignore malformed image src
+        }
+      }
+      if (matchedOrdinal < 0 || matchedRaw !== candidate.source.raw || !scope.active || task.signal.aborted) return;
+      const target: OccurrenceTarget = {
+        rootID: doc.id,
+        notebook: doc.box,
+        blockID: candidate.blockID,
+        imageOrdinal: matchedOrdinal,
+        oldPath: matchedRaw,
+        baselineBlockDOM: persistedDOM,
       };
-      const target = await waitForPersistedImageOccurrence(services.kernel, evidence, 1, task.signal);
-      if (!target || !scope.active || task.signal.aborted) return;
       hasPersistedTarget.set(task, true);
 
       const downloaded = await services.reader.read(candidate.source, {
@@ -160,10 +184,8 @@ export async function watchRemoteImages(
       });
       await assertImagePayload(downloaded.blob);
       if (!scope.active || task.signal.aborted) return;
-      const localOriginal = await services.assets.upload(
-        new File([downloaded.blob], safeFileName(downloaded.name || candidate.source.name), { type: downloaded.blob.type }),
-        doc.id, task.signal,
-      );
+      const providedFile = await calibrateRemoteImageFile(downloaded.blob, downloaded.name || candidate.source.name);
+      const localOriginal = await services.assets.upload(providedFile, doc.id, task.signal);
       const localSource = resolveSource(localOriginal, services.origin);
       if (localSource.kind !== "asset") return;
 
@@ -172,33 +194,21 @@ export async function watchRemoteImages(
       const localized = await services.references.commitOccurrence(target, localOriginal, task.signal);
       if (localized !== "replaced" || !scope.active || task.signal.aborted) return;
 
-      const updatedDOM = await blockDOM(services.kernel, target.blockID, target.notebook, task.signal);
-      const updatedTemplate = document.createElement("template");
-      updatedTemplate.innerHTML = updatedDOM;
-      const updatedOwner = [...updatedTemplate.content.querySelectorAll("[data-node-id]")]
-        .find(node => node.getAttribute("data-node-id") === target.blockID);
-      const updatedImages = [...(updatedOwner?.querySelectorAll("img") ?? [])];
-      const localizedMatches = updatedImages.filter(image => {
-        const raw = image.hasAttribute("data-src") ? image.getAttribute("data-src") : image.getAttribute("src");
-        try { return raw && resolveSource(raw, services.origin).key === localSource.key; }
-        catch { return false; }
-      });
-      const selected = updatedImages[target.imageOrdinal];
-      const selectedRaw = selected && (selected.hasAttribute("data-src") ? selected.getAttribute("data-src") : selected.getAttribute("src"));
-      if (!selected || localizedMatches.length !== 1 || !selectedRaw || resolveSource(selectedRaw, services.origin).key !== localSource.key) return;
-      const nextTarget = { ...target, oldPath: localOriginal, baselineBlockDOM: updatedDOM };
+      const nextTarget = { ...target, oldPath: localOriginal };
 
       // prepareImage persists the Dock mapping before a compressed path is eligible for
       // replacement. A skipped format/threshold leaves the localized original in place.
       const currentConfig = services.config();
       if (!autoAllowed(currentConfig, doc.id) || !scope.active || task.signal.aborted) return;
       const compressed = await services.compressOccurrence(nextTarget, currentConfig, task.signal,
-        { mode: "auto", replace: true });
+        { mode: "auto", replace: true, providedFile });
       if (compressed.status === "saved" && compressed.reference !== "replaced") {
         logger.warn("自动处理外链图片的压缩引用更新未能确认", compressed.reference);
       }
     } catch (error) {
-      if (!task.signal.aborted && scope.active) logger.warn("自动处理外链图片失败", error);
+      if (!task.signal.aborted && scope.active) {
+        logger.warn("自动处理外链图片失败", error);
+      }
     } finally {
       tasks.delete(task);
       hasPersistedTarget.delete(task);
@@ -208,10 +218,14 @@ export async function watchRemoteImages(
     }
   }
 
-  async function sweep(): Promise<void> {
+  async function sweep(confirmIfEmpty = false): Promise<void> {
     if (disposed || paused || !scope.active || signal.aborted || !observing) return;
     if (!autoAllowed(services.config(), doc.id)) return;
-    if (reading) { rerun = true; return; }
+    if (reading) {
+      if (confirmIfEmpty) pendingInsertConfirm = true;
+      rerun = true;
+      return;
+    }
     reading = true;
     try {
       const current = await snapshot();
@@ -220,7 +234,12 @@ export async function watchRemoteImages(
       if (rebasing) { rebasing = false; return; }
       const added = addedRemoteCandidates(old, current, services.config(), doc.id);
       if (added.length > 20) { logger.warn("检测到大量新增外链图片，请使用文档批量操作"); return; }
+      if (!added.length && confirmIfEmpty && !paused && !disposed && observing && !signal.aborted && !rerun) {
+        schedule(900, false);
+        return;
+      }
       for (const candidate of added) {
+        if (disposed || paused || !scope.active || signal.aborted) break;
         const identity = keyOf(candidate.blockID, candidate.source.key);
         const oldCount = old.get(identity)?.count ?? 0;
         await process(candidate, oldCount);
@@ -229,16 +248,23 @@ export async function watchRemoteImages(
       if (!signal.aborted && scope.active) logger.warn("读取持久化图片状态失败", error);
     } finally {
       reading = false;
-      if (rerun && !paused && !disposed && observing) { rerun = false; schedule(350); }
+      if (rerun && !paused && !disposed && observing) {
+        rerun = false;
+        const nextConfirm = pendingInsertConfirm;
+        pendingInsertConfirm = false;
+        schedule(350, nextConfirm);
+      }
     }
   }
-  function schedule(delay = 450): void {
+  function schedule(delay = 450, confirmIfEmpty = false): void {
     if (paused || disposed || !observing) return;
+    if (confirmIfEmpty) pendingInsertConfirm = true;
     if (timer !== undefined) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = undefined;
-      void sweep();
-      timer = setTimeout(() => { timer = undefined; void sweep(); }, 900);
+      const shouldConfirm = pendingInsertConfirm;
+      pendingInsertConfirm = false;
+      void sweep(shouldConfirm);
     }, delay);
   }
   const onUndo = (event: Event) => {
@@ -291,6 +317,34 @@ export function safeFileName(name: string): string {
   const base = name.replace(/\\/g, "/").split("/").pop() || "remote-image";
   const safe = base.replace(/[\u0000-\u001f<>:"/\\|?*]/g, "_").slice(0, 180);
   return safe || "remote-image";
+}
+
+const MIME_TO_EXT: Record<ImageInfo["mime"], string> = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/webp": ".webp",
+};
+
+/** Calibrates extension and MIME from image signature bytes when supported, keeping other formats intact. */
+export async function calibrateRemoteImageFile(blob: Blob, rawName: string): Promise<File> {
+  const baseName = safeFileName(rawName);
+  let fileName = baseName;
+  let mime = blob.type;
+  try {
+    const info = inspectImage(new Uint8Array(await blob.arrayBuffer()));
+    mime = info.mime;
+    const targetExt = MIME_TO_EXT[info.mime];
+    const extMatch = /\.[a-zA-Z0-9]{1,10}$/.exec(baseName);
+    const currentExt = extMatch?.[0].toLowerCase();
+    const compatibleExts = info.mime === "image/jpeg" ? [".jpg", ".jpeg"] : [targetExt];
+    if (!currentExt || !compatibleExts.includes(currentExt)) {
+      const stem = extMatch ? baseName.slice(0, -extMatch[0].length) : baseName;
+      fileName = `${stem || "remote-image"}${targetExt}`;
+    }
+  } catch {
+    // Preserve original file name and MIME for GIF/SVG or truncated test stubs
+  }
+  return new File([blob], fileName, { type: mime });
 }
 
 export async function assertImagePayload(blob: Blob): Promise<void> {

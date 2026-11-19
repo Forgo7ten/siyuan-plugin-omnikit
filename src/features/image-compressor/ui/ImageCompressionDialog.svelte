@@ -7,7 +7,7 @@
   interface Props {
     sourceName: string;
     defaults: { quality: number; manualMaxEdge: number };
-    t: (key: string) => string;
+    t: (key: string, values?: Record<string, string | number>) => string;
     previewEncode: (quality: number, manualMaxEdge: number) => Promise<ManualCompressionPreview>;
     save: (preview: ManualCompressionPreview, replace: boolean) => Promise<void>;
     onClose?: () => void;
@@ -23,6 +23,7 @@
   let originalURL = $state("");
   let busy = $state(false);
   let error = $state("");
+  let destroyed = false;
 
   onMount(() => {
     quality = defaults.quality;
@@ -39,6 +40,7 @@
     error = "";
     try {
       const encoded = await previewEncode(quality, manualMaxEdge);
+      if (destroyed) return;
       if (previewURL) URL.revokeObjectURL(previewURL);
       if (originalURL) URL.revokeObjectURL(originalURL);
       preview = encoded;
@@ -46,7 +48,7 @@
       originalURL = URL.createObjectURL(encoded.originalBlob);
       allowLarger = false;
     } catch {
-      error = t("image.dialog.previewFailed");
+      if (!destroyed) error = t("image.dialog.previewFailed");
     } finally {
       busy = false;
     }
@@ -59,7 +61,9 @@
     try {
       await save(preview, replaceCurrent);
     } catch {
-      error = t("image.dialog.saveFailed");
+      if (!destroyed) {
+        error = t("image.dialog.saveFailed");
+      }
     } finally {
       busy = false;
     }
@@ -81,6 +85,7 @@
   }
 
   onDestroy(() => {
+    destroyed = true;
     if (previewURL) URL.revokeObjectURL(previewURL);
     if (originalURL) URL.revokeObjectURL(originalURL);
   });
@@ -97,7 +102,7 @@
 
   <!-- Parameter Settings Card -->
   <div class="dialog-card">
-    <OmniFormRow title={t("image.dialog.quality")} description="压缩质量越低，体积越小">
+    <OmniFormRow title={t("image.dialog.quality")} description={t("image.dialog.qualityHelp")}>
       <div class="slider-wrapper">
         <OmniSlider
           bind:value={quality}
@@ -113,7 +118,7 @@
 
     <div class="card-divider"></div>
 
-    <OmniFormRow title={t("image.dialog.maxEdge")} description="原图长边超过此像素时等比缩减，保持宽高比">
+    <OmniFormRow title={t("image.dialog.maxEdge")} description={t("image.dialog.maxEdgeHelp")}>
       <div class="edge-input-group">
         <input
           aria-label={t("image.dialog.maxEdge")}
@@ -151,7 +156,7 @@
         disabled={busy}
       >
         <svg class="btn-icon" viewBox="0 0 16 16"><path fill="currentColor" d="M8 3.5C4.5 3.5 1.6 5.8.5 9c1.1 3.2 4 5.5 7.5 5.5s6.4-2.3 7.5-5.5c-1.1-3.2-4-5.5-7.5-5.5zm0 9A3.5 3.5 0 1 1 8 5.5a3.5 3.5 0 0 1 0 7zm0-5.5a2 2 0 1 0 0 4 2 2 0 0 0 0-4z"/></svg>
-        {busy ? "正在处理…" : preview ? "重新生成预览" : t("image.dialog.preview")}
+        {busy ? t("image.dialog.processing") : preview ? t("image.dialog.regeneratePreview") : t("image.dialog.preview")}
       </button>
     </div>
   </div>
@@ -195,7 +200,7 @@
         <div class="preview-card__footer">
           <span>{preview.width} × {preview.height} px</span>
           {#if preview.compressedBytes <= preview.originalBytes}
-            <span>节省 {formatBytes(preview.originalBytes - preview.compressedBytes)}</span>
+            <span>{t("image.dialog.savedAmount", { size: formatBytes(preview.originalBytes - preview.compressedBytes) })}</span>
           {/if}
           {#if preview.similarity !== undefined}
             <span class="preview-metric">

@@ -9,9 +9,11 @@ interface RecordsFile {
 
 const MAX_RECORDS = 10_000;
 const MAX_PATH_LENGTH = 2_048;
-const MAX_FILE_BYTES = 4 * 1024 * 1024;
+const MAX_IDENTITY_CACHE = 50_000;
 const BOX_ID = /^\d{14}-[a-z0-9]{7}$/;
 const OPERATIONS = new Set<OperationKind>(["saved-only", "replaced", "incomplete"]);
+const identityCache = new Map<string, string>();
+const trustedDrafts = new WeakSet<object>();
 
 /** Validate a kernel asset path and return a stable identity for duplicate checks. */
 function assetIdentity(path: unknown): string {
@@ -19,6 +21,8 @@ function assetIdentity(path: unknown): string {
       path !== path.trim() || /[\u0000-\u001f\u007f\\#]/.test(path)) {
     throw new Error("Invalid compression record asset path");
   }
+  const cached = identityCache.get(path);
+  if (cached !== undefined) return cached;
   const [assetPath, ...suffix] = path.split("?");
   if (!assetPath.startsWith("assets/") || assetPath.startsWith("assets//") || suffix.length > 1) {
     throw new Error("Compression record path must be a SiYuan asset path");
@@ -42,17 +46,24 @@ function assetIdentity(path: unknown): string {
     }
     return value.normalize("NFC").toLowerCase();
   });
-  return `${decoded.join("/")}?box=${box}`;
+  const identity = `${decoded.join("/")}?box=${box}`;
+  if (identityCache.size >= MAX_IDENTITY_CACHE) identityCache.clear();
+  identityCache.set(path, identity);
+  return identity;
 }
 
 const codec: StoreCodec<RecordsFile> = {
   defaults: () => ({ schemaVersion: 1, records: [] }),
   parse(raw) {
+    if (raw && typeof raw === "object" && trustedDrafts.has(raw)) {
+      trustedDrafts.delete(raw);
+      return raw as RecordsFile;
+    }
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
       throw new Error("Invalid image compression records store");
     }
     const file = raw as Partial<RecordsFile>;
-    if (file.schemaVersion !== 1 || !Array.isArray(file.records) || file.records.length > MAX_RECORDS) {
+    if (file.schemaVersion !== 1 || !Array.isArray(file.records)) {
       throw new Error("Unsupported image compression records store schema");
     }
     const originals = new Set<string>();
@@ -71,11 +82,7 @@ const codec: StoreCodec<RecordsFile> = {
       originals.add(originalIdentity);
       return { originalPath, compressedPath, updatedAt: record.updatedAt, lastOperation: record.lastOperation };
     });
-    const result = { schemaVersion: 1 as const, records };
-    if (new TextEncoder().encode(JSON.stringify(result)).byteLength > MAX_FILE_BYTES) {
-      throw new Error("Image compression records store exceeds size limit");
-    }
-    return result;
+    return { schemaVersion: 1 as const, records };
   },
 };
 
@@ -89,36 +96,46 @@ export class ImageCompressionRecordStore {
 
   async init(): Promise<void> { await this.store.load(); }
 
+  async reload(): Promise<boolean> { return this.store.reload(); }
+
   snapshot(): CompressionRecord[] { return this.store.snapshot().records; }
 
   async upsert(originalPath: string, compressedPath: string): Promise<void> {
     // Validate even before entering update so malformed input cannot be normalized silently.
-    assetIdentity(originalPath);
-    assetIdentity(compressedPath);
+    const originalIdentity = assetIdentity(originalPath);
+    const compressedIdentity = assetIdentity(compressedPath);
+    if (originalIdentity === compressedIdentity) {
+      throw new Error("Compression record paths must be distinct");
+    }
     const updatedAt = Date.now();
     await this.store.update(draft => {
-      const existing = draft.records.find(record => assetIdentity(record.originalPath) === assetIdentity(originalPath));
+      const existing = draft.records.find(record => assetIdentity(record.originalPath) === originalIdentity);
       if (existing) {
         existing.compressedPath = compressedPath;
         existing.updatedAt = updatedAt;
         existing.lastOperation = "saved-only";
       } else {
+        if (draft.records.length >= MAX_RECORDS) {
+          throw new Error(`Compression records reached limit (${MAX_RECORDS})`);
+        }
         draft.records.unshift({ originalPath, compressedPath, updatedAt, lastOperation: "saved-only" });
       }
+      trustedDrafts.add(draft);
     });
   }
 
   async markOperation(originalPath: string, compressedPath: string, status: OperationKind): Promise<void> {
-    assetIdentity(originalPath);
-    assetIdentity(compressedPath);
+    const originalIdentity = assetIdentity(originalPath);
+    const compressedIdentity = assetIdentity(compressedPath);
     if (!OPERATIONS.has(status)) throw new Error("Invalid compression record operation");
     await this.store.update(draft => {
-      const row = draft.records.find(record => assetIdentity(record.originalPath) === assetIdentity(originalPath));
+      const row = draft.records.find(record => assetIdentity(record.originalPath) === originalIdentity);
       // A stale job must never update the status of a newer mapping for this original.
-      if (row && assetIdentity(row.compressedPath) === assetIdentity(compressedPath)) {
+      if (row && assetIdentity(row.compressedPath) === compressedIdentity) {
         row.lastOperation = status;
         row.updatedAt = Date.now();
       }
+      trustedDrafts.add(draft);
     });
   }
 
@@ -126,6 +143,7 @@ export class ImageCompressionRecordStore {
     const identity = assetIdentity(originalPath);
     await this.store.update(draft => {
       draft.records = draft.records.filter(record => assetIdentity(record.originalPath) !== identity);
+      trustedDrafts.add(draft);
     });
   }
 }
@@ -141,4 +159,12 @@ export function imageRecordsFor(plugin: Plugin): { store: ImageCompressionRecord
     stores.set(plugin, entry);
   }
   return entry;
+}
+
+/** Reload an already-initialized record store without triggering cold-start creation or reads. */
+export async function reloadLoadedImageRecords(plugin: Plugin): Promise<void> {
+  const entry = stores.get(plugin);
+  if (!entry) return;
+  await entry.ready.catch(() => undefined);
+  await entry.store.reload();
 }

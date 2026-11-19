@@ -49,8 +49,10 @@ test("updateVersion updates package.json and plugin.json atomically", async () =
     await writeFile(path.join(root, "package.json"), JSON.stringify(pkg, null, 2) + "\n");
     await writeFile(path.join(root, "plugin.json"), JSON.stringify(manifest, null, 2) + "\n");
 
-    const updated = await updateVersion("patch", { projectRoot: root, log: () => {} });
+    const logs = [];
+    const updated = await updateVersion("patch", { projectRoot: root, log: msg => logs.push(msg) });
     assert.equal(updated, "0.1.1");
+    assert.ok(logs.some(line => line.includes("0.1.0 -> 0.1.1")));
 
     const updatedPkg = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
     const updatedManifest = JSON.parse(await readFile(path.join(root, "plugin.json"), "utf8"));

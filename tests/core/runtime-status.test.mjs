@@ -68,3 +68,24 @@ test("external disable clears failed state and a bad observer cannot block trans
   assert.equal(manager.statuses()[0].error, undefined);
   assert.ok(errors.includes("运行状态监听器失败"));
 });
+
+test("reconcileFromLoadedSettings does not fire notifySettingsChanged for already-enabled features", async () => {
+  const meta = { id: "runtime", title: "Runtime", description: "", category: "other", icon: "", defaultEnabled: true };
+  let settingsChangedCalls = 0;
+  class Feature extends BaseFeature {
+    constructor() { super(meta); }
+    onEnable() {}
+    onSettingsChanged() { settingsChangedCalls++; }
+  }
+  const catalog = new FeatureCatalog();
+  catalog.register(new Feature());
+  const manager = new FeatureManager(catalog, {
+    settings: { getFeatureEnabled: () => true },
+    logger: { debug() {}, error() {} },
+  });
+  await manager.initialize();
+  await manager.reconcileFromLoadedSettings();
+  assert.equal(settingsChangedCalls, 0);
+  await manager.notifySettingsChanged(meta.id);
+  assert.equal(settingsChangedCalls, 1);
+});

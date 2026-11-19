@@ -40,49 +40,99 @@ export function dockViewState<T extends { id: string }>(views: readonly T[], sel
 /** A single host Dock switches between feature-owned views. */
 export function registerDock(plugin: Plugin, options: RegisterDockOptions): () => void {
   let element: HTMLElement | undefined;
+  let heading: HTMLElement | undefined;
+  let tabsHost: HTMLElement | undefined;
+  let viewHost: HTMLElement | undefined;
+  let emptyHint: HTMLElement | undefined;
+  let settingsBtn: HTMLButtonElement | undefined;
   let selectedID: string | undefined;
   let mounted: ReturnType<typeof mount> | undefined;
+  let mountedID: string | undefined;
+  let mountedComponent: FeatureDockView["component"] | undefined;
+  let lastTabsSignature: string | undefined;
+
+  const ensureShell = (): void => {
+    if (!element || heading) return;
+    element.classList.add("omnikit-dock");
+    element.replaceChildren();
+    heading = el("h2", "omnikit-heading", options.title);
+    tabsHost = el("div", "omnikit-dock-tabs");
+    tabsHost.setAttribute("role", "tablist");
+    viewHost = el("div", "omnikit-dock-view");
+    emptyHint = el("p", "omnikit-dock-empty", options.t("dock.empty"));
+    settingsBtn = button(options.t("dock.openSettings"), options.openSettings);
+    element.append(heading, tabsHost, viewHost, emptyHint, settingsBtn);
+  };
 
   const render = (): void => {
     if (!element) return;
-    if (mounted) {
-      void unmount(mounted);
-      mounted = undefined;
-    }
-    element.classList.add("omnikit-dock");
-    element.replaceChildren();
-    element.append(el("h2", "omnikit-heading", options.title));
+    ensureShell();
+    if (!heading || !tabsHost || !viewHost || !emptyHint || !settingsBtn) return;
+
+    heading.textContent = options.title;
+    settingsBtn.textContent = options.t("dock.openSettings");
 
     const views = filterSupportedDockViews(options.views());
     const state = dockViewState(views, selectedID);
     selectedID = state.selected?.id;
+
     if (state.showTabs) {
-      const tabs = el("div", "omnikit-dock-tabs");
-      tabs.setAttribute("role", "tablist");
-      for (const view of views) {
-        const tab = button(view.title, () => {
-          selectedID = view.id;
-          render();
-        });
-        tab.setAttribute("role", "tab");
-        tab.setAttribute("aria-selected", String(view.id === selectedID));
-        tabs.append(tab);
+      const tabsSignature = JSON.stringify({
+        selectedID,
+        views: views.map(view => ({ id: view.id, title: view.title })),
+      });
+      if (tabsSignature !== lastTabsSignature) {
+        const tabs: HTMLButtonElement[] = [];
+        for (const view of views) {
+          const tab = button(view.title, () => {
+            selectedID = view.id;
+            render();
+          });
+          tab.setAttribute("role", "tab");
+          tab.setAttribute("aria-selected", String(view.id === selectedID));
+          tabs.push(tab);
+        }
+        tabsHost.replaceChildren(...tabs);
+        lastTabsSignature = tabsSignature;
       }
-      element.append(tabs);
+      tabsHost.style.display = "";
+    } else {
+      if (lastTabsSignature !== "") {
+        tabsHost.replaceChildren();
+        lastTabsSignature = "";
+      }
+      tabsHost.style.display = "none";
     }
 
     const selected = state.selected;
+    if (selected && mounted && mountedID === selected.id && mountedComponent === selected.component) {
+      viewHost.style.display = "";
+      emptyHint.style.display = "none";
+      return;
+    }
+
+    if (mounted) {
+      void unmount(mounted);
+      mounted = undefined;
+    }
+    mountedID = undefined;
+    mountedComponent = undefined;
+    viewHost.replaceChildren();
+
     if (selected) {
-      const target = el("div", "omnikit-dock-view");
-      element.append(target);
+      viewHost.style.display = "";
+      emptyHint.style.display = "none";
       mounted = mount(selected.component, {
-        target,
+        target: viewHost,
         props: { context: options.context, t: options.t },
       });
+      mountedID = selected.id;
+      mountedComponent = selected.component;
     } else {
-      element.append(el("p", "omnikit-dock-empty", options.t("dock.empty")));
+      viewHost.style.display = "none";
+      emptyHint.textContent = options.t("dock.empty");
+      emptyHint.style.display = "";
     }
-    element.append(button(options.t("dock.openSettings"), options.openSettings));
   };
 
   plugin.addDock({
@@ -99,6 +149,14 @@ export function registerDock(plugin: Plugin, options: RegisterDockOptions): () =
     destroy: () => {
       if (mounted) void unmount(mounted);
       mounted = undefined;
+      mountedID = undefined;
+      mountedComponent = undefined;
+      lastTabsSignature = undefined;
+      heading = undefined;
+      tabsHost = undefined;
+      viewHost = undefined;
+      emptyHint = undefined;
+      settingsBtn = undefined;
       element = undefined;
     },
   });

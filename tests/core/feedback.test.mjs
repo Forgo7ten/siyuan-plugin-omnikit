@@ -89,6 +89,22 @@ test("UiFeedback copyable copies text and emits notice when active", async () =>
   assert.equal(failed, false);
 });
 
+test("UiFeedback copyable returns false and suppresses notice if scope becomes inactive during clipboard await", async () => {
+  const scope = new FeatureScope();
+  const notices = [];
+  const feedback = new UiFeedback(
+    scope,
+    msg => notices.push(msg),
+    async () => {
+      scope.dispose();
+    },
+  );
+
+  const ok = await feedback.copyable("assets/late.png", "不应弹出");
+  assert.equal(ok, false);
+  assert.equal(notices.length, 0);
+});
+
 test("PluginStatusBar manages tasks, updates text, and cleans up on dispose", () => {
   setFrontendResolver(() => "desktop");
   const statusBar = new PluginStatusBar();

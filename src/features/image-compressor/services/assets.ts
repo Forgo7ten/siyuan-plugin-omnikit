@@ -23,9 +23,6 @@ export class AssetStore {
       // A write transport failure can happen after the kernel accepted the file. Never retry it.
       throw new UploadOutcomeUnknown(error instanceof Error ? error.message : "Upload outcome is unknown");
     }
-    if (response.code !== 0) {
-      throw new UploadOutcomeUnknown(`Upload failed with code ${response.code}: ${response.msg || ""}`);
-    }
     const data = response.data;
     if (!data || typeof data !== "object" || Array.isArray(data)) throw new UploadOutcomeUnknown("Upload response is not reliable");
     if (Array.isArray(data.failedFiles) && data.failedFiles.length > 0) {
@@ -43,9 +40,6 @@ export class AssetStore {
     }
     if (typeof path !== "string") throw new UploadOutcomeUnknown("Upload returned no exact file mapping");
     const normalized = path.replace(/\\/g, "/");
-    if (!normalized.startsWith("assets/")) {
-      throw new UploadOutcomeUnknown("Upload returned an invalid resource path");
-    }
     try {
       if (resolveSource(normalized, this.origin).kind !== "asset") throw new Error("non-asset path");
     } catch {

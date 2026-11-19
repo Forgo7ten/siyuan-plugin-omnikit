@@ -18,7 +18,7 @@ export function extractNormalizedTitle(
   url: string,
   options: NormalizeTitleOptions,
 ): NormalizedTitle | null {
-  const pageTitle = extractTagContent(html, "title");
+  const pageTitle = extractPageTitle(html);
   if (pageTitle && CHALLENGE_TITLE_PATTERN.test(cleanWhitespace(pageTitle))) {
     return hostnameFallback(url, options);
   }
@@ -45,13 +45,24 @@ export function truncateGraphemes(value: string, maxLength: number): string {
   return `${graphemes.slice(0, maxLength - 3).join("")}...`;
 }
 
-function extractTagContent(html: string, tagName: string): string | null {
-  if (tagName.toLowerCase() === "title") {
-    const headMatch = html.match(/<head\b[^>]*>([\s\S]*?)<\/head\s*>/i);
-    const scope = headMatch ? headMatch[1] : html;
-    return scope.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1] ?? null;
+function extractTitleScope(html: string): string {
+  const closedHead = html.match(/<head\b[^>]*>([\s\S]*?)<\/head\s*>/i);
+  if (closedHead) return closedHead[1];
+
+  const bodyIndex = html.search(/<body\b/i);
+  const headOpen = /<head\b[^>]*>/i.exec(html);
+  if (headOpen) {
+    const start = headOpen.index + headOpen[0].length;
+    return bodyIndex > start ? html.slice(start, bodyIndex) : html.slice(start);
   }
-  return html.match(new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}\\s*>`, "i"))?.[1] ?? null;
+
+  const preBody = bodyIndex >= 0 ? html.slice(0, bodyIndex) : html;
+  return preBody.replace(/<svg\b[^>]*>[\s\S]*?<\/svg\s*>/gi, "");
+}
+
+function extractPageTitle(html: string): string | null {
+  const scope = extractTitleScope(html);
+  return scope.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1] ?? null;
 }
 
 function extractMetaContent(html: string, key: "name" | "property", expected: string): string | null {

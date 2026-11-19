@@ -150,6 +150,9 @@ test("non-active background mode updates block via updateBlock and trusts code: 
     calls: [],
     async post(path, body) {
       this.calls.push(path);
+      if (path === "/api/block/getBlockInfo") {
+        return { data: { rootID: "20260101000000-rootabc", box: "notebook" }, code: 0 };
+      }
       if (path === "/api/block/getBlockDOM") {
         return { data: { id: block.id, dom: block.outerHTML }, code: 0 };
       }
@@ -162,10 +165,11 @@ test("non-active background mode updates block via updateBlock and trusts code: 
   };
 
   assert.equal(await commitLinkTitle(target, "Example", { replaceTitle: true, kernel }), "updated");
-  assert.deepEqual(kernel.calls, ["/api/block/getBlockDOM", "/api/block/updateBlock"]);
+  assert.deepEqual(kernel.calls, ["/api/block/getBlockInfo", "/api/block/getBlockDOM", "/api/block/updateBlock"]);
   assert.equal(updateCalls.length, 1);
   assert.equal(updateCalls[0].id, block.id);
   assert.equal(updateCalls[0].dataType, "dom");
+  assert.equal(updateCalls[0].lockType, true);
   assert.match(updateCalls[0].data, />Example<\/span>/);
 }));
 
@@ -236,6 +240,9 @@ test("commits same-block title updates with one updateBlock in non-active mode",
     calls: [],
     async post(path, body) {
       this.calls.push(path);
+      if (path === "/api/block/getBlockInfo") {
+        return { data: { rootID: "20260101000000-rootabc", box: "notebook" }, code: 0 };
+      }
       if (path === "/api/block/getBlockDOM") {
         return { data: { id: block.id, dom: block.outerHTML }, code: 0 };
       }
@@ -251,7 +258,7 @@ test("commits same-block title updates with one updateBlock in non-active mode",
     { target: first, title: "First" },
     { target: second, title: "Second" },
   ], { replaceTitle: false, kernel }), ["updated", "updated"]);
-  assert.deepEqual(kernel.calls, ["/api/block/getBlockDOM", "/api/block/updateBlock"]);
+  assert.deepEqual(kernel.calls, ["/api/block/getBlockInfo", "/api/block/getBlockDOM", "/api/block/updateBlock"]);
   assert.equal(updateCalls.length, 1);
   assert.match(updateCalls[0].data, />First<\/span>/);
   assert.match(updateCalls[0].data, />Second<\/span>/);
@@ -377,4 +384,290 @@ test("safely propagates AbortError during non-active kernel calls as aborted", a
     signal: controller.signal,
   });
   assert.equal(result, "aborted");
+}));
+
+test("active editor never falls back to updateBlock when link is removed from DOM", async () => installDOMParser(async () => {
+  const { links, block, protyle, transactions } = fixture();
+  const target = captureLinkTarget(links[0], protyle);
+  const kernel = kernelFor(block);
+  links[0].isConnected = false;
+
+  const result = await commitLinkTitle(target, "Example", { replaceTitle: false, kernel });
+  assert.equal(result, "conflict");
+  assert.deepEqual(kernel.calls, []);
+  assert.equal(transactions.length, 0);
+}));
+
+test("nested Protyle.protyle switches to inactive updateBlock when rootID changes or editor is destroyed", async () => installDOMParser(async () => {
+  const links = [new LinkElement("https://example.com/item", "https://example.com/item")];
+  const block = new BlockElement("20260101000000-block123", links);
+  const transactions = [];
+  const editorClassList = new Set(["protyle"]);
+  const protyleWrapper = {
+    destroyed: false,
+    protyle: {
+      element: { isConnected: true, classList: { contains: name => editorClassList.has(name) } },
+      wysiwyg: { element: { isConnected: true } },
+      block: { rootID: "20260101000000-docA", box: "notebook-1" },
+      notebookId: "notebook-1",
+    },
+    updateTransactionElement(element, oldHTML) {
+      transactions.push({ element, oldHTML });
+    },
+  };
+  const target = captureLinkTarget(links[0], protyleWrapper);
+  assert.ok(target);
+
+  // Switch active document to docB while protyle reference remains non-null
+  protyleWrapper.protyle.block.rootID = "20260101000000-docB";
+  const updateCalls = [];
+  const kernel = {
+    calls: [],
+    async post(path, body) {
+      this.calls.push(path);
+      if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-docA", box: "notebook-1" }, code: 0 };
+      if (path === "/api/block/getBlockDOM") return { data: { id: block.id, dom: block.outerHTML }, code: 0 };
+      if (path === "/api/block/updateBlock") { updateCalls.push(body); return { code: 0, data: null }; }
+      return { data: {}, code: 0 };
+    },
+  };
+
+  const switchedResult = await commitLinkTitle(target, "Switched Title", { replaceTitle: false, kernel });
+  assert.equal(switchedResult, "updated");
+  assert.deepEqual(kernel.calls, ["/api/block/getBlockInfo", "/api/block/getBlockDOM", "/api/block/updateBlock"]);
+  assert.equal(transactions.length, 0);
+  assert.equal(updateCalls.length, 1);
+
+  // Restore rootID, then destroy the editor (sets destroyed = true and removes .protyle class)
+  protyleWrapper.protyle.block.rootID = "20260101000000-docA";
+  protyleWrapper.destroyed = true;
+  editorClassList.delete("protyle");
+  kernel.calls = [];
+  const destroyedResult = await commitLinkTitle(target, "Destroyed Title", { replaceTitle: false, kernel });
+  assert.equal(destroyedResult, "updated");
+  assert.deepEqual(kernel.calls, ["/api/block/getBlockInfo", "/api/block/getBlockDOM", "/api/block/updateBlock"]);
+  assert.equal(transactions.length, 0);
+}));
+
+test("restores collapsed caret to end of link text without stealing non-collapsed or external selection", async () => installDOMParser(async () => {
+  const prevSelection = globalThis.getSelection;
+  const prevDocument = globalThis.document;
+  try {
+    const createRichFixture = () => {
+      const outsideNode = { nodeType: 3, textContent: "outside" };
+      const textNode = { nodeType: 3, textContent: "https://example.com/0" };
+      const link = {
+        attributes: new Map([["data-type", "a"], ["data-href", "https://example.com/0"]]),
+        isConnected: true,
+        block: undefined,
+        _text: "https://example.com/0",
+        firstChild: textNode,
+        childNodes: [textNode],
+        get textContent() { return this._text; },
+        set textContent(value) {
+          this._text = String(value);
+          const child = { nodeType: 3, textContent: this._text };
+          this.firstChild = this._text.length > 0 ? child : null;
+          this.childNodes = this.firstChild ? [this.firstChild] : [];
+        },
+        getAttribute(name) { return this.attributes.get(name) ?? null; },
+        setAttribute(name, value) { this.attributes.set(name, String(value)); },
+        removeAttribute(name) { this.attributes.delete(name); },
+        contains(node) { return node === this || node === this.firstChild || node === textNode; },
+        closest(selector) { return selector === "[data-node-id]" ? this.block : null; },
+        get outerHTML() { return `<span data-type="a" data-href="https://example.com/0">${this._text}</span>`; },
+      };
+      const block = new BlockElement("20260101000000-caret", [link]);
+      const events = [];
+      const protyle = {
+        block: { rootID: "20260101000000-rootcaret", box: "notebook" },
+        notebookId: "notebook",
+        updateTransactionElement() { events.push("transaction"); },
+      };
+      return { link, block, protyle, textNode, outsideNode, events };
+    };
+
+    const installSelection = (range, events) => {
+      let currentRange = range;
+      const selection = {
+        get rangeCount() { return currentRange ? 1 : 0; },
+        getRangeAt() { return currentRange; },
+        removeAllRanges() { events.push("removeAllRanges"); currentRange = null; },
+        addRange(next) { events.push("addRange"); currentRange = next; },
+      };
+      globalThis.getSelection = () => selection;
+      globalThis.document = {
+        createRange() {
+          return {
+            startContainer: null,
+            startOffset: 0,
+            collapsed: false,
+            setStart(node, offset) { this.startContainer = node; this.startOffset = offset; },
+            collapse(toStart) { this.collapsed = toStart; },
+          };
+        },
+      };
+      return () => currentRange;
+    };
+
+    // 1. Collapsed caret inside link -> restored at end of new Text node before transaction
+    {
+      const { link, protyle, textNode, events } = createRichFixture();
+      const getCurrent = installSelection({ collapsed: true, startContainer: textNode, endContainer: textNode }, events);
+      const target = captureLinkTarget(link, protyle);
+      assert.equal(await commitLinkTitle(target, "Restored Title", { replaceTitle: false }), "updated");
+      assert.deepEqual(events, ["removeAllRanges", "addRange", "transaction"]);
+      assert.equal(getCurrent().startContainer, link.firstChild);
+      assert.equal(getCurrent().startOffset, "Restored Title".length);
+      assert.equal(getCurrent().collapsed, true);
+    }
+
+    // 2. Non-collapsed selection inside link -> does not touch selection
+    {
+      const { link, protyle, textNode, events } = createRichFixture();
+      installSelection({ collapsed: false, startContainer: textNode, endContainer: textNode }, events);
+      const target = captureLinkTarget(link, protyle);
+      assert.equal(await commitLinkTitle(target, "Selected Title", { replaceTitle: false }), "updated");
+      assert.deepEqual(events, ["transaction"]);
+    }
+
+    // 3. Collapsed caret outside link -> does not steal focus
+    {
+      const { link, protyle, outsideNode, events } = createRichFixture();
+      installSelection({ collapsed: true, startContainer: outsideNode, endContainer: outsideNode }, events);
+      const target = captureLinkTarget(link, protyle);
+      assert.equal(await commitLinkTitle(target, "External Title", { replaceTitle: false }), "updated");
+      assert.deepEqual(events, ["transaction"]);
+    }
+  } finally {
+    globalThis.getSelection = prevSelection;
+    globalThis.document = prevDocument;
+  }
+}));
+
+test("non-active mode enforces exact ordinal and rejects fuzzy match on duplicate URLs", async () => installDOMParser(async () => {
+  const url = "https://example.com/dup";
+  const links = [new LinkElement(url, url), new LinkElement(url, url)];
+  const block = new BlockElement("20260101000000-dupblock", links);
+  const targetSecond = { ...captureLinkTarget(links[1], {
+    block: { rootID: "20260101000000-root", box: "notebook" },
+    notebookId: "notebook",
+    updateTransactionElement() {},
+  }), protyle: null };
+  assert.equal(targetSecond.ordinal, 1);
+
+  // Persisted DOM now only has ordinal 0 with that URL (ordinal 1 was deleted/shifted)
+  const shiftedDOM = `<div data-node-id="${block.id}"><span data-type="a" data-href="${url}">${url}</span></div>`;
+  const updateCalls = [];
+  const kernel = {
+    async post(path, body) {
+      if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-root", box: "notebook" }, code: 0 };
+      if (path === "/api/block/getBlockDOM") return { data: { id: block.id, dom: shiftedDOM }, code: 0 };
+      if (path === "/api/block/updateBlock") { updateCalls.push(body); return { code: 0, data: null }; }
+      return { data: {}, code: 0 };
+    },
+  };
+
+  const result = await commitLinkTitle(targetSecond, "Should Not Overwrite Ordinal 0", { replaceTitle: false, kernel });
+  assert.equal(result, "conflict");
+  assert.equal(updateCalls.length, 0);
+}));
+
+test("non-active mode checks live rootID and box and makes zero updateBlock calls when block moved across docs", async () => installDOMParser(async () => {
+  const { links, block, protyle } = fixture();
+  const target = { ...captureLinkTarget(links[0], protyle), protyle: null };
+  const calls = [];
+  const kernel = {
+    async post(path) {
+      calls.push(path);
+      if (path === "/api/block/getBlockInfo") {
+        return { data: { rootID: "20260101000000-otherdoc", box: "notebook" }, code: 0 };
+      }
+      if (path === "/api/block/getBlockDOM") {
+        return { data: { id: block.id, dom: block.outerHTML }, code: 0 };
+      }
+      return { code: 0, data: null };
+    },
+  };
+
+  const result = await commitLinkTitle(target, "Moved Title", { replaceTitle: false, kernel });
+  assert.equal(result, "conflict");
+  assert.deepEqual(calls, ["/api/block/getBlockInfo"]);
+}));
+
+test("commitLinkTitle checks isCurrent inside write lease after IME wait and returns superseded without modifying DOM", async () => installDOMParser(async () => {
+  const { links, protyle, transactions } = fixture();
+  const target = captureLinkTarget(links[0], protyle);
+  let composing = true;
+  let current = true;
+  setTimeout(() => {
+    current = false;
+    composing = false;
+  }, 5);
+
+  const result = await commitLinkTitle(target, "Stale Title", {
+    replaceTitle: false,
+    isComposing: () => composing,
+    imePollMs: 1,
+    imeTimeoutMs: 200,
+    isCurrent: () => current,
+  });
+
+  assert.equal(result, "superseded");
+  assert.equal(transactions.length, 0);
+  assert.equal(links[0].textContent, "https://example.com/0");
+}));
+
+test("restores collapsed caret on rolled-back text node when updateTransactionElement throws", async () => installDOMParser(async () => {
+  const prevSelection = globalThis.getSelection;
+  const prevDocument = globalThis.document;
+  try {
+    let textNode = { nodeType: 3, textContent: "https://example.com/0" };
+    let blockRef;
+    const link = {
+      attributes: new Map([["data-type", "a"], ["data-href", "https://example.com/0"]]),
+      isConnected: true,
+      get firstChild() { return textNode; },
+      childNodes: { get length() { return 1; } },
+      get textContent() { return textNode.textContent; },
+      set textContent(value) { textNode = { nodeType: 3, textContent: String(value) }; },
+      getAttribute(name) { return this.attributes.get(name) ?? null; },
+      setAttribute(name, value) { this.attributes.set(name, String(value)); },
+      removeAttribute(name) { this.attributes.delete(name); },
+      closest: selector => (selector === "[data-node-id]" ? blockRef : null),
+      contains: node => node === link || node === textNode,
+      get outerHTML() { return `<span data-type="a" data-href="https://example.com/0">${this.textContent}</span>`; },
+    };
+    blockRef = new BlockElement("20260101000000-rollback", [link]);
+    const protyle = {
+      block: { rootID: "20260101000000-rootabc", box: "notebook" },
+      notebookId: "notebook",
+      async updateTransactionElement() { throw new Error("tx failed"); },
+    };
+    const appliedRanges = [];
+    const initialNode = textNode;
+    globalThis.getSelection = () => ({
+      rangeCount: 1,
+      getRangeAt: () => ({ collapsed: true, startContainer: initialNode, endContainer: initialNode, startOffset: 8 }),
+      removeAllRanges() {},
+      addRange(r) { appliedRanges.push(r); },
+    });
+    globalThis.document = {
+      createRange: () => {
+        const range = { node: null, offset: 0, setStart(n, o) { this.node = n; this.offset = o; }, collapse() {} };
+        return range;
+      },
+    };
+
+    const target = captureLinkTarget(link, protyle);
+    const result = await commitLinkTitle(target, "New Title", { replaceTitle: false });
+    assert.equal(result, "conflict");
+    assert.equal(link.textContent, "https://example.com/0");
+    assert.equal(appliedRanges.length, 2);
+    assert.equal(appliedRanges[1].node, textNode);
+    assert.equal(appliedRanges[1].offset, 8);
+  } finally {
+    globalThis.getSelection = prevSelection;
+    globalThis.document = prevDocument;
+  }
 }));

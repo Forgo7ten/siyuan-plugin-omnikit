@@ -1,20 +1,18 @@
-import { showMessage } from "siyuan";
 import type { FeatureContext } from "../../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../../core/framework/FeatureScope.ts";
-import { translate } from "../../../i18n/translate.ts";
-import { combineSignals, resolveEditorRootID } from "../../../core/host/ProtyleAdapter.ts";
+import { combineSignals, resolveEditorRootID, resolveNotebookID } from "../../../core/host/ProtyleAdapter.ts";
 import { recordRewrittenReference, type CompressionBatchSummary, type CompressionProgress } from "../policy/CompressionResult.ts";
 import { isDocumentRootIdentity } from "../policy/DocumentIdentity.ts";
 import type { ImageProcessingServices } from "../services/ImageProcessingServices.ts";
-import { resolveSource, type ImageSource } from "../policy/source.ts";
+import type { ImageSource } from "../policy/source.ts";
 import type { OccurrenceTarget } from "../policy/contracts.ts";
-import { resolveImageOccurrence } from "../services/ImageOccurrenceResolver.ts";
-import { sqlLiteral } from "../services/references.ts";
 import { scanDocumentImages, type DocumentImageOccurrence } from "./scanDocumentImages.ts";
 
 export interface BatchActionOptions {
   signal?: AbortSignal;
   onProgress?: (progress: CompressionProgress) => void;
+  rootID?: string;
+  notebook?: string;
 }
 
 interface AuthorizedOccurrence { target: OccurrenceTarget; source: ImageSource }
@@ -38,7 +36,7 @@ export async function compressDocumentImages(
   options: BatchActionOptions = {},
 ): Promise<CompressionBatchSummary> {
   const protyle = detail?.protyle ?? detail?.editor?.protyle;
-  const rootID = resolveEditorRootID(detail);
+  const rootID = options.rootID ?? resolveEditorRootID(detail);
   const summary: CompressionBatchSummary = {
     scanComplete: false, scannedBlocks: 0, total: 0, completed: 0, succeeded: 0, skipped: 0, failed: 0,
     conflicts: 0, cancelled: false, originalBytes: 0, compressedBytes: 0, referencesRewritten: 0,
@@ -50,12 +48,14 @@ export async function compressDocumentImages(
     return cancelledSummary(summary);
   }
   if (!rootID || protyle?.disabled) {
-    showMessage(translate(context.plugin.i18n, "image.batch.invalidDocument"), 5000);
     return summary;
   }
 
   const config = services.config();
-  const editorNotebook = typeof protyle?.notebookId === "string" ? protyle.notebookId : undefined;
+  const editorNotebook = options.notebook
+    ?? resolveNotebookID(detail)
+    ?? resolveNotebookID(protyle)
+    ?? (typeof detail?.items?.[0]?.notebookId === "string" ? detail.items[0].notebookId : undefined);
   let notebook = editorNotebook ?? "";
   try {
     const identity = await services.kernel.post<any>("/api/block/getBlockInfo", { id: rootID, ...(editorNotebook ? { notebook: editorNotebook } : {}) }, { signal });
@@ -70,31 +70,21 @@ export async function compressDocumentImages(
   }
 
   const targetNotebook = notebook;
-  const blockDOMs = new Map<string, string>();
+  let blockDOMs = new Map<string, string>();
+  let nestedBlockIds = new Set<string>();
   const scanned: DocumentImageOccurrence[] = [];
   try {
-    const stmt = `SELECT id, markdown FROM blocks WHERE root_id = ${sqlLiteral(rootID)} AND type = 'p' AND markdown LIKE '%assets/%'`;
-    const sqlRes = await services.kernel.post<Array<{ id: string; markdown?: string }>>(
-      "/api/query/sql",
-      { stmt, mode: "readonly" },
-      { signal },
-    );
-    const rows = Array.isArray(sqlRes.data) ? sqlRes.data : [];
-    summary.scannedBlocks = rows.length;
-    for (const row of rows) {
-      if (signal.aborted || !scope.active) return cancelledSummary(summary);
-      if (!row?.id) continue;
-      try {
-        const response = await services.kernel.post<any>("/api/block/getBlockDOM", { id: row.id, notebook: targetNotebook }, { signal });
-        if (response.data?.id === row.id && typeof response.data.dom === "string" && response.data.dom.trim()) {
-          blockDOMs.set(row.id, response.data.dom);
-          const scan = scanDocumentImages(response.data.dom, services.origin, config);
-          scanned.push(...scan.occurrences);
-        }
-      } catch (error) {
-        context.logger.warn(`读取图片块失败：${row.id}`, error);
-      }
+    const domRes = await services.kernel.post<any>("/api/block/getBlockDOM", { id: rootID, notebook: targetNotebook }, { signal });
+    if (signal.aborted || !scope.active) return cancelledSummary(summary);
+    if (domRes.data?.id !== rootID || typeof domRes.data?.dom !== "string" || !domRes.data.dom.trim()) {
+      throw new Error("Unable to read document DOM");
     }
+    const docDOM = domRes.data.dom;
+    const scan = scanDocumentImages(docDOM, services.origin, config);
+    summary.scannedBlocks = scan.scannedBlocks;
+    blockDOMs = scan.blockDOMs;
+    nestedBlockIds = scan.nestedBlockIds;
+    scanned.push(...scan.occurrences);
     summary.scanComplete = true;
   } catch (error) {
     if (signal.aborted || !scope.active) return cancelledSummary(summary);
@@ -105,20 +95,25 @@ export async function compressDocumentImages(
   const authorized: AuthorizedOccurrence[] = [];
   for (const occurrence of scanned) {
     if (signal.aborted || !scope.active) return cancelledSummary(summary);
+    if (nestedBlockIds.has(occurrence.blockId)) {
+      summary.skipped++;
+      summary.completed++;
+      continue;
+    }
     const dom = blockDOMs.get(occurrence.blockId);
-    if (!dom) {
-      summary.failed++;
+    if (!dom || !dom.trim()) {
+      summary.skipped++;
       summary.completed++;
       continue;
     }
-    const target = resolveImageOccurrence(dom, {
-      rootID, notebook: targetNotebook, blockID: occurrence.blockId, imageOrdinal: occurrence.imageOrdinal, oldPath: occurrence.source.raw,
-    });
-    if (!target) {
-      summary.conflicts++;
-      summary.completed++;
-      continue;
-    }
+    const target: OccurrenceTarget = {
+      rootID,
+      notebook: targetNotebook,
+      blockID: occurrence.blockId,
+      imageOrdinal: occurrence.imageOrdinal,
+      oldPath: occurrence.source.raw,
+      baselineBlockDOM: dom,
+    };
     authorized.push({ target, source: occurrence.source });
   }
   summary.total = scanned.length;

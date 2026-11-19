@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { BaseFeature } from "../../src/core/framework/BaseFeature.ts";
 import { FeatureScope } from "../../src/core/framework/FeatureScope.ts";
+import { UiFeedback } from "../../src/core/feedback/UiFeedback.ts";
 
 const meta = {
   id: "unitTest", title: "Unit", description: "", category: "other",
@@ -82,4 +83,77 @@ test("FeatureRegistration reloadData contract is optional and invokable", async 
   const mockPlugin = { name: "test-plugin" };
   await registration.reloadData?.(mockPlugin);
   assert.equal(reloadedWith, mockPlugin);
+});
+
+test("BaseFeature binds scoped UiFeedback in onEnable and silences notices after deactivate", async () => {
+  const notices = [];
+  let featureFeedback;
+  class Feature extends BaseFeature {
+    constructor() { super(meta); }
+    onEnable(ctx) {
+      featureFeedback = ctx.feedback;
+      featureFeedback?.notify("启用通知");
+    }
+  }
+  const feature = new Feature();
+  const rootFeedback = new UiFeedback(undefined, msg => notices.push(msg));
+  await feature.activate({ feedback: rootFeedback });
+  assert.equal(notices.length, 1);
+  assert.notEqual(featureFeedback, rootFeedback);
+
+  await feature.deactivate();
+  featureFeedback?.notify("停用后幽灵通知");
+  assert.equal(notices.length, 1);
+});
+
+test("BaseFeature deactivate clears previous activation failure while still running onDisable", async () => {
+  let disabledCalls = 0;
+  class Feature extends BaseFeature {
+    constructor() { super(meta); }
+    onEnable() { throw new Error("boom"); }
+    onDisable() { disabledCalls++; }
+  }
+  const feature = new Feature();
+  await assert.rejects(() => feature.activate({}), /boom/);
+  assert.equal(feature.status, "error");
+  assert.ok(feature.error instanceof Error);
+
+  await feature.deactivate();
+  assert.equal(disabledCalls, 1);
+  assert.equal(feature.status, "disabled");
+  assert.equal(feature.error, undefined);
+});
+
+test("BaseFeature deactivate returns a Promise on concurrent and re-entrant calls without undefined window", async () => {
+  let disableCalls = 0;
+  let reentrantPromise;
+  let releaseDisable;
+  const disableBlocked = new Promise(resolve => { releaseDisable = resolve; });
+
+  class Feature extends BaseFeature {
+    constructor() { super(meta); }
+    onEnable(_ctx, scope) {
+      scope.own(() => {
+        reentrantPromise = this.deactivate();
+      });
+    }
+    async onDisable() {
+      disableCalls++;
+      await disableBlocked;
+    }
+  }
+
+  const feature = new Feature();
+  await feature.activate({});
+
+  const first = feature.deactivate();
+  const second = feature.deactivate();
+  assert.ok(first instanceof Promise);
+  assert.strictEqual(reentrantPromise, first);
+  assert.strictEqual(second, first);
+
+  releaseDisable();
+  await Promise.all([first, second, reentrantPromise]);
+  assert.equal(disableCalls, 1);
+  assert.equal(feature.status, "disabled");
 });

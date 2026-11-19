@@ -33,6 +33,7 @@ export interface ImageProcessingServices {
 
 export interface PreparedImage {
   source: ImageSource;
+  originalPath: string;
   path: string;
   originalBytes: number;
   compressedBytes: number;
@@ -52,6 +53,16 @@ export type OccurrenceCompressionResult =
       similarity?: number;
     };
 
+function formatAssetPath(source: Extract<ImageSource, { kind: "asset" }>): string {
+  return source.path + (source.box ? `?box=${source.box}` : "");
+}
+
+function normalizedAssetPath(rawPath: string, origin: string): string {
+  const source = resolveSource(rawPath, origin);
+  if (source.kind !== "asset") throw new Error("Compression original must be a local asset");
+  return formatAssetPath(source);
+}
+
 /** Prepare one source without touching document references. */
 export async function prepareImage(
   services: ImageProcessingServices,
@@ -63,6 +74,7 @@ export async function prepareImage(
   providedFile?: File,
   selectedMode?: CompressionMode,
 ): Promise<PreparedImage | undefined> {
+  if (source.kind !== "asset") throw new Error("Remote images must be localized before compression");
   const mode = selectedMode ?? (intent.kind === "document" ? "document" : intent.kind === "upload" || intent.kind === "remote-auto" ? "auto" : "manual-quick");
   const decision = classifyImageCandidate({
     path: source.raw,
@@ -78,20 +90,38 @@ export async function prepareImage(
     userAgent: services.userAgent(),
     ...(providedFile ? { providedFiles: new Map([[source.key, providedFile]]) } : {}),
   };
-  if (source.kind !== "asset") throw new Error("Remote images must be localized before compression");
   const original = await services.reader.read(source, readOptions);
   const encoded = await services.encoder.encode(original.blob, original.name, config, signal, undefined, mode);
   if (encoded.kind === "skipped") return undefined;
-  const path = await persistEncodedImage(services, source.path + (source.box ? `?box=${source.box}` : ""),
-    encoded.value.file, rootID, signal, config.compression.maxInputBytes);
+  const originalPath = formatAssetPath(source);
+  const path = await persistNormalizedImage(services, originalPath, encoded.value.file, rootID, signal);
   return {
     source,
+    originalPath,
     path,
     originalBytes: original.blob.size,
     compressedBytes: encoded.value.file.size,
     quality: encoded.value.quality,
     similarity: encoded.value.similarity,
   };
+}
+
+async function persistNormalizedImage(
+  services: ImageProcessingServices,
+  normalizedOriginal: string,
+  encodedFile: File,
+  rootID: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const path = await services.assets.upload(encodedFile, rootID, signal);
+  try {
+    await services.recordsReady;
+    await services.records.upsert(normalizedOriginal, path);
+  } catch (error) {
+    services.ui.copyablePath(path);
+    throw new RecordPersistenceError(path, error);
+  }
+  return path;
 }
 
 /** Upload and durably record one encoded asset before it can be referenced. */
@@ -101,19 +131,9 @@ export async function persistEncodedImage(
   encodedFile: File,
   rootID: string,
   signal: AbortSignal,
-  _maxBytes?: number,
 ): Promise<string> {
-  const original = resolveSource(originalPath, services.origin);
-  if (original.kind !== "asset") throw new Error("Compression original must be a local asset");
-  const path = await services.assets.upload(encodedFile, rootID, signal);
-  try {
-    await services.recordsReady;
-    await services.records.upsert(originalPath, path);
-  } catch (error) {
-    services.ui.copyablePath(path);
-    throw new RecordPersistenceError(path, error);
-  }
-  return path;
+  const normalizedOriginal = normalizedAssetPath(originalPath, services.origin);
+  return persistNormalizedImage(services, normalizedOriginal, encodedFile, rootID, signal);
 }
 
 /** Persistence is a mandatory gate for every compressed-reference write. */
@@ -133,7 +153,7 @@ export async function compressOccurrence(
     : { kind: "upload", rootID: target.rootID, originalInputCount: 1 };
   const prepared = await prepareImage(services, source, target.rootID, intent, config, signal, options.providedFile, mode);
   if (!prepared) return { status: "skipped" };
-  return finishSaved(services, target, prepared.path, signal, options.replace ?? false, {
+  return finishSaved(services, target, prepared.path, prepared.originalPath, signal, options.replace ?? false, {
     originalBytes: prepared.originalBytes,
     compressedBytes: prepared.compressedBytes,
     quality: prepared.quality,
@@ -149,19 +169,19 @@ export async function savePreview(
   replace: boolean,
   metrics?: { originalBytes?: number; compressedBytes?: number; quality?: number; similarity?: number },
 ): Promise<OccurrenceCompressionResult> {
-  const path = await persistEncodedImage(services, target.oldPath, encodedFile, target.rootID, signal,
-    services.config().compression.maxInputBytes);
-  return finishSaved(services, target, path, signal, replace, metrics);
+  const originalPath = normalizedAssetPath(target.oldPath, services.origin);
+  const path = await persistNormalizedImage(services, originalPath, encodedFile, target.rootID, signal);
+  return finishSaved(services, target, path, originalPath, signal, replace, metrics);
 }
 
 async function finishSaved(
   services: ImageProcessingServices, target: OccurrenceTarget, path: string,
-  signal: AbortSignal, replace: boolean,
+  originalPath: string, signal: AbortSignal, replace: boolean,
   metrics?: { originalBytes?: number; compressedBytes?: number; quality?: number; similarity?: number },
 ): Promise<OccurrenceCompressionResult> {
   const reference = !replace || signal.aborted ? "not-requested" : await services.references.commitOccurrence(target, path, signal);
   if (replace && !signal.aborted) {
-    await services.records.markOperation(target.oldPath, path,
+    await services.records.markOperation(originalPath, path,
       reference === "replaced" ? "replaced" : "incomplete").catch(() => undefined);
   }
   const result: OccurrenceCompressionResult = { status: "saved", path, reference };
