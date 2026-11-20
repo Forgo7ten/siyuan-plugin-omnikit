@@ -7,12 +7,7 @@ import {
   buildReplacementPath,
 } from '../../../src/features/image-compressor/policy/source.ts';
 import { SourceReader, requireRemotePermission } from '../../../src/features/image-compressor/services/download.ts';
-import { readFile } from 'node:fs/promises';
-import ts from 'typescript';
-const imageSource = await readFile(new URL('../../../src/features/image-compressor/services/image.ts', import.meta.url), 'utf8');
-const imageJavascript = ts.transpile(imageSource.replace(/import\s*\{\s*outputName\s*\}\s*from\s*['"][^'"]+['"];?/, 'const outputName = name => name + ".webp";'), { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 });
-const imageModule = await import(`data:text/javascript,${encodeURIComponent(imageJavascript)}`);
-const { inspectImage } = imageModule;
+import { inspectImage } from '../../../src/features/image-compressor/services/image.ts';
 
 test('source resolver preserves literal asset paths, box identity, and decorative query/hash suffixes', () => {
   const literalPercent = resolveSource('./assets/a%20b.png?box=20240101000000-abcdefg', 'https://kernel.example');

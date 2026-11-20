@@ -16,6 +16,8 @@ test("image defaults use schema 2 and the grouped configuration shape", () => {
   assert.equal(config.schemaVersion, 2);
   assert.equal(config.compression.smartEnabled, false);
   assert.equal(config.compression.targetSimilarity, 0.99);
+  assert.equal(config.compression.concurrencyDesktop, 3);
+  assert.equal(config.compression.concurrencyMobile, 1);
   assert.deepEqual(parseImageConfig(config), config);
 });
 

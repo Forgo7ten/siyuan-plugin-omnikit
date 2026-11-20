@@ -289,7 +289,7 @@ test("abandons the whole group when a persisted occurrence conflicts in non-acti
   ], { replaceTitle: false, kernel: kernelFor(block, { dom: stale }) }), ["conflict", "conflict"]);
 }));
 
-test("waits for IME composition and aborts safely on timeout or signal", async () => installDOMParser(async () => {
+test("waits for IME composition and returns ime-timeout on timeout or aborted on signal", async () => installDOMParser(async () => {
   const first = fixture();
   const target = captureLinkTarget(first.links[0], first.protyle);
   assert.equal(await commitLinkTitle(target, "Example", {
@@ -297,7 +297,7 @@ test("waits for IME composition and aborts safely on timeout or signal", async (
     isComposing: () => true,
     imeTimeoutMs: 5,
     imePollMs: 1,
-  }), "conflict");
+  }), "ime-timeout");
   assert.equal(first.transactions.length, 0);
 
   const second = fixture();
@@ -832,4 +832,148 @@ test("commitLinkTitle waits for target editor IME without blocking when another 
   assert.equal(result, "updated");
   assert.equal(checkedProtyle, protyleA);
   composingB = false;
+}));
+
+test("non-active mode rejects when persisted block changed outside the target link", async () => {
+  const prevDOMParser = globalThis.DOMParser;
+  try {
+    const url = "https://example.com/item";
+    const originalHTML = `<div data-node-id="20260101000000-blkbase">prefix <span data-type="a" data-href="${url}">${url}</span></div>`;
+    const changedHTML = `<div data-node-id="20260101000000-blkbase">edited <span data-type="a" data-href="${url}">${url}</span></div>`;
+
+    const parseRich = html => {
+      const id = html.match(/data-node-id="([^"]+)"/)?.[1];
+      const prefix = html.match(/<div data-node-id="[^"]+">(.*?)<span data-type="a"/)?.[1] ?? "";
+      const linkMatch = html.match(/<span data-type="a" data-href="([^"]+)">(.*?)<\/span>/);
+      const link = new LinkElement(linkMatch[1], linkMatch[2]);
+      return new BlockElement(id, [link], prefix);
+    };
+
+    const capturedBlock = parseRich(originalHTML);
+    const target = {
+      ...captureLinkTarget(capturedBlock.links[0], {
+        block: { rootID: "20260101000000-rootbase", box: "notebook" },
+        notebookId: "notebook",
+        updateTransactionElement() {},
+      }),
+      protyle: null,
+    };
+
+    globalThis.DOMParser = class {
+      parseFromString(html) {
+        const parsed = parseRich(html);
+        return { querySelectorAll: selector => selector === "[data-node-id]" ? [parsed] : [] };
+      }
+    };
+
+    const updateCalls = [];
+    const kernel = {
+      async post(path, body) {
+        if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-rootbase", box: "notebook" }, code: 0 };
+        if (path === "/api/block/getBlockDOM") return { data: { id: "20260101000000-blkbase", dom: changedHTML }, code: 0 };
+        if (path === "/api/block/updateBlock") { updateCalls.push(body); return { code: 0, data: null }; }
+        return { code: 0, data: {} };
+      },
+    };
+
+    assert.equal(await commitLinkTitle(target, "New Title", { replaceTitle: false, kernel }), "conflict");
+    assert.equal(updateCalls.length, 0);
+  } finally {
+    globalThis.DOMParser = prevDOMParser;
+  }
+});
+
+test("non-active mode re-reads getBlockDOM only when updateBlock throws unknown and classifies outcomes accurately", async () => installDOMParser(async () => {
+  const { links, block, protyle } = fixture();
+  const baseTarget = { ...captureLinkTarget(links[0], protyle), protyle: null };
+
+  // 1. Unknown updateBlock error + verify read shows title persisted -> "updated"
+  {
+    let domReads = 0;
+    const kernel = {
+      async post(path) {
+        if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-rootabc", box: "notebook" }, code: 0 };
+        if (path === "/api/block/getBlockDOM") {
+          domReads += 1;
+          const dom = domReads === 1
+            ? block.outerHTML
+            : `<div data-node-id="${block.id}" updated="20260101000001"><span data-type="a" data-href="https://example.com/0">Resolved</span></div>`;
+          return { data: { id: block.id, dom }, code: 0 };
+        }
+        if (path === "/api/block/updateBlock") throw new Error("timeout waiting response");
+        return { code: 0, data: {} };
+      },
+    };
+    assert.equal(await commitLinkTitle(baseTarget, "Resolved", { replaceTitle: false, kernel }), "updated");
+    assert.equal(domReads, 2);
+  }
+
+  // 2. Unknown updateBlock error + verify read still matches baseline -> "failed"
+  {
+    const kernel = {
+      async post(path) {
+        if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-rootabc", box: "notebook" }, code: 0 };
+        if (path === "/api/block/getBlockDOM") return { data: { id: block.id, dom: block.outerHTML }, code: 0 };
+        if (path === "/api/block/updateBlock") throw new Error("timeout waiting response");
+        return { code: 0, data: {} };
+      },
+    };
+    assert.equal(await commitLinkTitle(baseTarget, "Resolved", { replaceTitle: false, kernel }), "failed");
+  }
+
+  // 3. Unknown updateBlock error + verify read shows concurrent edit -> "conflict"
+  {
+    let domReads = 0;
+    const kernel = {
+      async post(path) {
+        if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-rootabc", box: "notebook" }, code: 0 };
+        if (path === "/api/block/getBlockDOM") {
+          domReads += 1;
+          const dom = domReads === 1
+            ? block.outerHTML
+            : `<div data-node-id="${block.id}"><span data-type="a" data-href="https://example.com/0">User Edited</span></div>`;
+          return { data: { id: block.id, dom }, code: 0 };
+        }
+        if (path === "/api/block/updateBlock") throw new Error("timeout waiting response");
+        return { code: 0, data: {} };
+      },
+    };
+    assert.equal(await commitLinkTitle(baseTarget, "Resolved", { replaceTitle: false, kernel }), "conflict");
+  }
+
+  // 4. Unknown updateBlock error + verify read fails -> "unknown"
+  {
+    let domReads = 0;
+    const kernel = {
+      async post(path) {
+        if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-rootabc", box: "notebook" }, code: 0 };
+        if (path === "/api/block/getBlockDOM") {
+          domReads += 1;
+          if (domReads === 1) return { data: { id: block.id, dom: block.outerHTML }, code: 0 };
+          throw new Error("still disconnected");
+        }
+        if (path === "/api/block/updateBlock") throw new Error("timeout waiting response");
+        return { code: 0, data: {} };
+      },
+    };
+    assert.equal(await commitLinkTitle(baseTarget, "Resolved", { replaceTitle: false, kernel }), "unknown");
+  }
+
+  // 5. Explicit kernel rejection (code: 1) -> "failed" without extra getBlockDOM read
+  {
+    let domReads = 0;
+    const kernel = {
+      async post(path) {
+        if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-rootabc", box: "notebook" }, code: 0 };
+        if (path === "/api/block/getBlockDOM") {
+          domReads += 1;
+          return { data: { id: block.id, dom: block.outerHTML }, code: 0 };
+        }
+        if (path === "/api/block/updateBlock") return { code: 1, msg: "rejected", data: null };
+        return { code: 0, data: {} };
+      },
+    };
+    assert.equal(await commitLinkTitle(baseTarget, "Resolved", { replaceTitle: false, kernel }), "failed");
+    assert.equal(domReads, 1);
+  }
 }));

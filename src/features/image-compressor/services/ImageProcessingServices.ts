@@ -83,6 +83,7 @@ export async function prepareImage(
     path: source.raw,
     mode,
     excludedExtensions: config.compression.excludedExtensions,
+    smartEnabled: config.compression.smartEnabled === true,
   });
   if (!decision.eligible) return undefined;
 

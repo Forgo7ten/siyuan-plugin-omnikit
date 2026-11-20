@@ -3,8 +3,13 @@ import assert from "node:assert/strict";
 import { FeatureScope } from "../../../src/core/framework/FeatureScope.ts";
 import { TitleCache } from "../../../src/features/titled-link/services/title-cache.ts";
 import {
-  TitledLinkController, isAutomaticLinkCandidate, isHttpUrl, mapWithConcurrency,
+  AUTO_PASTE_DELAY_MS,
+  TitledLinkController,
+  isAutomaticLinkCandidate,
+  isHttpUrl,
+  mapWithConcurrency,
 } from "../../../src/features/titled-link/TitledLinkController.ts";
+import { DEFAULT_MAX_TITLE_LENGTH } from "../../../src/features/titled-link/policy/types.ts";
 
 test("automatic admission accepts only an empty or exact URL anchor", () => {
   assert.equal(isAutomaticLinkCandidate("", "https://example.com"), true);
@@ -619,7 +624,7 @@ test("manual request during IME wait supersedes queued batch write inside write 
     assert.equal(link.textContent, "Fresh Manual Title");
     assert.equal(transactions.length, 1);
     assert.equal(transactions[0].text, "Fresh Manual Title");
-    assert.ok(notices.includes('titledLink.batchSummary:{"total":1,"updated":0,"skipped":1}'));
+    assert.ok(notices.includes('titledLink.batchSummary:{"total":1,"updated":0,"conflict":0,"failed":0,"unknown":0}'));
     assert.ok(notices.includes("titledLink.updated"));
     scope.dispose();
   } finally {
@@ -628,17 +633,22 @@ test("manual request during IME wait supersedes queued batch write inside write 
   }
 });
 
-test("truncates static file names and hostname fallback at maxTitleLength and strips control chars", async () => {
-  // 1. Static file name > 20 graphemes with replaceTitle: true
+test("truncates static file names and hostname fallback at fixed limit 80, skips cache for both, and strips control chars", async () => {
+  assert.equal(DEFAULT_MAX_TITLE_LENGTH, 80);
+  assert.equal(AUTO_PASTE_DELAY_MS, 200);
+
+  // 1. Static file name > 80 graphemes with replaceTitle: true and manual cache skip
   {
-    const url = "https://example.com/files/very-long-manual-filename.pdf";
+    const longFile = `${"a".repeat(86)}.pdf`;
+    const url = `https://example.com/files/${longFile}`;
     const link = new BatchLink(url, url);
-    const block = new BatchBlock("b1", [link]);
+    new BatchBlock("b1", [link]);
     const protyle = { block: { rootID: "root", box: "notebook" }, notebookId: "notebook", updateTransactionElement() {} };
+    const cache = new TitleCache();
     const scope = new FeatureScope();
     const controller = new TitledLinkController({
       settings: {
-        getFeature: () => ({ auto: { enabled: true }, replaceTitle: true, maxTitleLength: 20, fallbackToHostname: true }),
+        getFeature: () => ({ auto: { enabled: true }, replaceTitle: true, fallbackToHostname: true }),
         getUserAgent: () => "UA",
       },
       logger: { warn() {}, debug() {} },
@@ -646,20 +656,22 @@ test("truncates static file names and hostname fallback at maxTitleLength and st
       frontend: () => "desktop",
       notify: () => {},
       translate: key => key,
+      cache,
       fetchImpl: async () => assert.fail("static file must not fetch"),
       kernel: { post: async () => ({ data: {} }) },
     });
 
     assert.equal(await controller.runManual(link, protyle), "updated");
-    assert.equal(link.textContent.length, 20);
-    assert.equal(link.textContent, "very-long-manual-...");
-    assert.equal(link.getAttribute("data-title"), "very-long-manual-...");
+    assert.equal(link.textContent.length, 80);
+    assert.equal(link.textContent, `${"a".repeat(77)}...`);
+    assert.equal(link.getAttribute("data-title"), `${"a".repeat(77)}...`);
+    assert.equal(cache.size, 0);
     scope.dispose();
   }
 
-  // 2. Hostname fallback truncated at maxTitleLength=5 and not cached
+  // 2. Hostname fallback truncated at fixed length 80 and not cached
   {
-    const url = "https://averyverylongdomain.com/page";
+    const url = `https://${"domainpart".repeat(9)}.com/page`;
     const link = new BatchLink(url, url);
     new BatchBlock("b2", [link]);
     const protyle = { block: { rootID: "root", box: "notebook" }, notebookId: "notebook", updateTransactionElement() {} };
@@ -667,7 +679,7 @@ test("truncates static file names and hostname fallback at maxTitleLength and st
     const scope = new FeatureScope();
     const controller = new TitledLinkController({
       settings: {
-        getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, maxTitleLength: 5, fallbackToHostname: true }),
+        getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, fallbackToHostname: true }),
         getUserAgent: () => "UA",
       },
       logger: { warn() {}, debug() {} },
@@ -681,7 +693,8 @@ test("truncates static file names and hostname fallback at maxTitleLength and st
     });
 
     assert.equal(await controller.runManual(link, protyle), "updated");
-    assert.equal(link.textContent, "av...");
+    assert.equal(link.textContent.length, 80);
+    assert.equal(link.textContent, `${"domainpart".repeat(7)}domainp...`);
     assert.equal(cache.size, 0);
     scope.dispose();
   }
@@ -1208,5 +1221,174 @@ test("classifies http, timeout, network, aborted, challenge, and missing-title f
     const res = await c.titleFor(makeTarget(), "manual");
     assert.equal(res.status, "failure");
     assert.equal(res.reason, "missing-title");
+  }
+});
+
+test("manual notifications distinguish imeTimeout and unknown, and batch summary counts all four categories", async () => {
+  // 1. IME timeout notice in manual mode
+  {
+    const link = new BatchLink("https://example.com/ime", "https://example.com/ime");
+    new BatchBlock("b-ime", [link]);
+    const protyle = { block: { rootID: "root", box: "notebook" }, notebookId: "notebook", updateTransactionElement() {} };
+    const notices = [];
+    const scope = new FeatureScope();
+    const controller = new TitledLinkController({
+      settings: {
+        getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, fallbackToHostname: false }),
+        getUserAgent: () => "UA",
+      },
+      logger: { warn() {}, debug() {} },
+    }, scope, {
+      frontend: () => "desktop",
+      notify: msg => notices.push(msg),
+      translate: key => key,
+      isComposing: () => true,
+      imeTimeoutMs: 5,
+      imePollMs: 1,
+      fetchImpl: async () => htmlResponse("Timed Out Title"),
+      kernel: { post: async () => ({ data: {} }) },
+    });
+
+    assert.equal(await controller.runManual(link, protyle), "ime-timeout");
+    assert.deepEqual(notices, ["titledLink.imeTimeout"]);
+    scope.dispose();
+  }
+
+  // 2. Background unknown notice in manual mode when updateBlock + re-read both fail
+  {
+    const prevDOMParser = globalThis.DOMParser;
+    try {
+      const link = new BatchLink("https://example.com/unk", "https://example.com/unk");
+      const block = new BatchBlock("b-unk", [link]);
+      const staleProtyle = {
+        destroyed: true,
+        block: { rootID: "root", box: "notebook" },
+        notebookId: "notebook",
+        updateTransactionElement() {},
+      };
+      globalThis.DOMParser = class {
+        parseFromString() {
+          const parsedLink = new BatchLink("https://example.com/unk", "https://example.com/unk");
+          return { querySelectorAll: selector => selector === "[data-node-id]" ? [new BatchBlock("b-unk", [parsedLink])] : [] };
+        }
+      };
+
+      const notices = [];
+      const scope = new FeatureScope();
+      let domCalls = 0;
+      const controller = new TitledLinkController({
+        settings: {
+          getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, fallbackToHostname: false }),
+          getUserAgent: () => "UA",
+        },
+        logger: { warn() {}, debug() {} },
+      }, scope, {
+        frontend: () => "desktop",
+        notify: msg => notices.push(msg),
+        translate: key => key,
+        fetchImpl: async () => htmlResponse("Fetched Title"),
+        kernel: {
+          async post(path) {
+            if (path === "/api/block/getBlockInfo") return { data: { rootID: "root", box: "notebook" }, code: 0 };
+            if (path === "/api/block/getBlockDOM") {
+              domCalls += 1;
+              if (domCalls === 1) return { data: { id: "b-unk", dom: block.outerHTML }, code: 0 };
+              throw new Error("verify read lost");
+            }
+            if (path === "/api/block/updateBlock") throw new Error("write timed out");
+            return { data: {}, code: 0 };
+          },
+        },
+      });
+
+      assert.equal(await controller.runManual(link, staleProtyle), "unknown");
+      assert.deepEqual(notices, ["titledLink.unknown"]);
+      scope.dispose();
+    } finally {
+      globalThis.DOMParser = prevDOMParser;
+    }
+  }
+
+  // 3. Batch summary emits counts for updated, conflict, failed, and unknown
+  {
+    const prevDOMParser = globalThis.DOMParser;
+    try {
+      const uLink = new BatchLink("https://example.com/u", "https://example.com/u");
+      const cLink = new BatchLink("https://example.com/c", "https://example.com/c");
+      const fLink = new BatchLink("https://example.com/f", "https://example.com/f");
+      const kLink = new BatchLink("https://example.com/k", "https://example.com/k");
+      const bUpdated = new BatchBlock("b-u", [uLink]);
+      const bConflict = new BatchBlock("b-c", [cLink]);
+      const bFailed = new BatchBlock("b-f", [fLink]);
+      const bUnknown = new BatchBlock("b-k", [kLink]);
+
+      globalThis.DOMParser = class {
+        parseFromString(html) {
+          const id = html.match(/data-node-id="([^"]+)"/)?.[1];
+          const match = html.match(/<span data-type="a" data-href="([^"]+)"[^>]*>(.*?)<\/span>/);
+          if (!id || !match) return { querySelectorAll: () => [] };
+          return {
+            querySelectorAll: selector => selector === "[data-node-id]"
+              ? [new BatchBlock(id, [new BatchLink(match[1], match[2])])]
+              : [],
+          };
+        }
+      };
+
+      const notices = [];
+      const scope = new FeatureScope();
+      let unknownDomCalls = 0;
+      const staleProtyle = {
+        destroyed: true,
+        block: { rootID: "root", box: "notebook" },
+        notebookId: "notebook",
+        updateTransactionElement() {},
+      };
+      const controller = new TitledLinkController({
+        settings: {
+          getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, fallbackToHostname: false }),
+          getUserAgent: () => "UA",
+        },
+        logger: { warn() {}, debug() {} },
+      }, scope, {
+        frontend: () => "desktop",
+        notify: msg => notices.push(msg),
+        translate: (key, values) => values ? `${key}:${JSON.stringify(values)}` : key,
+        fetchImpl: async url => {
+          if (String(url).endsWith("/f")) throw new Error("fetch failed");
+          return htmlResponse(`Title ${url.slice(-1)}`);
+        },
+        kernel: {
+          async post(path, body) {
+            if (path === "/api/block/getBlockInfo") return { data: { rootID: "root", box: "notebook" }, code: 0 };
+            if (path === "/api/block/getBlockDOM") {
+              if (body.id === "b-c") {
+                return { data: { id: "b-c", dom: '<div data-node-id="b-c"><span data-type="a" data-href="https://example.com/c">Changed</span></div>' }, code: 0 };
+              }
+              if (body.id === "b-k") {
+                unknownDomCalls += 1;
+                if (unknownDomCalls === 1) return { data: { id: "b-k", dom: bUnknown.outerHTML }, code: 0 };
+                throw new Error("verify read failed");
+              }
+              if (body.id === "b-u") return { data: { id: "b-u", dom: bUpdated.outerHTML }, code: 0 };
+              return { data: { id: body.id, dom: "" }, code: 0 };
+            }
+            if (path === "/api/block/updateBlock") {
+              if (body.id === "b-k") throw new Error("write timed out");
+              return { code: 0, data: null };
+            }
+            return { data: {}, code: 0 };
+          },
+        },
+      });
+
+      await controller.runBatch([bUpdated, bConflict, bFailed, bUnknown], staleProtyle);
+      assert.deepEqual(notices, [
+        'titledLink.batchSummary:{"total":4,"updated":1,"conflict":1,"failed":1,"unknown":1}',
+      ]);
+      scope.dispose();
+    } finally {
+      globalThis.DOMParser = prevDOMParser;
+    }
   }
 });

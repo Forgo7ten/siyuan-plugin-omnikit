@@ -116,6 +116,7 @@ export async function compressSelectedImageQuick(
       path: target.oldPath,
       mode: "manual-quick",
       excludedExtensions: services.config().compression.excludedExtensions,
+      smartEnabled: services.config().compression.smartEnabled === true,
     });
     if (!candidateDecision.eligible) return { kind: "notify", key: "image.single.noBenefit" };
     let providedFile: File | undefined;
@@ -175,6 +176,7 @@ export async function compressSelectedImageCustom(
       path: target.oldPath,
       mode: "manual-dialog",
       excludedExtensions: services.config().compression.excludedExtensions,
+      smartEnabled: services.config().compression.smartEnabled === true,
     });
     if (!candidateDecision.eligible) return { kind: "notify", key: "image.single.noBenefit" };
     const source = resolveSource(target.oldPath, services.origin);

@@ -8,7 +8,6 @@ export function defaultTitledLinkConfig(): TitledLinkConfig {
     schemaVersion: 1,
     auto: { enabled: true },
     replaceTitle: false,
-    maxTitleLength: 80,
     fallbackToHostname: true,
   };
 }
@@ -31,16 +30,11 @@ export function parseTitledLinkConfig(raw: unknown): TitledLinkConfig {
     throw new Error("Only titled-link config schemaVersion 1 is supported");
   }
   const auto = object(config.auto, "auto");
-  const maxTitleLength = config.maxTitleLength;
-  if (!Number.isSafeInteger(maxTitleLength) || (maxTitleLength as number) < 0 || (maxTitleLength as number) > 200) {
-    throw new Error("maxTitleLength: integer from 0 to 200 required");
-  }
 
   return {
     schemaVersion: 1,
     auto: { enabled: boolean(auto.enabled, "auto.enabled") },
     replaceTitle: boolean(config.replaceTitle, "replaceTitle"),
-    maxTitleLength: maxTitleLength as number,
     fallbackToHostname: boolean(config.fallbackToHostname, "fallbackToHostname"),
   };
 }

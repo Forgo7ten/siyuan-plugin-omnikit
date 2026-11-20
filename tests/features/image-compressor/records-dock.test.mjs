@@ -40,7 +40,7 @@ test("dock lookups and availability checks enforce D01/D06/D12/I-05/P3-6/B-3/P3-
   assert.match(refs, /\/api\/block\/getBlockDOMs/);
   assert.match(refs, /\/api\/block\/getBlockDOM/);
   assert.match(refs, /\/api\/asset\/statAsset/);
-  assert.doesNotMatch(refs, /return\s*["']missing(?:-confirmed)?["']/);
+  assert.match(refs, /\/api\/file\/getFile/);
   assert.match(dock, /reconcileRecordPair/);
   assert.match(dock, /locateAssetOccurrences/);
   assert.match(dock, /image\.records\.imageRefs/);
@@ -61,9 +61,9 @@ test("dock lookups and availability checks enforce D01/D06/D12/I-05/P3-6/B-3/P3-
   assert.match(dock, /max-height:\s*56px/);
   assert.doesNotMatch(dock, /relinkAsset|\/api\/asset\/removeAsset|removeAsset\(/);
   assert.doesNotMatch(dock, /prunedNotice|noSafeOccurrences|MAX_RECORDS|CAPACITY_WARNING_COUNT|capacityBanner/);
-  // B-3: TTL cache never caches "unknown", and manual refresh passes force=true
-  assert.match(dock, /onclick=\{\(\) => refresh\(true\)\}/);
-  assert.match(dock, /statusCache\.delete\(path\)/);
+  // No statusCache: every activation or refresh re-checks asset availability directly
+  assert.match(dock, /onclick=\{\(\) => refresh\(\)\}/);
+  assert.doesNotMatch(dock, /statusCache|STATUS_TTL_MS/);
   // P3-7: O(N) cleanup using nextPaths Set (no O(N^2) records.some inside key loop)
   assert.match(dock, /nextPaths\.has\(path\)/);
 });
@@ -136,26 +136,52 @@ test("D01: checkAssetAvailability treats statAsset code=1 and transport errors a
   const code1Kernel = {
     async post() { throw Object.assign(new Error("stat failed"), { code: 1 }); },
   };
-  assert.equal(await checkAssetAvailability(code1Kernel, "assets/a.png"), "unknown");
+  assert.equal(await checkAssetAvailability(code1Kernel, "assets/a.png", undefined, {
+    fetchFn: async () => new Response(JSON.stringify({ code: 500, msg: "io error" }), { status: 500 }),
+  }), "unknown");
+
+  assert.equal(await checkAssetAvailability(code1Kernel, "assets/a.png", undefined, {
+    fetchFn: async () => new Response("binary", { status: 200 }),
+  }), "present");
+
+  assert.equal(await checkAssetAvailability(code1Kernel, "assets/a.png?box=20260101000001-abcdef0", undefined, {
+    fetchFn: async () => { throw new Error("Must not call getFile for ?box="); },
+  }), "unknown");
 
   const timeoutKernel = {
     async post() { throw new Error("Request timed out"); },
   };
   assert.equal(await checkAssetAvailability(timeoutKernel, "assets/a.png"), "unknown");
 
-  // Reconcile under code=1 -> unknown: MUST preserve ALL records
+  // Reconcile under code=1 + getFile non-404 -> unknown: MUST preserve ALL records
   const recA = store.snapshot().find(r => r.originalPath === "assets/a.png");
-  const resUnknown = await reconcileRecordPair(recA, p => checkAssetAvailability(code1Kernel, p), store);
+  const resUnknown = await reconcileRecordPair(
+    recA,
+    p => checkAssetAvailability(code1Kernel, p, undefined, {
+      fetchFn: async () => new Response(JSON.stringify({ code: 500 }), { status: 202 }),
+    }),
+    store,
+  );
   assert.equal(resUnknown.original, "unknown");
   assert.equal(resUnknown.removed, false);
   assert.equal(store.snapshot().length, 2);
 
-  // Reconcile when compressed is proven missing-confirmed: removes ONLY that single pair, no cascade
+  // Reconcile when compressed is proven missing-confirmed via statAsset code=1 + getFile 202/404: removes ONLY that single pair, no cascade
   const resConfirmed = await reconcileRecordPair(
     recA,
-    async p => (p === "assets/a.webp" ? "missing-confirmed" : "present"),
+    p => checkAssetAvailability(code1Kernel, p, undefined, {
+      fetchFn: async (_url, init) => {
+        const { path } = JSON.parse(init.body);
+        if (path === "data/assets/a.webp") {
+          return new Response(JSON.stringify({ code: 404, msg: "not found" }), { status: 202 });
+        }
+        return new Response("binary", { status: 200 });
+      },
+    }),
     store,
   );
+  assert.equal(resConfirmed.original, "present");
+  assert.equal(resConfirmed.compressed, "missing-confirmed");
   assert.equal(resConfirmed.removed, true);
   assert.deepEqual(store.snapshot().map(r => r.originalPath), ["assets/a.webp"]);
 });

@@ -1,10 +1,11 @@
+export const DEFAULT_MAX_TITLE_LENGTH = 80;
+
 export interface TitledLinkConfig {
   schemaVersion: 1;
   auto: {
     enabled: boolean;
   };
   replaceTitle: boolean;
-  maxTitleLength: number;
   fallbackToHostname: boolean;
 }
 

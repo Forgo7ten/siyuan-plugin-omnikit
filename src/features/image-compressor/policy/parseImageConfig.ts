@@ -28,7 +28,7 @@ export class UnsupportedConfigError extends Error {}
 const runtimeDefaults = () => ({
   minInputBytes: 100 * 1024, minSavingBytes: 4096, minSavingRatio: 0.05,
   maxInputBytes: 32 * MiB, maxPixels: 32_000_000, maxEncodeMs: 45_000,
-  concurrencyDesktop: 2, concurrencyMobile: 1,
+  concurrencyDesktop: 3, concurrencyMobile: 1,
   excludedExtensions: ["gif", "svg", "webp"],
   smartEnabled: false,
   targetSimilarity: 0.99,

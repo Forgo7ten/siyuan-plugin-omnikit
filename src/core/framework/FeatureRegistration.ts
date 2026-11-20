@@ -1,6 +1,6 @@
 import type { Component } from "svelte";
 import type { Plugin } from "siyuan";
-import type { BaseFeature } from "./BaseFeature.ts";
+import type { BaseFeature, FeaturePhase } from "./BaseFeature.ts";
 import type { FeatureContext } from "./FeatureContext.ts";
 import type { JsonStore, StoreCodec } from "../store/JsonStore.ts";
 import type { SettingsManager } from "../store/SettingsManager.ts";
@@ -11,24 +11,24 @@ import type { SiyuanFrontend } from "../host/Platform.ts";
  * The only central extension point is adding one registration to featureRegistrations.
  */
 export interface FeatureRegistration<T> {
-  id: string;
-  titleKey: string;
-  descriptionKey: string;
-  defaultEnabled: boolean;
-  file: `feature-${string}-settings.json`;
-  codec: StoreCodec<T>;
+  readonly id: string;
+  readonly titleKey: string;
+  readonly descriptionKey: string;
+  readonly defaultEnabled: boolean;
+  readonly file: `feature-${string}-settings.json`;
+  readonly codec: StoreCodec<T>;
   create(plugin: Plugin, settings: SettingsManager): BaseFeature;
   /** Settings UI belongs to the feature; core never checks a feature id. */
-  settingsView: Component<{
+  readonly settingsView: Component<{
     store: JsonStore<T>;
-    runtimePhase: string;
+    runtimePhase: FeaturePhase | "configured";
     t: (key: string, values?: Record<string, string | number>) => string;
   }>;
   /** Optional feature-owned content for the shared OmniKit dock container. */
-  dockView?: Component<{ context: FeatureContext; t: (key: string, values?: Record<string, string | number>) => string }>;
+  readonly dockView?: Component<{ context: FeatureContext; t: (key: string, values?: Record<string, string | number>) => string }>;
   readonly frontends?: readonly SiyuanFrontend[];
   /** Optional feature reload callback dispatched when host data changes or external sync occurs. */
-  reloadData?: (plugin: Plugin) => Promise<void>;
+  readonly reloadData?: (plugin: Plugin) => Promise<void>;
 }
 
 function featureSlug(id: string): string {

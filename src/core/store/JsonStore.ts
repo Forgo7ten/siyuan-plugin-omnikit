@@ -127,8 +127,11 @@ export class JsonStore<T> {
         throw new Error(`Cannot back up unreadable ${this.file}; do not overwrite it`);
       }
       const next = this.codec.parse(this.codec.defaults());
-      const backupName = this.file.replace(/\.json$/, `.backup-${Date.now()}.json`);
-      await this.saveConfirmed(backupName, this.rawToBackup, "back up");
+      const hasNonEmptyBackup = typeof this.rawToBackup !== "string" || this.rawToBackup.trim().length > 0;
+      if (hasNonEmptyBackup) {
+        const backupName = this.file.replace(/\.json$/, `.backup-${Date.now()}.json`);
+        await this.saveConfirmed(backupName, this.rawToBackup, "back up");
+      }
       await this.saveConfirmed(this.file, next, "save");
       this.value = next;
       this.fingerprint = serialize(next);

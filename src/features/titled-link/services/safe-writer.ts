@@ -8,7 +8,18 @@ import {
   resolveProtyleElement,
 } from "../../../core/host/ProtyleAdapter.ts";
 
-export type LinkWriteResult = "updated" | "unchanged" | "conflict" | "aborted" | "superseded";
+export type LinkWriteResult =
+  | "updated"
+  | "unchanged"
+  | "conflict"
+  | "failed"
+  | "unknown"
+  | "aborted"
+  | "superseded"
+  | "ime-timeout";
+
+export const DEFAULT_IME_TIMEOUT_MS = 5_000;
+export const DEFAULT_IME_POLL_MS = 500;
 
 export interface LinkWriterKernel {
   post<T>(path: string, body: unknown, options?: { signal?: AbortSignal; timeout?: number }): Promise<{ data: T; code?: number } | { code: number; data?: T; msg?: string }>;
@@ -183,8 +194,8 @@ function abortAwareDelay(ms: number, signal?: AbortSignal): Promise<boolean> {
 async function awaitCompositionEnd(options: CommitLinkTitleOptions, protyle?: unknown): Promise<boolean> {
   if (!options.isComposing) return true;
   const editor = resolveProtyleElement(protyle);
-  const timeout = options.imeTimeoutMs ?? 3_000;
-  const poll = Math.max(1, options.imePollMs ?? 50);
+  const timeout = options.imeTimeoutMs ?? DEFAULT_IME_TIMEOUT_MS;
+  const poll = Math.max(1, options.imePollMs ?? DEFAULT_IME_POLL_MS);
   const deadline = Date.now() + timeout;
   while (options.isComposing(protyle)) {
     if (editor && editor.isConnected === false) return true;
@@ -239,7 +250,11 @@ async function commitInactiveTitles(
   updates: readonly GroupedLinkTitleUpdate[],
   options: CommitLinkTitleOptions,
 ): Promise<LinkWriteResult[]> {
-  const conflict = () => updates.map(u => isUpdateCurrent(u, options) ? ("conflict" as LinkWriteResult) : ("superseded" as LinkWriteResult));
+  const mapActive = (value: LinkWriteResult) =>
+    updates.map(u => isUpdateCurrent(u, options) ? value : ("superseded" as LinkWriteResult));
+  const conflict = () => mapActive("conflict");
+  const failed = () => mapActive("failed");
+  const unknown = () => mapActive("unknown");
   const aborted = () => updates.map(() => "aborted" as LinkWriteResult);
   if (!options.kernel) return conflict();
   if (updates.every(u => !isUpdateCurrent(u, options))) {
@@ -247,6 +262,8 @@ async function commitInactiveTitles(
   }
   const first = updates[0].target;
 
+  let results: LinkWriteResult[];
+  let expectedHTML: string;
   try {
     const infoRes = await options.kernel.post<BlockInfo>("/api/block/getBlockInfo", {
       id: first.blockID,
@@ -275,6 +292,12 @@ async function commitInactiveTitles(
     const block = parseBlockFromDOM(response.data.dom, first.blockID);
     if (!block) return conflict();
     stripRenderOnlyAttributes(block);
+    if (first.originalBlockHTML !== undefined) {
+      const baseline = parseBlockFromDOM(first.originalBlockHTML, first.blockID);
+      if (!baseline) return conflict();
+      stripRenderOnlyAttributes(baseline);
+      if (baseline.outerHTML !== block.outerHTML) return conflict();
+    }
 
     const links = linkElements(block);
     const activeFlags = updates.map(u => isUpdateCurrent(u, options));
@@ -297,7 +320,7 @@ async function commitInactiveTitles(
       targetLinks.push(link);
     }
 
-    const results: LinkWriteResult[] = updates.map(({ title }, index) => {
+    results = updates.map(({ title }, index) => {
       if (!activeFlags[index]) return "superseded";
       const link = targetLinks[index]!;
       return (link.textContent ?? "") === title &&
@@ -315,23 +338,71 @@ async function commitInactiveTitles(
         link.setAttribute("data-title", updates[i].title);
       }
     }
-
-    const updateRes = await options.kernel.post<{ code?: number }>("/api/block/updateBlock", {
-      id: first.blockID,
-      dataType: "dom",
-      data: block.outerHTML,
-      lockType: true,
-    }, { signal: options.signal, timeout: 30_000 });
-
-    if (updateRes && "code" in updateRes && updateRes.code !== undefined && updateRes.code !== 0) {
-      return conflict();
-    }
-    return results;
+    expectedHTML = block.outerHTML;
   } catch (error) {
     if (options.signal?.aborted || (error as { name?: string })?.name === "AbortError") {
       return aborted();
     }
     return conflict();
+  }
+
+  try {
+    const updateRes = await options.kernel.post<{ code?: number }>("/api/block/updateBlock", {
+      id: first.blockID,
+      dataType: "dom",
+      data: expectedHTML,
+      lockType: true,
+    }, { signal: options.signal, timeout: 30_000 });
+
+    if (updateRes && "code" in updateRes && updateRes.code !== undefined && updateRes.code !== 0) {
+      return failed();
+    }
+    return results;
+  } catch (error) {
+    if ((error as { outcome?: string })?.outcome === "not-sent") {
+      return failed();
+    }
+    if (options.signal?.aborted) {
+      return unknown();
+    }
+    try {
+      const verifyRes = await options.kernel.post<BlockDOM>("/api/block/getBlockDOM", {
+        id: first.blockID,
+        notebook: first.notebook,
+      }, { signal: options.signal, timeout: 10_000 });
+      if (verifyRes?.data?.id !== first.blockID || typeof verifyRes?.data?.dom !== "string") {
+        return unknown();
+      }
+      const latestBlock = parseBlockFromDOM(verifyRes.data.dom, first.blockID);
+      if (!latestBlock) return unknown();
+      stripRenderOnlyAttributes(latestBlock);
+      if (latestBlock.outerHTML === expectedHTML) {
+        return results;
+      }
+
+      const latestLinks = linkElements(latestBlock);
+      let allHaveTargetTitle = true;
+      let allStillMatchBaseline = true;
+      for (let i = 0; i < updates.length; i++) {
+        if (results[i] !== "updated") continue;
+        const { target, title } = updates[i];
+        const latestLink = latestLinks[target.ordinal];
+        if (!latestLink || isInsideProtectedContainer(latestLink) || latestLink.getAttribute("data-href") !== target.originalHref) {
+          return conflict();
+        }
+        const matchesTarget = (latestLink.textContent ?? "") === title &&
+          (!options.replaceTitle || latestLink.getAttribute("data-title") === title);
+        const matchesBaseline = (latestLink.textContent ?? "") === target.originalText &&
+          latestLink.getAttribute("data-title") === target.originalTitle;
+        if (!matchesTarget) allHaveTargetTitle = false;
+        if (!matchesBaseline) allStillMatchBaseline = false;
+      }
+      if (allHaveTargetTitle) return results;
+      if (allStillMatchBaseline) return failed();
+      return conflict();
+    } catch {
+      return unknown();
+    }
   }
 }
 
@@ -378,7 +449,11 @@ export async function commitLinkTitles(
       if (updates.every(u => !isUpdateCurrent(u, options))) {
         return updates.map(() => "superseded");
       }
-      if (!await awaitCompositionEnd(options, first.protyle)) return options.signal?.aborted ? aborted() : conflict();
+      if (!await awaitCompositionEnd(options, first.protyle)) {
+        return options.signal?.aborted
+          ? aborted()
+          : updates.map(u => isUpdateCurrent(u, options) ? "ime-timeout" : "superseded");
+      }
       if (updates.every(u => !isUpdateCurrent(u, options))) {
         return updates.map(() => "superseded");
       }

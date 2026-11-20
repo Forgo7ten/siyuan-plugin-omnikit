@@ -19,6 +19,28 @@ export interface RemoteWatcherHandle {
   reconcile(): Promise<void>;
 }
 
+const MAX_REMOTE_BATCH_SIZE = 20;
+
+export async function downloadAndUploadRemoteImage(
+  source: Extract<ImageSource, { kind: "remote" }>,
+  rootID: string,
+  services: ImageProcessingServices,
+  signal: AbortSignal,
+): Promise<{ localPath: string; file: File }> {
+  const config = services.config();
+  const downloaded = await services.reader.read(source, {
+    maxBytes: Math.min(config.compression.maxInputBytes, 32 * 1024 * 1024),
+    timeoutMs: 30_000,
+    signal,
+    userAgent: services.userAgent(),
+  });
+  await assertImagePayload(downloaded.blob);
+  if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+  const file = await calibrateRemoteImageFile(downloaded.blob, downloaded.name || source.name);
+  const localPath = await services.assets.upload(file, rootID, signal);
+  return { localPath, file };
+}
+
 /** Only a newly persisted, authorized HTTP(S) image may be localized. */
 export function addedRemoteCandidates(
   previous: ReadonlyMap<string, Candidate>, current: ReadonlyMap<string, Candidate>,
@@ -31,6 +53,7 @@ export function addedRemoteCandidates(
       path: candidate.source.raw,
       mode: "auto",
       excludedExtensions: config.compression.excludedExtensions,
+      smartEnabled: config.compression.smartEnabled === true,
     });
     return decision.eligible ? [candidate] : [];
   });
@@ -177,14 +200,14 @@ export async function watchRemoteImages(
       };
       hasPersistedTarget.set(task, true);
 
-      const downloaded = await services.reader.read(candidate.source, {
-        maxBytes: Math.min(config.compression.maxInputBytes, 32 * 1024 * 1024), timeoutMs: 30_000, signal: task.signal,
-        userAgent: services.userAgent(),
-      });
-      await assertImagePayload(downloaded.blob);
+      if (candidate.source.kind !== "remote") return;
+      const { localPath: localOriginal, file: providedFile } = await downloadAndUploadRemoteImage(
+        candidate.source,
+        doc.id,
+        services,
+        task.signal,
+      );
       if (!scope.active || task.signal.aborted) return;
-      const providedFile = await calibrateRemoteImageFile(downloaded.blob, downloaded.name || candidate.source.name);
-      const localOriginal = await services.assets.upload(providedFile, doc.id, task.signal);
       const localSource = resolveSource(localOriginal, services.origin);
       if (localSource.kind !== "asset") return;
 
@@ -246,16 +269,35 @@ export async function watchRemoteImages(
       previous = current;
       if (rebasing) { rebasing = false; return; }
       const added = addedRemoteCandidates(old, current, services.config(), doc.id);
-      if (added.length > 20) { logger.warn("检测到大量新增外链图片，请使用文档批量操作"); return; }
       if (!added.length && confirmIfEmpty && !paused && !disposed && observing && !signal.aborted && !rerun) {
         schedule(900, false);
         return;
       }
-      for (const candidate of added) {
+      const blockTails = new Map<string, Promise<void>>();
+      for (let start = 0; start < added.length; start += MAX_REMOTE_BATCH_SIZE) {
         if (disposed || paused || !scope.active || signal.aborted) break;
-        const identity = keyOf(candidate.blockID, candidate.source.key);
-        const oldCount = old.get(identity)?.count ?? 0;
-        await process(candidate, oldCount);
+        const batch = added.slice(start, start + MAX_REMOTE_BATCH_SIZE);
+        const currentConfig = services.config();
+        const concurrency = services.mobile ? 1 : Math.max(1, currentConfig.compression.concurrencyDesktop ?? 3);
+        let nextIdx = 0;
+        const worker = async () => {
+          while (nextIdx < batch.length) {
+            if (disposed || paused || !scope.active || signal.aborted) return;
+            const candidate = batch[nextIdx++];
+            const identity = keyOf(candidate.blockID, candidate.source.key);
+            const oldCount = old.get(identity)?.count ?? 0;
+            // Serialize operations targeting the same blockID so concurrent downloads do not invalidate each other's baselineBlockDOM.
+            const prevTail = blockTails.get(candidate.blockID) ?? Promise.resolve();
+            const run = prevTail.catch(() => undefined).then(() => {
+              if (disposed || paused || !scope.active || signal.aborted) return;
+              return process(candidate, oldCount);
+            });
+            blockTails.set(candidate.blockID, run);
+            await run;
+          }
+        };
+        const workers = Array.from({ length: Math.min(concurrency, batch.length) }, () => worker());
+        await Promise.all(workers);
       }
     } catch (error) {
       if (!signal.aborted && scope.active) logger.warn("读取持久化图片状态失败", error);

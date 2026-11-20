@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
+  import type { FeaturePhase } from "../../../core/framework/BaseFeature.ts";
   import type { JsonStore } from "../../../core/store/JsonStore.ts";
   import { SettingsConflictError, isSettingsConflictError } from "../../../core/store/SettingsConflictError.ts";
   import { describeError } from "../../../core/host/describeError.ts";
@@ -10,7 +11,7 @@
 
   interface Props {
     store: JsonStore<ImageFeatureConfig>;
-    runtimePhase: string;
+    runtimePhase: FeaturePhase | "configured";
     hostVersion: string;
     desktopFrontend?: boolean;
     t: (key: string, values?: Record<string, string | number>) => string;

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import { describeError } from "../../../core/host/describeError.ts";
+  import type { FeaturePhase } from "../../../core/framework/BaseFeature.ts";
   import type { JsonStore } from "../../../core/store/JsonStore.ts";
   import { SettingsConflictError, isSettingsConflictError } from "../../../core/store/SettingsConflictError.ts";
   import { defaultTitledLinkConfig, parseTitledLinkConfig } from "../policy/settings.ts";
@@ -8,7 +9,7 @@
 
   interface Props {
     store: JsonStore<TitledLinkConfig>;
-    runtimePhase: string;
+    runtimePhase: FeaturePhase | "configured";
     t: (key: string, values?: Record<string, string | number>) => string;
   }
 
@@ -109,14 +110,6 @@
       <span><strong>{t("feature.titledLink.settings.fallbackToHostname")}</strong><small>{t("feature.titledLink.settings.fallbackToHostnameHelp")}</small></span>
       <input type="checkbox" class="b3-switch" bind:checked={draft.fallbackToHostname} />
     </label>
-    <label class="setting-row">
-      <span><strong>{t("feature.titledLink.settings.maxTitleLength")}</strong><small>{t("feature.titledLink.settings.maxTitleLengthHelp")}</small></span>
-      <span class="range-control">
-        <input type="range" min="0" max="200" step="1" bind:value={draft.maxTitleLength}
-          aria-label={t("feature.titledLink.settings.maxTitleLength")} />
-        <output>{draft.maxTitleLength}</output>
-      </span>
-    </label>
   </fieldset>
 
   {#if conflict}
@@ -146,9 +139,6 @@
   .setting-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
   .setting-row > span:first-child { display: grid; gap: 0.2rem; }
   small { color: var(--b3-theme-on-surface-light); }
-  .range-control { display: flex; align-items: center; gap: 0.6rem; min-width: 12rem; }
-  .range-control input { flex: 1; }
-  .range-control output { width: 2.5rem; text-align: right; }
   .save-bar { display: flex; justify-content: flex-end; gap: 0.5rem; }
   .notice { color: var(--b3-theme-on-surface-light); }
   .notice--error, .warning { color: var(--b3-theme-error); }

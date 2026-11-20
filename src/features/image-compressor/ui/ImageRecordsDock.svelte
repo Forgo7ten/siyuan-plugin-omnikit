@@ -25,8 +25,6 @@
 
   type DisplayStatus = AssetAvailability | "checking";
 
-  const STATUS_TTL_MS = 10 * 60 * 1000;
-
   let { context, t }: Props = $props();
   const { store, ready } = untrack(() => imageRecordsFor(context.plugin));
   const kernel = new KernelClient();
@@ -35,7 +33,6 @@
 
   let records = $state<CompressionRecord[]>([]);
   let assetStatuses = $state<Record<string, DisplayStatus>>({});
-  const statusCache = new Map<string, { status: "present" | "missing-confirmed"; checkedAt: number }>();
   let expanded = $state<{ path: string; mode: "original" | "compressed" } | null>(null);
   let occurrences = $state<OccurrenceItem[]>([]);
   let unsupportedRefs = $state<UnsupportedReferenceItem[]>([]);
@@ -93,35 +90,14 @@
 
   let dockAbort: AbortController | undefined;
 
-  function cacheStatus(path: string, status: AssetAvailability): void {
-    if (status === "present" || status === "missing-confirmed") {
-      statusCache.set(path, { status, checkedAt: Date.now() });
-    } else {
-      // Never cache "unknown" so transient kernel/network errors re-check on next activation.
-      statusCache.delete(path);
-    }
-  }
-
-  async function verifySinglePath(path: string, force: boolean, signal?: AbortSignal): Promise<AssetAvailability> {
-    if (!force) {
-      const cached = statusCache.get(path);
-      if (cached && Date.now() - cached.checkedAt < STATUS_TTL_MS) {
-        return cached.status;
-      }
-    }
-    const status = await checkAssetAvailability(kernel, path, signal);
-    cacheStatus(path, status);
-    return status;
-  }
-
-  async function verifyRecords(recordsToCheck: CompressionRecord[], force: boolean, signal?: AbortSignal): Promise<void> {
+  async function verifyRecords(recordsToCheck: CompressionRecord[], signal?: AbortSignal): Promise<void> {
     for (let offset = 0; offset < recordsToCheck.length; offset += 3) {
       if (signal?.aborted) return;
       await Promise.all(recordsToCheck.slice(offset, offset + 3).map(async record => {
         try {
           const result = await reconcileRecordPair(
             record,
-            (path, sig) => verifySinglePath(path, force, sig),
+            (path, sig) => checkAssetAvailability(kernel, path, sig, { origin }),
             store,
             signal,
           );
@@ -159,8 +135,6 @@
       for (const path of Object.keys(assetStatuses)) {
         if (nextPaths.has(path)) {
           nextStatuses[path] = assetStatuses[path];
-        } else {
-          statusCache.delete(path);
         }
       }
 
@@ -182,13 +156,13 @@
         unsupportedRefs = [];
       }
       if (mounted && changedRecords.length > 0) {
-        void verifyRecords(changedRecords, true, dockAbort?.signal);
+        void verifyRecords(changedRecords, dockAbort?.signal);
       }
     });
     mounted = true;
-    const handleTabActivate = () => { if (!busy) void refresh(false); };
+    const handleTabActivate = () => { if (!busy) void refresh(); };
     window.addEventListener("omnikit-dock-tab-activated", handleTabActivate);
-    void refresh(true);
+    void refresh();
     return () => {
       dockAbort?.abort();
       unsubscribe();
@@ -196,7 +170,7 @@
     };
   });
 
-  async function refresh(force = false): Promise<void> {
+  async function refresh(): Promise<void> {
     dockAbort?.abort();
     dockAbort = new AbortController();
     const signal = dockAbort.signal;
@@ -208,12 +182,10 @@
       records = [...store.snapshot()];
       const snapshot = [...records];
       for (const record of snapshot) {
-        const origCached = !force ? statusCache.get(record.originalPath) : undefined;
-        const compCached = !force ? statusCache.get(record.compressedPath) : undefined;
-        assetStatuses[record.originalPath] = origCached && Date.now() - origCached.checkedAt < STATUS_TTL_MS ? origCached.status : "checking";
-        assetStatuses[record.compressedPath] = compCached && Date.now() - compCached.checkedAt < STATUS_TTL_MS ? compCached.status : "checking";
+        assetStatuses[record.originalPath] = "checking";
+        assetStatuses[record.compressedPath] = "checking";
       }
-      await verifyRecords(snapshot, force, signal);
+      await verifyRecords(snapshot, signal);
     } catch (error) {
       if (!signal.aborted && !isAbortError(error)) {
         message = t("image.records.loadFailed");
@@ -506,7 +478,7 @@
       type="button"
       class="b3-button b3-button--outline image-records__refresh-btn"
       disabled={busy || loading}
-      onclick={() => refresh(true)}
+      onclick={() => refresh()}
       title={t("image.records.refresh")}
     >
       {#if loading}

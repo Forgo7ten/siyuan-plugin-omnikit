@@ -3,7 +3,7 @@ import { adaptiveQualitySearch, type QualitySearchProgress } from "./adaptive-qu
 import { SimilarityWorkerSession, type WorkerFactory } from "./SimilarityWorkerSession.ts";
 import { getSimilarityPolicy } from "./similarity-policy.ts";
 import type { CompressionMode } from "../policy/contracts.ts";
-import { isProtectedDrawingPath, isWebpManualAllowed } from "../policy/ImageCandidateClassifier.ts";
+import { isProtectedDrawingPath, isWebpAllowed } from "../policy/ImageCandidateClassifier.ts";
 import { inspectImage, type EncodeOptions, type EncodeResult, type ImageCodec } from "../services/image.ts";
 import type { ImageConfig } from "../policy/parseImageConfig.ts";
 
@@ -91,7 +91,7 @@ export class AdaptiveImageCompressor implements ImageCodec {
     const ext = name.split(/[?#]/)[0].split(".").pop()?.toLowerCase() ?? "";
     if (
       isProtectedDrawingPath(name) ||
-      (c.excludedExtensions.includes(ext) && !isWebpManualAllowed(ext, mode))
+      (c.excludedExtensions.includes(ext) && !isWebpAllowed(ext, mode, c.smartEnabled === true))
     ) {
       return { kind: "skipped", reason: "protected-extension" };
     }

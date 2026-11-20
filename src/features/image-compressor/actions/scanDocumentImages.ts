@@ -35,6 +35,7 @@ export function scanDocumentImages(dom: string, origin: string, config: ImageCon
       path: source.raw,
       mode: "document",
       excludedExtensions: config.compression.excludedExtensions,
+      smartEnabled: config.compression.smartEnabled === true,
     });
     if (!decision.eligible) continue;
     if (owner && typeof (owner as Element).querySelector === "function" &&

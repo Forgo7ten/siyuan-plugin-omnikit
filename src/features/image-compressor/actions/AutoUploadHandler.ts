@@ -52,6 +52,7 @@ export function hasCompressibleInput(input: UploadInput | undefined, config: Ima
     path,
     mode: "auto",
     excludedExtensions: excluded,
+    smartEnabled: config?.compression?.smartEnabled === true,
   }).eligible);
 }
 
@@ -250,11 +251,13 @@ async function processCompletedUpload(
   for (const rawPath of paths) {
     if (!scope.active || scope.signal.aborted) break;
     const path = rawPath.replaceAll("\\", "/");
-    const excluded = services.config()?.compression?.excludedExtensions ?? ["gif", "svg", "webp"];
+    const currentConfig = services.config();
+    const excluded = currentConfig?.compression?.excludedExtensions ?? ["gif", "svg", "webp"];
     const decision = classifyImageCandidate({
       path,
       mode: "auto",
       excludedExtensions: excluded,
+      smartEnabled: currentConfig?.compression?.smartEnabled === true,
     });
     if (!decision.eligible) {
       logger.debug?.("分类器跳过不合格文件", { path, reason: decision.reason });

@@ -442,7 +442,7 @@ test("bare HTTP 404 is treated as a read fault and enters read-only without load
   await assert.rejects(store.recoverWithBackup(), /Cannot back up unreadable/);
 });
 
-test("HTTP 200 with empty or whitespace body enters read-only with rawToBackup preserved", async () => {
+test("HTTP 200 with empty or whitespace body enters read-only and recovers without writing an empty backup", async () => {
   const plugin = createPlugin();
   const mockFetch = async () => new Response("   \n ", { status: 200 });
   const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
@@ -453,9 +453,8 @@ test("HTTP 200 with empty or whitespace body enters read-only with rawToBackup p
 
   await store.recoverWithBackup();
   assert.equal(store.needsRecovery, false);
-  assert.equal(plugin.writes.length, 2);
-  assert.match(plugin.writes[0], /^feature-unit-test\.backup-\d+\.json$/);
-  assert.equal(plugin.storage.get(plugin.writes[0]), "   \n ");
+  assert.deepEqual(plugin.writes, ["feature-unit-test.json"]);
+  assert.deepEqual(plugin.storage.get("feature-unit-test.json"), { schemaVersion: 1, value: 0 });
 });
 
 test("stalled response body is aborted by the read deadline", async t => {

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import type { FeaturePhase } from "../../../core/framework/BaseFeature.ts";
   import type { JsonStore } from "../../../core/store/JsonStore.ts";
   import { KernelClient } from "../../../core/host/KernelClient.ts";
   import { getCurrentFrontend } from "../../../core/host/Platform.ts";
@@ -10,7 +11,7 @@
 
   interface Props {
     store: JsonStore<ImageFeatureConfig>;
-    runtimePhase: string;
+    runtimePhase: FeaturePhase | "configured";
     t: (key: string, values?: Record<string, string | number>) => string;
   }
   let { store, runtimePhase, t }: Props = $props();

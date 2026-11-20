@@ -144,3 +144,125 @@ test('RemoteImageWatcher removes record capacity throttling and resolves persist
   assert.doesNotMatch(watcher, /resolveImageOccurrence/);
   assert.match(watcher, /const target: OccurrenceTarget = \{/);
 });
+
+test('watchRemoteImages processes >20 added remote images across consecutive batches with desktop concurrency 3', async () => {
+  class MockMutationObserver {
+    constructor(callback) {
+      this.callback = callback;
+    }
+    observe() {}
+    disconnect() {}
+  }
+
+  const prevHTMLElement = globalThis.HTMLElement;
+  const prevMutationObserver = globalThis.MutationObserver;
+  const prevDocument = globalThis.document;
+  const prevDOMParser = globalThis.DOMParser;
+
+  class FakeHTMLElement {}
+  globalThis.HTMLElement = FakeHTMLElement;
+  globalThis.MutationObserver = MockMutationObserver;
+
+  const totalImages = 22;
+  let docImgs = ['<div data-node-id="20260101000001-init">initial</div>'];
+  const imgObj = (blockID, src) => ({
+    tagName: 'IMG',
+    closest: selector => selector === '[data-node-id]' ? { getAttribute: () => blockID } : null,
+    hasAttribute: name => name === 'src',
+    getAttribute: name => name === 'src' ? src : null,
+  });
+
+  globalThis.document = {
+    createElement: () => ({
+      _html: '',
+      set innerHTML(val) { this._html = val; },
+      get content() {
+        const matches = [...this._html.matchAll(/data-node-id="([^"]+)"[^>]*><img src="([^"]+)"/g)];
+        const imgs = matches.map(m => imgObj(m[1], m[2]));
+        const children = matches.map(m => ({
+          getAttribute: name => name === 'data-node-id' ? m[1] : null,
+          querySelector: () => null,
+          querySelectorAll: selector => selector.includes('img') ? [imgObj(m[1], m[2])] : [],
+        }));
+        return {
+          children,
+          querySelectorAll: selector => selector.includes('img') ? imgs : [],
+        };
+      },
+    }),
+  };
+
+  try {
+    const { watchRemoteImages } = await import('../../../src/features/image-compressor/actions/RemoteImageWatcher.ts');
+    const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+    const currentConfig = config();
+    let activeReads = 0;
+    let peakReads = 0;
+    let compressedCount = 0;
+    const blockSrc = new Map();
+
+    const services = {
+      config: () => currentConfig,
+      origin: 'http://127.0.0.1:6806',
+      mobile: false,
+      userAgent: () => 'TestUA',
+      kernel: {
+        post: async (_path, body) => {
+          if (body.id === rootID) {
+            return { code: 0, data: { id: rootID, dom: docImgs.join('') } };
+          }
+          const idx = Number(body.id.slice(0, 2));
+          const src = blockSrc.get(body.id) ?? `https://cdn.example/img-${idx}.png`;
+          return { code: 0, data: { id: body.id, dom: `<div data-node-id="${body.id}"><img src="${src}" /></div>` } };
+        },
+      },
+      reader: {
+        read: async source => {
+          activeReads += 1;
+          peakReads = Math.max(peakReads, activeReads);
+          await new Promise(resolve => setTimeout(resolve, 10));
+          activeReads -= 1;
+          return { blob: new Blob([pngBytes], { type: 'image/png' }), name: `${source.raw.split('/').pop()}` };
+        },
+      },
+      assets: {
+        upload: async file => `assets/local-${file.name.match(/\d+/)?.[0]}.png`,
+      },
+      references: {
+        commitOccurrence: async (target, nextPath) => {
+          blockSrc.set(target.blockID, nextPath);
+          return 'replaced';
+        },
+      },
+      compressOccurrence: async () => {
+        compressedCount += 1;
+        return { status: 'saved', path: 'assets/comp.webp', reference: 'replaced', originalBytes: 100, compressedBytes: 40 };
+      },
+    };
+
+    const editor = Object.assign(new FakeHTMLElement(), {
+      addEventListener() {},
+      removeEventListener() {},
+    });
+    const doc = { id: rootID, root_id: rootID, box: 'box-1' };
+    const scope = { signal: new AbortController().signal, active: true, own: fn => fn };
+
+    const handle = await watchRemoteImages(editor, doc, scope, services, { warn() {} });
+    docImgs = Array.from({ length: totalImages }, (_, i) => {
+      const blk = `${String(i).padStart(2, '0')}260101000001-blk`;
+      return `<div data-node-id="${blk}"><img src="https://cdn.example/img-${i}.png" /></div>`;
+    });
+
+    await handle.reconcile();
+    await new Promise(resolve => setTimeout(resolve, 650));
+    handle.dispose();
+
+    assert.equal(compressedCount, totalImages);
+    assert.ok(peakReads > 1 && peakReads <= 3, `expected peak concurrency in (1, 3], got ${peakReads}`);
+  } finally {
+    globalThis.HTMLElement = prevHTMLElement;
+    globalThis.MutationObserver = prevMutationObserver;
+    globalThis.document = prevDocument;
+    globalThis.DOMParser = prevDOMParser;
+  }
+});

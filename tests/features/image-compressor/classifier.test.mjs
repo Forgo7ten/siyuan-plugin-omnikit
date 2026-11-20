@@ -102,22 +102,42 @@ test("classifyImageCandidate skips non-empty unsupported static extensions while
   assert.equal(cdn.extension, "");
 });
 
-test("classifyImageCandidate treats static WebP as skipped in auto/document and eligible in manual-quick/manual-dialog (D04)", () => {
+test("classifyImageCandidate treats static WebP as skipped in auto/document when smartEnabled is false, and eligible when smartEnabled is true or in manual modes", () => {
   const auto = classifyImageCandidate({
     path: "assets/image.webp",
     mode: "auto",
     excludedExtensions: excluded,
+    smartEnabled: false,
   });
   assert.equal(auto.eligible, false);
   assert.equal(auto.reason, "excluded-extension");
+
+  const autoSmart = classifyImageCandidate({
+    path: "assets/image.webp",
+    mode: "auto",
+    excludedExtensions: excluded,
+    smartEnabled: true,
+  });
+  assert.equal(autoSmart.eligible, true);
+  assert.equal(autoSmart.extension, "webp");
 
   const batch = classifyImageCandidate({
     path: "assets/image.webp",
     mode: "document",
     excludedExtensions: excluded,
+    smartEnabled: false,
   });
   assert.equal(batch.eligible, false);
   assert.equal(batch.reason, "excluded-extension");
+
+  const batchSmart = classifyImageCandidate({
+    path: "assets/image.webp",
+    mode: "document",
+    excludedExtensions: excluded,
+    smartEnabled: true,
+  });
+  assert.equal(batchSmart.eligible, true);
+  assert.equal(batchSmart.extension, "webp");
 
   const quick = classifyImageCandidate({
     path: "assets/image.webp",

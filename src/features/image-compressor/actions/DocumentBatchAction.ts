@@ -7,8 +7,9 @@ import { isDocumentRootIdentity } from "../policy/DocumentIdentity.ts";
 import type { ImageProcessingServices } from "../services/ImageProcessingServices.ts";
 import { resolveImageOccurrence } from "../services/ImageOccurrenceResolver.ts";
 import { blockDOM } from "../services/references.ts";
-import type { ImageSource } from "../policy/source.ts";
+import { buildReplacementPath, resolveSource, type ImageSource } from "../policy/source.ts";
 import type { OccurrenceTarget } from "../policy/contracts.ts";
+import { downloadAndUploadRemoteImage } from "./RemoteImageWatcher.ts";
 import { scanDocumentImages, type DocumentImageOccurrence } from "./scanDocumentImages.ts";
 
 export interface BatchActionOptions {
@@ -25,6 +26,11 @@ interface Prepared {
   compressedBytes: number;
   quality?: number;
   similarity?: number;
+}
+interface PreparedRemote {
+  localPath: string;
+  localSource: Extract<ImageSource, { kind: "asset" }>;
+  file: File;
 }
 
 /**
@@ -64,6 +70,7 @@ export async function compressDocumentImages(
   if (!rootID || protyle?.disabled) {
     return summary;
   }
+  const verifiedRootID: string = rootID;
 
   const config = services.config();
   const editorNotebook = options.notebook
@@ -88,6 +95,16 @@ export async function compressDocumentImages(
   let nestedBlockIds = new Set<string>();
   const scanned: DocumentImageOccurrence[] = [];
   try {
+    const editorRunner = (protyle && typeof protyle.getInstance === "function" ? protyle.getInstance() : protyle) as {
+      disabled?: boolean;
+      destroyed?: boolean;
+      flushPendingTransactions?: () => Promise<void>;
+    } | undefined;
+    if (editorRunner && !protyle?.disabled && !editorRunner.disabled && !editorRunner.destroyed &&
+        typeof editorRunner.flushPendingTransactions === "function") {
+      await editorRunner.flushPendingTransactions();
+      if (signal.aborted || !scope.active) return cancelledSummary(summary);
+    }
     const domRes = await services.kernel.post<any>("/api/block/getBlockDOM", { id: rootID, notebook: targetNotebook }, { signal });
     if (signal.aborted || !scope.active) return cancelledSummary(summary);
     if (domRes.data?.id !== rootID || typeof domRes.data?.dom !== "string" || !domRes.data.dom.trim()) {
@@ -146,11 +163,12 @@ export async function compressDocumentImages(
   const countedPaths = new Set<string>();
   const distinctGroups = [...byKey.entries()];
   const preparedMap = new Map<string, Prepared>();
+  const preparedRemoteMap = new Map<string, PreparedRemote>();
   const failedKeys = new Set<string>();
   preparedTotal = distinctGroups.length;
 
-  // Preparation phase with bounded concurrency: desktop 2, mobile 1
-  const concurrency = services.mobile ? 1 : Math.max(1, config.compression.concurrencyDesktop ?? 2);
+  // Preparation phase with bounded concurrency: desktop 3, mobile 1
+  const concurrency = services.mobile ? 1 : Math.max(1, config.compression.concurrencyDesktop ?? 3);
   let nextIdx = 0;
 
   async function prepareWorker(): Promise<void> {
@@ -160,6 +178,27 @@ export async function compressDocumentImages(
       const [key, locations] = distinctGroups[idx];
       const source = locations[0].source;
       report(source.raw);
+
+      if (source.kind === "remote") {
+        try {
+          const { localPath, file } = await downloadAndUploadRemoteImage(source, verifiedRootID, services, signal);
+          const localSource = resolveSource(localPath, services.origin);
+          if (localSource.kind !== "asset") {
+            throw new Error(`Unexpected localized asset kind: ${localSource.kind}`);
+          }
+          preparedRemoteMap.set(key, { localPath, localSource, file });
+        } catch (error) {
+          if (signal.aborted || !scope.active || isAbortError(error)) return;
+          context.logger.warn(`下载并本地化远程图片失败：${source.raw}`, error);
+          failedKeys.add(key);
+        } finally {
+          if (!signal.aborted && scope.active) {
+            prepared++;
+            report(source.raw);
+          }
+        }
+        continue;
+      }
 
       if (source.kind !== "asset") {
         if (!signal.aborted && scope.active) {
@@ -210,19 +249,191 @@ export async function compressDocumentImages(
 
   const dirtyBlocks = new Set<string>();
 
+  async function refreshIfDirty(target: OccurrenceTarget): Promise<OccurrenceTarget | undefined> {
+    if (!dirtyBlocks.has(target.blockID)) return target;
+    const freshDOM = await blockDOM(services.kernel, target.blockID, target.notebook, signal);
+    return resolveImageOccurrence(freshDOM, {
+      rootID: target.rootID,
+      notebook: target.notebook,
+      blockID: target.blockID,
+      imageOrdinal: target.imageOrdinal,
+      oldPath: target.oldPath,
+    });
+  }
+
+  async function applyWebpGroup(
+    targets: readonly OccurrenceTarget[],
+    preparedItem: Prepared,
+    sourceKey: string,
+    kernelPath: string,
+    displayRaw: string,
+  ): Promise<boolean> {
+    let anyReplaced = false;
+    let groupHasConflictOrUnknown = false;
+    for (const initialTarget of targets) {
+      if (signal.aborted || !scope.active) return false;
+      try {
+        const target = await refreshIfDirty(initialTarget);
+        if (!target) {
+          summary.conflicts++;
+          groupHasConflictOrUnknown = true;
+          summary.completed++;
+          report(displayRaw);
+          continue;
+        }
+        const committed = await services.references.commitOccurrence(target, preparedItem.path, signal);
+        if (committed === "replaced") {
+          anyReplaced = true;
+          dirtyBlocks.add(target.blockID);
+          recordRewrittenReference(summary, sourceKey, preparedItem.originalBytes, preparedItem.compressedBytes, countedPaths);
+        } else if (committed === "conflict") {
+          summary.conflicts++;
+          groupHasConflictOrUnknown = true;
+        } else if (committed === "aborted") {
+          return false;
+        } else {
+          summary.unknown++;
+          groupHasConflictOrUnknown = true;
+          context.logger.warn(`引用写入结果未确认：${displayRaw}`);
+        }
+      } catch (error) {
+        if (signal.aborted || !scope.active || isAbortError(error)) return false;
+        context.logger.warn(`提交图片引用失败：${displayRaw}`, error);
+        summary.failed++;
+        groupHasConflictOrUnknown = true;
+      }
+      summary.completed++;
+      report(displayRaw);
+    }
+    await services.records.markOperation(
+      kernelPath,
+      preparedItem.path,
+      anyReplaced && !groupHasConflictOrUnknown ? "replaced" : "incomplete",
+    ).catch(() => undefined);
+    return true;
+  }
+
   // Sequential occurrence replacement phase
   for (const [key, locations] of distinctGroups) {
     if (signal.aborted || !scope.active) return cancelledSummary(summary);
     const source = locations[0].source;
     report(source.raw);
 
-    if (source.kind !== "asset") {
-      for (const _item of locations) { summary.skipped++; summary.completed++; }
+    if (failedKeys.has(key)) {
+      for (const _item of locations) { summary.failed++; summary.completed++; }
       continue;
     }
 
-    if (failedKeys.has(key)) {
-      for (const _item of locations) { summary.failed++; summary.completed++; }
+    if (source.kind === "remote") {
+      const remotePrepared = preparedRemoteMap.get(key);
+      if (!remotePrepared) {
+        for (const _item of locations) { summary.skipped++; summary.completed++; }
+        continue;
+      }
+      const localizedTargets: OccurrenceTarget[] = [];
+      for (const item of locations) {
+        if (signal.aborted || !scope.active) return cancelledSummary(summary);
+        try {
+          const target = await refreshIfDirty(item.target);
+          if (!target) {
+            summary.conflicts++;
+            summary.completed++;
+            report(source.raw);
+            continue;
+          }
+          const localized = await services.references.commitOccurrence(target, remotePrepared.localPath, signal);
+          if (localized === "aborted") {
+            return cancelledSummary(summary);
+          }
+          if (localized === "conflict") {
+            summary.conflicts++;
+            summary.completed++;
+            report(source.raw);
+            continue;
+          }
+          if (localized !== "replaced") {
+            summary.unknown++;
+            context.logger.warn(`本地原图引用写入结果未确认：${source.raw}`);
+            summary.completed++;
+            report(source.raw);
+            continue;
+          }
+          dirtyBlocks.add(target.blockID);
+          const expectedLocalPath = buildReplacementPath(target.oldPath, remotePrepared.localPath, services.origin);
+          const freshDOM = await blockDOM(services.kernel, target.blockID, target.notebook, signal);
+          const recaptured = resolveImageOccurrence(freshDOM, {
+            rootID: target.rootID,
+            notebook: target.notebook,
+            blockID: target.blockID,
+            imageOrdinal: target.imageOrdinal,
+            oldPath: expectedLocalPath,
+          });
+          if (!recaptured) {
+            summary.conflicts++;
+            summary.completed++;
+            report(source.raw);
+            continue;
+          }
+          localizedTargets.push(recaptured);
+        } catch (error) {
+          if (signal.aborted || !scope.active || isAbortError(error)) return cancelledSummary(summary);
+          context.logger.warn(`更新远程图片为本地原图失败：${source.raw}`, error);
+          summary.failed++;
+          summary.completed++;
+          report(source.raw);
+        }
+      }
+
+      if (!localizedTargets.length) continue;
+
+      let webpPrepared: Prepared | undefined;
+      try {
+        const encoded = await services.compressOccurrence(localizedTargets[0], config, signal, {
+          replace: false,
+          mode: "document",
+          providedFile: remotePrepared.file,
+        });
+        if (encoded.status === "saved") {
+          const origBytes = encoded.originalBytes ?? 0;
+          const compBytes = encoded.compressedBytes ?? 0;
+          webpPrepared = {
+            path: encoded.path,
+            originalBytes: origBytes,
+            compressedBytes: compBytes,
+            quality: encoded.quality,
+            similarity: encoded.similarity,
+          };
+          uploaded++;
+          summary.originalBytes += origBytes;
+          summary.compressedBytes += compBytes;
+        }
+      } catch (error) {
+        if (signal.aborted || !scope.active || isAbortError(error)) return cancelledSummary(summary);
+        context.logger.warn(`压缩本地化后的远程图片失败：${source.raw}`, error);
+        for (const _loc of localizedTargets) { summary.failed++; summary.completed++; }
+        report(source.raw);
+        continue;
+      }
+
+      if (!webpPrepared) {
+        for (const _loc of localizedTargets) { summary.skipped++; summary.completed++; }
+        report(source.raw);
+        continue;
+      }
+
+      const continued = await applyWebpGroup(
+        localizedTargets,
+        webpPrepared,
+        remotePrepared.localSource.key,
+        remotePrepared.localSource.kernelPath,
+        source.raw,
+      );
+      if (!continued) return cancelledSummary(summary);
+      continue;
+    }
+
+    if (source.kind !== "asset") {
+      for (const _item of locations) { summary.skipped++; summary.completed++; }
       continue;
     }
 
@@ -232,59 +443,14 @@ export async function compressDocumentImages(
       continue;
     }
 
-    let anyReplaced = false;
-    let groupHasConflictOrUnknown = false;
-    for (const item of locations) {
-      if (signal.aborted || !scope.active) return cancelledSummary(summary);
-      let target = item.target;
-      try {
-        if (dirtyBlocks.has(target.blockID)) {
-          const freshDOM = await blockDOM(services.kernel, target.blockID, target.notebook, signal);
-          const refreshed = resolveImageOccurrence(freshDOM, {
-            rootID: target.rootID,
-            notebook: target.notebook,
-            blockID: target.blockID,
-            imageOrdinal: target.imageOrdinal,
-            oldPath: target.oldPath,
-          });
-          if (!refreshed) {
-            summary.conflicts++;
-            groupHasConflictOrUnknown = true;
-            summary.completed++;
-            report(source.raw);
-            continue;
-          }
-          target = refreshed;
-        }
-        const committed = await services.references.commitOccurrence(target, preparedItem.path, signal);
-        if (committed === "replaced") {
-          anyReplaced = true;
-          dirtyBlocks.add(target.blockID);
-          recordRewrittenReference(summary, source.key, preparedItem.originalBytes, preparedItem.compressedBytes, countedPaths);
-        } else if (committed === "conflict") {
-          summary.conflicts++;
-          groupHasConflictOrUnknown = true;
-        } else if (committed === "aborted") {
-          return cancelledSummary(summary);
-        } else {
-          summary.unknown++;
-          groupHasConflictOrUnknown = true;
-          context.logger.warn(`引用写入结果未确认：${source.raw}`);
-        }
-      } catch (error) {
-        if (signal.aborted || !scope.active || isAbortError(error)) return cancelledSummary(summary);
-        context.logger.warn(`提交图片引用失败：${source.raw}`, error);
-        summary.failed++;
-        groupHasConflictOrUnknown = true;
-      }
-      summary.completed++;
-      report(source.raw);
-    }
-    await services.records.markOperation(
+    const continued = await applyWebpGroup(
+      locations.map(item => item.target),
+      preparedItem,
+      source.key,
       source.kernelPath,
-      preparedItem.path,
-      anyReplaced && !groupHasConflictOrUnknown ? "replaced" : "incomplete",
-    ).catch(() => undefined);
+      source.raw,
+    );
+    if (!continued) return cancelledSummary(summary);
   }
 
   summary.uploaded = uploaded;

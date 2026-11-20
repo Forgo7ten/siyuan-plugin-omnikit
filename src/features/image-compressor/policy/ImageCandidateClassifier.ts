@@ -16,6 +16,7 @@ export interface ImageCandidateInput {
   path: string;
   mode: CompressionMode;
   excludedExtensions: readonly string[];
+  smartEnabled?: boolean;
 }
 
 export const DRAWING_DIRECTORY = /(?:^|[\\/])drawings?[\\/]/i;
@@ -31,8 +32,9 @@ export function isProtectedDrawingPath(rawPath: string): boolean {
   return /excalidraw/i.test(rawPath) || DRAWING_DIRECTORY.test(rawPath);
 }
 
-export function isWebpManualAllowed(extension: string, mode: CompressionMode): boolean {
-  return extension === "webp" && (mode === "manual-dialog" || mode === "manual-quick");
+export function isWebpAllowed(extension: string, mode: CompressionMode, smartEnabled = false): boolean {
+  if (extension !== "webp") return false;
+  return mode === "manual-dialog" || mode === "manual-quick" || smartEnabled === true;
 }
 
 function normalizedPath(raw: string): string {
@@ -57,7 +59,7 @@ function extensionOf(path: string): string {
  * Pure classifier evaluating image candidates before disk read or download.
  * Excludes videos, excalidraw/drawings directories, vector formats (SVG), animated formats (GIF, APNG),
  * unsupported non-empty static extensions (preserving extensionless CDN URLs),
- * and user-excluded extensions (allowing static WebP in manual-dialog and manual-quick modes).
+ * and user-excluded extensions (allowing static WebP in manual modes, or in auto/document modes when smartEnabled is true).
  */
 export function classifyImageCandidate(input: ImageCandidateInput): ImageCandidateDecision {
   const path = normalizedPath(input.path);
@@ -80,7 +82,7 @@ export function classifyImageCandidate(input: ImageCandidateInput): ImageCandida
   }
   if (
     input.excludedExtensions.includes(extension) &&
-    !isWebpManualAllowed(extension, input.mode)
+    !isWebpAllowed(extension, input.mode, input.smartEnabled)
   ) {
     return { eligible: false, reason: "excluded-extension", extension };
   }

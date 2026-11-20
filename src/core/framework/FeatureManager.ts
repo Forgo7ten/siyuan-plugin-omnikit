@@ -1,4 +1,4 @@
-import type { BaseFeature } from "./BaseFeature.ts";
+import type { BaseFeature, FeaturePhase } from "./BaseFeature.ts";
 import type { FeatureContext } from "./FeatureContext.ts";
 import { FeatureCatalog } from "./FeatureCatalog.ts";
 import { isFrontendSupported } from "../host/Platform.ts";
@@ -8,7 +8,7 @@ export interface FeatureStatus {
   id: string;
   title: string;
   description: string;
-  status: string;
+  status: FeaturePhase;
   error?: string;
 }
 

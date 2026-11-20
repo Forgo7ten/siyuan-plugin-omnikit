@@ -296,6 +296,17 @@ export class ImageCompressorFeature extends BaseFeature {
 
   private async runBatch(menu: MenuContext, controller: ImageController): Promise<void> {
     if (!menu.rootID) return;
-    await controller.compressDocument(menu.detail, menu.rootID);
+    let detail = menu.detail;
+    if (!detail?.protyle && !detail?.editor?.protyle) {
+      try {
+        const activeProtyle = (getActiveEditor() as any)?.protyle;
+        if (activeProtyle?.block?.rootID === menu.rootID) {
+          detail = { ...(detail && typeof detail === "object" ? detail : {}), protyle: activeProtyle };
+        }
+      } catch {
+        // Ignore absent active editor in non-DOM/test contexts
+      }
+    }
+    await controller.compressDocument(detail, menu.rootID);
   }
 }

@@ -1,5 +1,6 @@
 import { outputName } from "../policy/source.ts";
 import type { CompressionMode } from "../policy/contracts.ts";
+import { isProtectedDrawingPath, isWebpAllowed } from "../policy/ImageCandidateClassifier.ts";
 
 export interface CompressionOptions {
   initialQuality: number;
@@ -249,9 +250,9 @@ export class BicEncoder implements ImageCodec {
     if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
     const c = config.compression;
     const ext = name.split(/[?#]/)[0].split(".").pop()?.toLowerCase() ?? "";
-    const manualWebpAllowed = ext === "webp" && (mode === "manual-dialog" || mode === "manual-quick");
-    if (/excalidraw|(?:^|[\/\\])drawings?[\/\\]/i.test(name) ||
-        c.excludedExtensions.includes(ext) && !manualWebpAllowed) {
+    const webpAllowed = isWebpAllowed(ext, mode, c.smartEnabled === true);
+    if (isProtectedDrawingPath(name) ||
+        (c.excludedExtensions.includes(ext) && !webpAllowed)) {
       return { kind: "skipped", reason: "protected-extension" };
     }
     if (ext !== "" && !["png", "jpg", "jpeg", "webp"].includes(ext)) {

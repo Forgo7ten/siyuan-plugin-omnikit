@@ -15,14 +15,31 @@ import {
   resolveTitledLinkProtyle,
 } from "./services/safe-writer.ts";
 import type { GroupedLinkTitleUpdate } from "./services/safe-writer.ts";
-import type {
-  LinkOccurrenceTarget,
-  TitleFetchFailureReason,
-  TitleFetchResult,
-  TitledLinkConfig,
+import {
+  DEFAULT_MAX_TITLE_LENGTH,
+  type LinkOccurrenceTarget,
+  type TitleFetchFailureReason,
+  type TitleFetchResult,
+  type TitledLinkConfig,
 } from "./policy/types.ts";
 
-export type LinkActionResult = "updated" | "unchanged" | "conflict" | "failed" | "aborted" | "superseded";
+/**
+ * Delay after SiYuan's pre-insertion `paste` event before scanning the block for
+ * the newly converted link node. SiYuan's `TEventBus` emits `paste` before DOM
+ * insertion and provides no post-paste completion callback; adjust here if host
+ * paste timing changes on slower devices or future SiYuan versions.
+ */
+export const AUTO_PASTE_DELAY_MS = 200;
+
+export type LinkActionResult =
+  | "updated"
+  | "unchanged"
+  | "conflict"
+  | "failed"
+  | "unknown"
+  | "aborted"
+  | "superseded"
+  | "ime-timeout";
 export interface TitledLinkControllerOptions {
   notify?: (message: string) => void;
   frontend?: () => string;
@@ -30,6 +47,8 @@ export interface TitledLinkControllerOptions {
   kernel: KernelClient;
   cache?: TitleCache;
   isComposing?: (protyle?: unknown) => boolean;
+  imeTimeoutMs?: number;
+  imePollMs?: number;
   translate?: (key: string, values?: Record<string, string | number>) => string;
   /** Optional timer injection for deterministic tests; defaults to setTimeout/clearTimeout. */
   setTimer?: (handler: () => void, ms: number) => number;
@@ -140,7 +159,7 @@ export class TitledLinkController {
         : (current === block && added.length === 1 ? added[0] : undefined);
       if (!candidate || !isAutomaticLinkCandidate(candidate.textContent ?? "", url)) return;
       void this.runLink(candidate, protyle, "auto");
-    }, 200);
+    }, AUTO_PASTE_DELAY_MS);
     if (!settled) {
       release = this.scope.own(() => clearTimer(timer));
     }
@@ -247,6 +266,8 @@ export class TitledLinkController {
             signal: this.scope.signal,
             kernel: this.kernel,
             isComposing: this.options.isComposing,
+            imeTimeoutMs: this.options.imeTimeoutMs,
+            imePollMs: this.options.imePollMs,
           });
           this.context.logger?.debug?.("批量提交块内链接标题写入完成", {
             blockID: group[0]?.candidate?.target?.blockID,
@@ -267,8 +288,23 @@ export class TitledLinkController {
       }
 
       const updated = results.filter(result => result === "updated").length;
-      this.context.logger?.debug?.("批量提取链接标题结束", { total: links.length, updated, skipped: links.length - updated });
-      this.notify(this.t("titledLink.batchSummary", { total: links.length, updated, skipped: links.length - updated }));
+      const conflict = results.filter(result => result === "conflict").length;
+      const failed = results.filter(result => result === "failed" || result === "ime-timeout").length;
+      const unknown = results.filter(result => result === "unknown").length;
+      this.context.logger?.debug?.("批量提取链接标题结束", {
+        total: links.length,
+        updated,
+        conflict,
+        failed,
+        unknown,
+      });
+      this.notify(this.t("titledLink.batchSummary", {
+        total: links.length,
+        updated,
+        conflict,
+        failed,
+        unknown,
+      }));
     } finally {
       for (const key of claimedKeys) this.inFlightBatches.delete(key);
     }
@@ -363,6 +399,8 @@ export class TitledLinkController {
         signal,
         kernel: this.kernel,
         isComposing: this.options.isComposing,
+        imeTimeoutMs: this.options.imeTimeoutMs,
+        imePollMs: this.options.imePollMs,
         isCurrent: () => this.current(target, token),
       });
       this.context.logger?.debug?.("链接标题写入完成", {
@@ -371,13 +409,26 @@ export class TitledLinkController {
         title: fetched.title,
       });
       if (!this.current(target, token)) return this.scope.active ? "superseded" : "aborted";
-      if (mode === "manual" && !fetched.fallback && (result === "updated" || result === "unchanged")) {
+      if (mode === "manual" &&
+          fetched.source !== "static-file" &&
+          !fetched.fallback &&
+          (result === "updated" || result === "unchanged")) {
         this.cache.refresh(cacheKey(target.originalHref), fetched.title);
       }
-      if (mode === "manual") this.notify(this.t(result === "updated"
-        ? fetched.fallback ? "titledLink.fallbackUsed" : "titledLink.updated"
-        : result === "unchanged" ? "titledLink.unchanged"
-          : result === "conflict" ? "titledLink.conflict" : "titledLink.failed"));
+      if (mode === "manual") {
+        const noticeKey = result === "updated"
+          ? (fetched.fallback ? "titledLink.fallbackUsed" : "titledLink.updated")
+          : result === "unchanged"
+            ? "titledLink.unchanged"
+            : result === "conflict"
+              ? "titledLink.conflict"
+              : result === "unknown"
+                ? "titledLink.unknown"
+                : result === "ime-timeout"
+                  ? "titledLink.imeTimeout"
+                  : "titledLink.failed";
+        this.notify(this.t(noticeKey));
+      }
       return result;
     } catch (error) {
       if (!this.current(target, token)) return this.scope.active ? "superseded" : "aborted";
@@ -429,7 +480,7 @@ export class TitledLinkController {
     const config = this.config();
     const result = await this.resolveTitle(target, mode, config, signal);
     if (result.status !== "success") return result;
-    const title = finalizeTitle(result.title, config.maxTitleLength);
+    const title = finalizeTitle(result.title, DEFAULT_MAX_TITLE_LENGTH);
     return title ? { ...result, title } : { status: "failure", url: result.url, reason: "missing-title" };
   }
 
@@ -465,6 +516,10 @@ export class TitledLinkController {
 
   private async fetchAndNormalize(url: string, config: TitledLinkConfig, signal?: AbortSignal): Promise<TitleFetchResult> {
     const effective = signal ?? this.scope.signal;
+    const normalizeOptions = {
+      fallbackToHostname: config.fallbackToHostname,
+      maxTitleLength: DEFAULT_MAX_TITLE_LENGTH,
+    };
     try {
       const resource = await fetchTitleResource({
         url, frontend: this.frontend(), userAgent: this.context.settings.getUserAgent(),
@@ -472,13 +527,13 @@ export class TitledLinkController {
       });
       if (!resource.ok) {
         if (resource.body instanceof ReadableStream) await resource.body.cancel();
-        const fallback = resolveNormalizedTitle("", url, config);
+        const fallback = resolveNormalizedTitle("", url, normalizeOptions);
         if (fallback.ok) return { status: "success", url, title: fallback.title, source: fallback.source, fallback: true };
         return { status: "failure", url, reason: "http", httpStatus: resource.status };
       }
       const decoded = await readAndDecodeTitleResource(resource, { signal: effective });
       if (effective.aborted) return { status: "failure", url, reason: "aborted" };
-      const extracted = resolveNormalizedTitle(decoded.html, url, config);
+      const extracted = resolveNormalizedTitle(decoded.html, url, normalizeOptions);
       if (extracted.ok) {
         return {
           status: "success",
@@ -491,7 +546,7 @@ export class TitledLinkController {
       return { status: "failure", url, reason: extracted.reason };
     } catch (error) {
       if (effective.aborted) return { status: "failure", url, reason: "aborted" };
-      const fallback = resolveNormalizedTitle("", url, config);
+      const fallback = resolveNormalizedTitle("", url, normalizeOptions);
       if (fallback.ok) return { status: "success", url, title: fallback.title, source: fallback.source, fallback: true };
       const reason: TitleFetchFailureReason = isTimeoutError(error) ? "timeout" : "network";
       return { status: "failure", url, reason, error };

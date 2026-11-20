@@ -20,9 +20,9 @@ export function extractStaticFileName(url: string): string | null {
 
   try {
     const decoded = decodeURIComponent(encodedName).trim();
-    return decoded || null;
+    return decoded || encodedName.trim() || null;
   } catch {
-    return null;
+    return encodedName.trim() || null;
   }
 }
 

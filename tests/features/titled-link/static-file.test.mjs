@@ -19,10 +19,11 @@ test("recognizes the configured archive, document, media and image families", ()
   }
 });
 
-test("rejects web pages, unsupported protocols and malformed URL encoding", () => {
+test("rejects web pages and unsupported protocols while falling back on malformed URL encoding", () => {
   assert.equal(extractStaticFileName("https://example.com/page.html"), null);
   assert.equal(extractStaticFileName("ftp://example.com/a.pdf"), null);
   assert.equal(extractStaticFileName("siyuan://blocks/123.pdf"), null);
-  assert.equal(extractStaticFileName("https://example.com/%E0%A4%A.pdf"), null);
+  assert.equal(extractStaticFileName("https://example.com/%E0%A4%A.pdf"), "%E0%A4%A.pdf");
+  assert.equal(extractStaticFileName("https://example.com/%20.pdf"), ".pdf");
   assert.equal(extractStaticFileName("not a URL"), null);
 });
