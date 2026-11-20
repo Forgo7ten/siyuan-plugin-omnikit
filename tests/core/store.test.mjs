@@ -8,6 +8,7 @@ function createPlugin(storage = new Map()) {
   let saveResult;
   return {
     writes,
+    storage,
     setSaveResult(value) { saveResult = value; },
     async loadData(path) { return storage.has(path) ? storage.get(path) : ""; },
     async saveData(path, data) {
@@ -391,4 +392,151 @@ test("SettingsManager.reloadAfterExternalChange settles all stores when one stor
   } finally {
     console.warn = origWarn;
   }
+});
+
+test("transport failure never falls back to loadData when window and fetch exist", async () => {
+  const storage = new Map([["feature-unit-test.json", { schemaVersion: 1, value: 9 }]]);
+  let loadDataCalls = 0;
+  const plugin = {
+    async loadData(path) {
+      loadDataCalls++;
+      return storage.get(path) ?? "";
+    },
+    async saveData() {},
+  };
+
+  const origWindow = globalThis.window;
+  const origFetch = globalThis.fetch;
+  globalThis.window = {};
+  globalThis.fetch = async () => {
+    throw new TypeError("Failed to fetch");
+  };
+  try {
+    const store = new JsonStore(plugin, "feature-unit-test.json", codec);
+    await assert.rejects(store.load(), TypeError);
+    assert.equal(loadDataCalls, 0);
+    assert.equal(store.needsRecovery, true);
+    await assert.rejects(store.update(v => { v.value = 1; }), /read-only/);
+  } finally {
+    if (origWindow === undefined) delete globalThis.window;
+    else globalThis.window = origWindow;
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("bare HTTP 404 is treated as a read fault and enters read-only without loadData fallback", async () => {
+  let loadDataCalls = 0;
+  const plugin = {
+    async loadData() {
+      loadDataCalls++;
+      return "";
+    },
+    async saveData() {},
+  };
+  const mockFetch = async () => new Response("Not Found", { status: 404 });
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
+
+  await assert.rejects(store.load(), /HTTP 404/);
+  assert.equal(loadDataCalls, 0);
+  assert.equal(store.needsRecovery, true);
+  await assert.rejects(store.recoverWithBackup(), /Cannot back up unreadable/);
+});
+
+test("HTTP 200 with empty or whitespace body enters read-only with rawToBackup preserved", async () => {
+  const plugin = createPlugin();
+  const mockFetch = async () => new Response("   \n ", { status: 200 });
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
+
+  await store.load();
+  assert.equal(store.needsRecovery, true);
+  await assert.rejects(store.update(v => { v.value = 1; }), /read-only/);
+
+  await store.recoverWithBackup();
+  assert.equal(store.needsRecovery, false);
+  assert.equal(plugin.writes.length, 2);
+  assert.match(plugin.writes[0], /^feature-unit-test\.backup-\d+\.json$/);
+  assert.equal(plugin.storage.get(plugin.writes[0]), "   \n ");
+});
+
+test("stalled response body is aborted by the read deadline", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const plugin = createPlugin();
+  let enteredText;
+  const textEntered = new Promise(resolve => { enteredText = resolve; });
+  const mockFetch = async () => ({
+    status: 200,
+    ok: true,
+    text() {
+      enteredText();
+      return new Promise(() => {});
+    },
+  });
+
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
+  const pending = store.load();
+  await textEntered;
+  t.mock.timers.tick(30_000);
+  await assert.rejects(pending, /Storage read timed out/);
+  assert.equal(store.needsRecovery, true);
+  await assert.rejects(store.update(() => {}), /read-only/);
+});
+
+test("enterReadOnly clears stale rawToBackup when a later reload fails over network", async () => {
+  const plugin = createPlugin();
+  let mode = "corrupt";
+  const mockFetch = async () => {
+    if (mode === "corrupt") {
+      return new Response("{invalid-json", { status: 200 });
+    }
+    return new Response("Gateway error", { status: 502 });
+  };
+
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
+  await store.load();
+  assert.equal(store.needsRecovery, true);
+
+  mode = "network-fail";
+  await assert.rejects(store.reload(), /HTTP 502/);
+  assert.equal(store.needsRecovery, true);
+  await assert.rejects(store.recoverWithBackup(), /Cannot back up unreadable/);
+  assert.deepEqual(plugin.writes, []);
+});
+
+test("reload() reports true when only read-only state flips", async () => {
+  const plugin = createPlugin();
+  let fail = true;
+  const mockFetch = async () => {
+    if (fail) return new Response("Server Error", { status: 500 });
+    return new Response(JSON.stringify({ schemaVersion: 1, value: 0 }), { status: 200 });
+  };
+
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, mockFetch);
+  await assert.rejects(store.load(), /HTTP 500/);
+  assert.equal(store.needsRecovery, true);
+
+  fail = false;
+  const changed = await store.reload();
+  assert.equal(changed, true);
+  assert.equal(store.needsRecovery, false);
+
+  fail = true;
+  await assert.rejects(store.reload(), /HTTP 500/);
+  assert.equal(store.needsRecovery, true);
+});
+
+test("emit() computes one snapshot per round and prevents external mutation of store state", async () => {
+  const plugin = createPlugin();
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec);
+  await store.load();
+
+  const seen = [];
+  store.subscribe(next => { seen.push(next); });
+  store.subscribe(next => { seen.push(next); });
+  seen.length = 0;
+
+  await store.update(v => { v.value = 42; });
+  assert.equal(seen.length, 2);
+  assert.strictEqual(seen[0], seen[1]);
+  seen[0].value = 999;
+  assert.equal(store.snapshot().value, 42);
 });

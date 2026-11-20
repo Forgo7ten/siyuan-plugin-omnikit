@@ -124,6 +124,7 @@ test("PluginStatusBar manages tasks, updates text, and cleans up on dispose", ()
         const attrs = new Map();
         return {
           tagName: tag,
+          isConnected: true,
           get className() { return [...classList].join(" "); },
           set className(val) {
             classList.clear();
@@ -168,4 +169,69 @@ test("PluginStatusBar manages tasks, updates text, and cleans up on dispose", ()
   // Dispose
   statusBar.dispose();
   assert.equal(statusBar.isMounted(), false);
+});
+
+test("PluginStatusBar shows the most recently updated task, not the last inserted", () => {
+  setFrontendResolver(() => "desktop");
+  const statusBar = new PluginStatusBar();
+  let registeredElement = null;
+  const mockPlugin = {
+    addStatusBar(options) {
+      registeredElement = options.element;
+      return options.element;
+    },
+  };
+
+  statusBar.mount(mockPlugin);
+  statusBar.update("a", "1");
+  statusBar.update("b", "2");
+  assert.equal(registeredElement.textContent, "2");
+
+  statusBar.update("a", "3");
+  assert.equal(registeredElement.textContent, "3");
+
+  statusBar.clear("a");
+  assert.equal(registeredElement.textContent, "2");
+
+  statusBar.dispose();
+});
+
+test("PluginStatusBar.mount treats detached element (isConnected === false) as unmounted", () => {
+  setFrontendResolver(() => "desktop");
+  const origDoc = globalThis.document;
+  globalThis.document = {
+    createElement(tag) {
+      const classList = new Set();
+      return {
+        tagName: tag,
+        isConnected: false,
+        get className() { return [...classList].join(" "); },
+        set className(val) {
+          classList.clear();
+          val.split(/\s+/).filter(Boolean).forEach(c => classList.add(c));
+        },
+        classList: {
+          add(...names) { names.forEach(n => classList.add(n)); },
+          remove(...names) { names.forEach(n => classList.delete(n)); },
+          contains(name) { return classList.has(name); },
+        },
+        setAttribute() {},
+        getAttribute() {},
+        removeAttribute() {},
+        textContent: "",
+        title: "",
+        remove() {},
+      };
+    },
+    body: { classList: { contains() { return false; } } },
+  };
+  try {
+    const statusBar = new PluginStatusBar();
+    statusBar.mount({ addStatusBar: options => options.element });
+    assert.equal(statusBar.isMounted(), false);
+    statusBar.update("task-1", "should noop");
+    statusBar.clear("task-1");
+  } finally {
+    globalThis.document = origDoc;
+  }
 });

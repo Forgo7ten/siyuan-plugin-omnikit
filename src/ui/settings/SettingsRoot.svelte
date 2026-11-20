@@ -5,6 +5,7 @@
   import type { FeatureManager } from "../../core/framework/FeatureManager.ts";
   import type { FeatureStatus } from "../../core/framework/FeatureManager.ts";
   import { isFrontendSupported, type SiyuanFrontend } from "../../core/host/Platform.ts";
+  import { describeError } from "../../core/host/describeError.ts";
 
   interface Props {
     registrations: readonly FeatureRegistration<any>[];
@@ -16,8 +17,11 @@
   let { registrations, settings, manager, t }: Props = $props();
   let core = $state<CoreSettings>(untrack(() => settings.core.snapshot()));
   let userAgentDraft = $state(untrack(() => settings.getGeneral().userAgent));
+  let uaDirty = $state(false);
   let coreRecovery = $state(untrack(() => settings.core.needsRecovery));
-  let featureRecovery = $state<Record<string, boolean>>({});
+  let featureRecovery = $state<Record<string, boolean>>(
+    untrack(() => Object.fromEntries(registrations.map(entry => [entry.id, settings.store(entry.id).needsRecovery]))),
+  );
   let activeId = $state("general");
   let busy = $state(false);
   let error = $state("");
@@ -31,7 +35,12 @@
   onMount(() => {
     const disposeCore = settings.core.subscribe(value => {
       core = value as CoreSettings;
-      userAgentDraft = core.general.userAgent;
+      // @safety Do not clobber a field the user has modified or is actively editing.
+      const editing = typeof document !== "undefined" &&
+        (document.activeElement as HTMLElement | null)?.getAttribute?.("data-omnikit-field") === "user-agent";
+      if (!uaDirty && !editing) {
+        userAgentDraft = core.general.userAgent;
+      }
       coreRecovery = settings.core.needsRecovery;
     });
     const disposeFeatures = registrations.map(entry => {
@@ -92,7 +101,7 @@
     try {
       await settings.updateGeneral({ debugLog: enabled });
       core = settings.core.snapshot();
-    } catch (cause) { error = String(cause); }
+    } catch (cause) { error = describeError(cause); }
     finally { busy = false; }
   }
 
@@ -103,7 +112,9 @@
     try {
       await settings.updateGeneral({ userAgent: userAgentDraft.trim() });
       core = settings.core.snapshot();
-    } catch (cause) { error = String(cause); }
+      userAgentDraft = core.general.userAgent;
+      uaDirty = false;
+    } catch (cause) { error = describeError(cause); }
     finally { busy = false; }
   }
 
@@ -112,9 +123,16 @@
     busy = true;
     error = "";
     try {
-      await settings.core.recoverWithBackup();
+      try { await settings.core.reload(); } catch { /* still read-only; fall through */ }
+      if (settings.core.needsRecovery) await settings.core.recoverWithBackup();
       core = settings.core.snapshot();
-    } catch (cause) { error = String(cause); }
+      userAgentDraft = core.general.userAgent;
+      uaDirty = false;
+      coreRecovery = settings.core.needsRecovery;
+      if (!coreRecovery && manager) {
+        await manager.reconcileFromLoadedSettings();
+      }
+    } catch (cause) { error = describeError(cause); }
     finally { busy = false; }
   }
 
@@ -128,7 +146,7 @@
         : (await settings.setFeatureEnabled(id, enabled), true);
       if (!ok) throw new Error(t("toggleFailed"));
       core = settings.core.snapshot();
-    } catch (cause) { error = String(cause); }
+    } catch (cause) { error = describeError(cause); }
     finally { busy = false; }
   }
 
@@ -139,7 +157,7 @@
     try {
       const ok = await manager.setEnabled(id, true);
       if (!ok) throw new Error(t("toggleFailed"));
-    } catch (cause) { error = String(cause); }
+    } catch (cause) { error = describeError(cause); }
     finally { busy = false; }
   }
 
@@ -256,6 +274,7 @@
         <div class="card-body">
           {#if coreRecovery}
             <div class="recovery-box">
+              <p class="setting-hint">{t("recovery.settingsWarning")}</p>
               <p class="omnikit-error" role="alert">{settings.core.error}</p>
               <button class="b3-button b3-button--cancel" disabled={busy} onclick={recoverCore}>
                 {t("recovery.settingsButton")}
@@ -283,8 +302,10 @@
             <input
               class="b3-text-field"
               type="text"
+              data-omnikit-field="user-agent"
               bind:value={userAgentDraft}
               disabled={busy || coreRecovery}
+              oninput={() => { uaDirty = true; }}
               onchange={changeUserAgent} />
           </div>
         </div>
@@ -299,7 +320,10 @@
         {@const isSupported = isFrontendSupported(entry.frontends)}
         {@const isRunning = isSupported && enabled && runtime?.status === "enabled"}
         {@const isConfigured = !manager && isSupported && enabled}
-        {@const derivedPhase = !isSupported ? "unsupported" : (runtime?.status ?? (isConfigured ? "configured" : "disabled"))}
+        {@const preferenceUnreadable = (coreRecovery || !!featureRecovery[entry.id]) && enabled && Boolean(manager) && runtime?.status !== "enabled"}
+        {@const derivedPhase = !isSupported
+          ? "unsupported"
+          : (preferenceUnreadable ? "error" : (runtime?.status ?? (isConfigured ? "configured" : "disabled")))}
 
         <section
           id="section-{entry.id}"
@@ -321,7 +345,7 @@
                     class:pill-configured={isConfigured}
                     class:pill-error={derivedPhase === "error"}
                     class:pill-muted={!enabled && derivedPhase !== "error"}>
-                    {t(`runtime.${derivedPhase}`)}
+                    {preferenceUnreadable ? t("runtime.preferenceUnreadable") : t(`runtime.${derivedPhase}`)}
                   </span>
                 {/if}
               </div>
@@ -451,7 +475,7 @@
     }
 
     &.active {
-      background: var(--b3-theme-primary-light);
+      background: var(--b3-theme-primary-lightest, color-mix(in srgb, var(--b3-theme-primary) 12%, transparent));
       color: var(--b3-theme-primary);
       font-weight: 600;
 
@@ -488,12 +512,12 @@
     transition: background-color 0.2s ease;
 
     &.running {
-      background: var(--b3-theme-success, #2ba471);
-      box-shadow: 0 0 6px var(--b3-theme-success, #2ba471);
+      background: var(--b3-theme-success);
+      box-shadow: 0 0 6px var(--b3-theme-success);
     }
 
     &.configured {
-      background: var(--b3-theme-primary, #3b82f6);
+      background: var(--b3-theme-primary);
       opacity: 0.85;
     }
 
@@ -522,7 +546,7 @@
 
     &.error {
       background: var(--b3-theme-error);
-      color: #fff;
+      color: var(--b3-theme-on-error);
     }
 
     &.unsupported {
@@ -563,7 +587,7 @@
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    background: var(--b3-theme-error-light, rgba(224, 62, 62, 0.1));
+    background: color-mix(in srgb, var(--b3-theme-error) 12%, transparent);
     color: var(--b3-theme-error);
     padding: 0.75rem 1rem;
     border-radius: 8px;
@@ -576,7 +600,7 @@
     border: 1px solid var(--b3-border-color);
     border-radius: 10px;
     padding: 1.25rem 1.5rem;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.03);
+    box-shadow: 0 1px 4px color-mix(in srgb, var(--b3-theme-on-background) 6%, transparent);
     transition: border-color 0.2s ease, box-shadow 0.2s ease;
     scroll-margin-top: 1.25rem;
 
@@ -631,15 +655,15 @@
     line-height: 1.2;
 
     &.pill-active {
-      background: var(--b3-theme-success-light, rgba(43, 164, 113, 0.15));
-      color: var(--b3-theme-success, #2ba471);
+      background: color-mix(in srgb, var(--b3-theme-success) 15%, transparent);
+      color: var(--b3-theme-success);
     }
     &.pill-configured {
-      background: var(--b3-theme-primary-light, rgba(59, 130, 246, 0.12));
-      color: var(--b3-theme-primary, #3b82f6);
+      background: var(--b3-theme-primary-lightest, color-mix(in srgb, var(--b3-theme-primary) 12%, transparent));
+      color: var(--b3-theme-primary);
     }
     &.pill-error {
-      background: var(--b3-theme-error-light, rgba(224, 62, 62, 0.15));
+      background: color-mix(in srgb, var(--b3-theme-error) 15%, transparent);
       color: var(--b3-theme-error);
     }
     &.pill-muted {
@@ -705,7 +729,7 @@
     margin-bottom: 1rem;
     padding: 0.75rem;
     border-radius: 6px;
-    background: var(--b3-theme-error-light, rgba(224, 62, 62, 0.1));
+    background: color-mix(in srgb, var(--b3-theme-error) 12%, transparent);
     display: flex;
     flex-direction: column;
     gap: 0.5rem;

@@ -23,7 +23,7 @@ test("ReferenceService.commitOccurrence delegates occurrence-scoped update throu
   const blockID = id(2);
   const rootID = id(1);
   const notebook = id(9);
-  const dom = `<div data-node-id="${blockID}"><img data-src="assets/a.png" src="assets/a.png"></div>`;
+  const dom = `<div data-node-id="${blockID}" parent-heading="20260101000000-heading"><img data-src="assets/a.png" src="assets/a.png"></div>`;
 
   const client = {
     async post(url, body) {
@@ -42,13 +42,18 @@ test("ReferenceService.commitOccurrence delegates occurrence-scoped update throu
       hasAttribute(n) { return n in this.attrs; }
       getAttribute(n) { return this.attrs[n]; }
       setAttribute(n, v) { this.attrs[n] = v; }
+      removeAttribute(n) { delete this.attrs[n]; }
     }
     class MockBlock {
-      constructor() { this.img = new MockImg(); }
-      getAttribute(n) { return n === "data-node-id" ? blockID : null; }
+      constructor() { this.img = new MockImg(); this.attrs = { "data-node-id": blockID, "parent-heading": "20260101000000-heading" }; }
+      getAttribute(n) { return this.attrs[n] ?? null; }
+      removeAttribute(n) { delete this.attrs[n]; }
       querySelectorAll(selector) { return selector === "img" ? [this.img] : []; }
       querySelector() { return null; }
-      get outerHTML() { return `<div data-node-id="${blockID}"><img data-src="${this.img.getAttribute("data-src")}" src="${this.img.getAttribute("src")}"></div>`; }
+      get outerHTML() {
+        const headingAttr = this.attrs["parent-heading"] ? ` parent-heading="${this.attrs["parent-heading"]}"` : "";
+        return `<div data-node-id="${blockID}"${headingAttr}><img data-src="${this.img.getAttribute("data-src")}" src="${this.img.getAttribute("src")}"></div>`;
+      }
     }
     globalThis.document = {
       createElement: () => {
@@ -57,13 +62,15 @@ test("ReferenceService.commitOccurrence delegates occurrence-scoped update throu
       },
     };
 
+    const domWithHeading = `<div data-node-id="${blockID}" parent-heading="20260101000000-heading"><img data-src="assets/a.png" src="assets/a.png"></div>`;
     const service = new ReferenceService(client, "http://localhost:6806");
     const result = await service.commitOccurrence(
-      { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/a.png", baselineBlockDOM: dom },
+      { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/a.png", baselineBlockDOM: domWithHeading },
       "assets/a.webp",
     );
     assert.equal(result, "replaced");
     assert.deepEqual(calls.map(c => c.url), ["/api/block/getBlockInfo", "/api/block/getBlockDOM", "/api/block/updateBlock"]);
+    assert.equal(calls[2].body.data.includes("parent-heading"), false);
   } finally {
     globalThis.document = priorDoc;
   }

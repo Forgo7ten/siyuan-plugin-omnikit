@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveSource, outputName } from '../../../src/features/image-compressor/policy/source.ts';
+import {
+  resolveSource,
+  outputName,
+  sameAsset,
+  buildReplacementPath,
+} from '../../../src/features/image-compressor/policy/source.ts';
 import { SourceReader, requireRemotePermission } from '../../../src/features/image-compressor/services/download.ts';
 import { readFile } from 'node:fs/promises';
 import ts from 'typescript';
@@ -9,12 +14,49 @@ const imageJavascript = ts.transpile(imageSource.replace(/import\s*\{\s*outputNa
 const imageModule = await import(`data:text/javascript,${encodeURIComponent(imageJavascript)}`);
 const { inspectImage } = imageModule;
 
-test('source resolver canonicalizes workspace assets and preserves box identity', () => {
-  const source = resolveSource('./assets/a%20b.png?box=20240101000000-abcdefg', 'https://kernel.example');
-  assert.equal(source.kind, 'asset');
-  assert.equal(source.fetchURL, 'https://kernel.example/assets/a%20b.png?box=20240101000000-abcdefg');
+test('source resolver preserves literal asset paths, box identity, and decorative query/hash suffixes', () => {
+  const literalPercent = resolveSource('./assets/a%20b.png?box=20240101000000-abcdefg', 'https://kernel.example');
+  assert.equal(literalPercent.kind, 'asset');
+  assert.equal(literalPercent.kernelPath, 'assets/a%20b.png?box=20240101000000-abcdefg');
+  assert.equal(literalPercent.fetchURL, 'https://kernel.example/assets/a%2520b.png?box=20240101000000-abcdefg');
+
+  const urlEncodedFromKernel = resolveSource('https://kernel.example/assets/a%20b.png?box=20240101000000-abcdefg&width=200#preview', 'https://kernel.example');
+  assert.equal(urlEncodedFromKernel.kind, 'asset');
+  assert.equal(urlEncodedFromKernel.kernelPath, 'assets/a b.png?box=20240101000000-abcdefg');
+  assert.equal(urlEncodedFromKernel.fetchURL, 'https://kernel.example/assets/a%20b.png?box=20240101000000-abcdefg');
+
+  const decorated = resolveSource('assets/x.png?resize=1&width=320#fig', 'https://kernel.example');
+  assert.equal(decorated.kind, 'asset');
+  assert.equal(decorated.kernelPath, 'assets/x.png');
+  assert.equal(decorated.key, 'asset:assets/x.png');
+
   assert.throws(() => resolveSource('assets/../secret.png', 'https://kernel.example'));
-  assert.throws(() => resolveSource('assets/x.png?resize=1', 'https://kernel.example'));
+  assert.throws(() => resolveSource('assets/x.png?box=bad', 'https://kernel.example'));
+});
+
+test('source resolver separates 100%.png vs 100%25.png, preserves case sensitivity, and builds safe replacements', () => {
+  const pct = resolveSource('assets/100%.png', 'https://kernel.example');
+  const pct25 = resolveSource('assets/100%25.png', 'https://kernel.example');
+  assert.equal(pct.kernelPath, 'assets/100%.png');
+  assert.equal(pct25.kernelPath, 'assets/100%25.png');
+  assert.notEqual(pct.key, pct25.key);
+  assert.equal(pct.fetchURL, 'https://kernel.example/assets/100%25.png');
+  assert.equal(pct25.fetchURL, 'https://kernel.example/assets/100%2525.png');
+
+  const upper = resolveSource('assets/Photo.png', 'https://kernel.example');
+  const lower = resolveSource('assets/photo.png', 'https://kernel.example');
+  assert.notEqual(upper.key, lower.key);
+  assert.equal(sameAsset('assets/Photo.png?width=100#top', 'assets/Photo.png', 'https://kernel.example'), true);
+  assert.equal(sameAsset('assets/Photo.png', 'assets/photo.png', 'https://kernel.example'), false);
+
+  assert.equal(
+    buildReplacementPath('assets/a.png?width=200#top', 'assets/a.webp?box=20240101000000-abcdefg', 'https://kernel.example'),
+    'assets/a.webp?box=20240101000000-abcdefg&width=200#top',
+  );
+  assert.equal(
+    buildReplacementPath('assets/a.png?box=20240101000000-abcdefg&width=200', 'assets/a.webp', 'https://kernel.example'),
+    'assets/a.webp?width=200',
+  );
 });
 
 test('source resolver handles Windows and file URLs but rejects network shares', () => {
@@ -24,7 +66,7 @@ test('source resolver handles Windows and file URLs but rejects network shares',
   assert.equal(outputName('../圖 表?.png'), '圖 表_.webp');
 });
 
-test('source reader enforces allowed HTTP/HTTPS origins and bounded unauthenticated fetch', async () => {
+test('source reader enforces allowed HTTP/HTTPS origins and bounded unauthenticated fetch following redirects', async () => {
   assert.throws(() => requireRemotePermission('ftp://images.example/a.png'));
   assert.doesNotThrow(() => requireRemotePermission('http://any-domain.example/a.png'));
   assert.doesNotThrow(() => requireRemotePermission('https://any-domain.example/a.png'));
@@ -34,7 +76,7 @@ test('source reader enforces allowed HTTP/HTTPS origins and bounded unauthentica
   const result = await reader.read(source, { maxBytes: 4, timeoutMs: 1000 });
   assert.equal(result.blob.size, 2);
   assert.equal(init.credentials, 'omit');
-  assert.equal(init.redirect, 'error');
+  assert.equal(init.redirect, 'follow');
   const tooLarge = new SourceReader(async () => new Response(new Uint8Array(5)));
   await assert.rejects(tooLarge.read(source, { maxBytes: 4, timeoutMs: 1000 }), /byte limit/);
 });

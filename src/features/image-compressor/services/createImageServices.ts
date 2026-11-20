@@ -1,9 +1,8 @@
 import imageCompression from "browser-image-compression";
-import { getFrontend } from "siyuan";
 import type { FeatureContext } from "../../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../../core/framework/FeatureScope.ts";
 import { KernelClient } from "../../../core/host/KernelClient.ts";
-import { isMobileFrontend } from "../../../core/host/Platform.ts";
+import { getCurrentFrontend, isMobileFrontend } from "../../../core/host/Platform.ts";
 import { createImageUI } from "../ui/ImageTaskUI.ts";
 import { AssetStore } from "./assets.ts";
 import { createDesktopBridge } from "./desktop.ts";
@@ -19,8 +18,8 @@ export function createImageServices(context: FeatureContext, scope: FeatureScope
   const origin = location.origin;
   const mobile = isMobileFrontend();
   const t = (key: string) => String((context.plugin.i18n as Record<string, string>)[key] ?? key);
-  const ui = createImageUI(scope, t);
-  const frontend = getFrontend();
+  const ui = createImageUI(scope, t, context.feedback);
+  const frontend = getCurrentFrontend();
   const nodeRequire = (globalThis as typeof globalThis & { require?: (name: string) => any }).require;
   const desktop = (frontend === "desktop" || frontend === "desktop-window") && nodeRequire
     ? createDesktopBridge(nodeRequire, path => ui.confirm(t("sources.localPermission"), path, scope.signal))
@@ -42,8 +41,8 @@ export function createImageServices(context: FeatureContext, scope: FeatureScope
     compressOccurrence(target, config, signal, options) {
       return compressOccurrence(this, target, config, signal, options);
     },
-    savePreview(target, encodedFile, signal, replace) {
-      return savePreview(this, target, encodedFile, signal, replace);
+    savePreview(target, encodedFile, signal, replace, metrics) {
+      return savePreview(this, target, encodedFile, signal, replace, metrics);
     },
     ui,
     origin,

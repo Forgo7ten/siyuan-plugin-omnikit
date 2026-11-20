@@ -116,6 +116,29 @@ test('redirects can target local addresses while protocol and embedded credentia
   }
 });
 
+test('desktop follows more than 3 redirects while guarding against infinite redirect loops (D03)', async () => {
+  const fiveHops = bridgeFor({
+    responses: [
+      { status: 302, location: 'https://cdn1.example/step1.png' },
+      { status: 301, location: 'https://cdn2.example/step2.png' },
+      { status: 307, location: 'https://cdn3.example/step3.png' },
+      { status: 308, location: 'https://cdn4.example/step4.png' },
+      { status: 302, location: 'https://cdn5.example/final.png' },
+    ],
+  });
+  const ok = await fiveHops.bridge.download('https://images.example/start.png', options);
+  assert.equal(ok.blob.size, 2);
+  assert.equal(ok.name, 'final.png');
+  assert.equal(fiveHops.requests.length, 6);
+
+  const loopResponses = Array.from({ length: 25 }, (_, i) => ({
+    status: 302,
+    location: `https://loop.example/${i}`,
+  }));
+  const infinite = bridgeFor({ responses: loopResponses });
+  await assert.rejects(infinite.bridge.download('https://loop.example/start.png', options), /Too many redirects/);
+});
+
 test('desktop enforces declared and streamed response byte limits', async () => {
   const declared = bridgeFor({ responses: [{ declaredBytes: 9 }] });
   await assert.rejects(declared.bridge.download('https://images.example/a.png', options), /byte limit/);

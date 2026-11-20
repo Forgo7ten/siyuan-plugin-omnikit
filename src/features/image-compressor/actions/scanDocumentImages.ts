@@ -1,3 +1,4 @@
+import { isInsideProtectedContainer } from "../../../core/host/dom.ts";
 import { imageSourceAttribute, trySource, type ImageSource } from "../policy/source.ts";
 import type { ImageConfig } from "../policy/parseImageConfig.ts";
 import { classifyImageCandidate } from "../policy/ImageCandidateClassifier.ts";
@@ -25,7 +26,7 @@ export function scanDocumentImages(dom: string, origin: string, config: ImageCon
     const blockId = owner?.getAttribute("data-node-id");
     const imageOrdinal = blockId ? ordinals.get(blockId) ?? 0 : 0;
     if (blockId) ordinals.set(blockId, imageOrdinal + 1);
-    if (image.closest("pre, code, script, style, [data-type='NodeCodeBlock'], [data-type='NodeBlockQueryEmbed'], .protyle-wysiwyg__embed")) continue;
+    if (isInsideProtectedContainer(image)) continue;
     const raw = imageSourceAttribute(image);
     const source = raw && trySource(raw, origin);
     if (source && !blockId) throw new Error("Image has no owning block");

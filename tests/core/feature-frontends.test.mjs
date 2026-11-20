@@ -146,6 +146,7 @@ test("FeatureManager lifecycle skips activation and reports unsupported status",
 
   const settings = {
     getFeatureEnabled: () => true,
+    isPreferenceReliable: () => true,
     setFeatureEnabled: async () => {},
   };
 
@@ -306,4 +307,18 @@ test("filterSupportedDockViews filters views by frontend compatibility", () => {
 
   const onDesktop = filterSupportedDockViews(views, "desktop");
   assert.deepEqual(onDesktop.map(v => v.id), ["desktop-tool", "all-tool", "omitted-tool"]);
+});
+
+test("plugin.json frontends includes all five SiYuan frontends", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const manifest = JSON.parse(await readFile(new URL("../../plugin.json", import.meta.url), "utf8"));
+  assert.deepEqual(manifest.frontends, [
+    "desktop",
+    "desktop-window",
+    "mobile",
+    "browser-desktop",
+    "browser-mobile",
+  ]);
+  assert.equal(manifest.icon, "icon.png");
+  assert.equal(manifest.preview, "preview.png");
 });

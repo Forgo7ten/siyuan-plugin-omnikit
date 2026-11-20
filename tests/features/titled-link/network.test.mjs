@@ -50,9 +50,38 @@ test("browser and mobile hosts use forwardProxy base64 to preserve original byte
   assert.equal(call.body.method, "GET");
   assert.equal(call.body.responseEncoding, "base64");
   assert.equal(call.body.timeout, 8_000);
-  assert.deepEqual(call.body.headers, [{ "User-Agent": "OmniKit UA" }, { Referer: "" }]);
+  assert.deepEqual(call.body.headers, [
+    { "User-Agent": "OmniKit UA" },
+    { Referer: "" },
+    { Range: "bytes=0-65535" },
+    { "Accept-Encoding": "identity" },
+  ]);
   assert.equal(resource.transport, "proxy");
   assert.deepEqual(resource.body, original);
+});
+
+test("falls back to an unbounded request when the range is unsatisfiable", async () => {
+  const calls = [];
+  const resource = await fetchTitleResource({
+    url: "https://example.com/short",
+    frontend: "mobile",
+    userAgent: "OmniKit UA",
+    kernelClient: {
+      async post(path, body) {
+        calls.push({ path, body });
+        return { data: calls.length === 1
+          ? { url: body.url, status: 416, contentType: "", body: "", bodyEncoding: "base64", headers: {}, elapsed: 1 }
+          : { url: body.url, status: 200, contentType: "text/html; charset=utf-8",
+              body: Buffer.from("<html><head><title>OK</title></head>").toString("base64"),
+              bodyEncoding: "base64", headers: {}, elapsed: 1 } };
+      },
+    },
+  });
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0].body.headers.some(h => h.Range === "bytes=0-65535"));
+  assert.ok(calls[1].body.headers.every(h => !("Range" in h)));
+  assert.equal(resource.transport, "proxy");
+  assert.equal(resource.status, 200);
 });
 
 test("rejects a proxy response that did not preserve binary bytes", async () => {

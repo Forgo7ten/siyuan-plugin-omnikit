@@ -1,7 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { FeatureScope } from "../../../src/core/framework/FeatureScope.ts";
-import { completedUploadPaths, registerAutoUpload, waitForObservedImages } from "../../../src/features/image-compressor/actions/AutoUploadHandler.ts";
+import {
+  completedUploadPaths,
+  hasCompressibleInput,
+  registerAutoUpload,
+  waitForObservedImages,
+} from "../../../src/features/image-compressor/actions/AutoUploadHandler.ts";
+import { defaultImageFeatureConfig } from "../../../src/features/image-compressor/policy/parseImageConfig.ts";
 
 function setup() {
   const listeners = new Map();
@@ -74,6 +80,15 @@ test("completedUploadPaths supports succMap fallback and normalizes Windows back
   }), ["assets/photo1.png", "assets/photo2.jpg"]);
 });
 
+test("hasCompressibleInput returns false for empty file lists and true when input is absent (P3-4)", () => {
+  const cfg = defaultImageFeatureConfig();
+  assert.equal(hasCompressibleInput(undefined, cfg), true);
+  assert.equal(hasCompressibleInput({ kind: "files", files: [] }, cfg), false);
+  assert.equal(hasCompressibleInput({ kind: "local-files", files: [] }, cfg), false);
+  assert.equal(hasCompressibleInput({ kind: "files", files: [new File(["x"], "a.pdf")] }, cfg), false);
+  assert.equal(hasCompressibleInput({ kind: "files", files: [new File(["x"], "a.png")] }, cfg), true);
+});
+
 test("native completion can precede editor insertion without treating it as a missing image", async () => {
   const observed = [];
   const pending = waitForObservedImages(observed, "asset:assets/later.png", new AbortController().signal);
@@ -132,7 +147,7 @@ test("unauthorized document upload remains completely silent without emitting no
   scope.dispose();
 });
 
-test("upload where all images are skipped remains completely silent without emitting notices", async () => {
+test("upload where all images are skipped via observed insertion remains completely silent without emitting notices", async () => {
   const listeners = new Map();
   const plugin = { eventBus: {
     on(name, handler) { listeners.set(name, handler); },
@@ -158,15 +173,41 @@ test("upload where all images are skipped remains completely silent without emit
   };
   const notices = [];
   const priorDocument = globalThis.document;
+  const priorObserver = globalThis.MutationObserver;
+  const priorElement = globalThis.Element;
+  const priorHtmlImg = globalThis.HTMLImageElement;
+
+  class MockElement {}
+  class MockImg extends MockElement {
+    constructor(src) {
+      super();
+      this.src = src;
+    }
+    hasAttribute(attr) { return attr === "src"; }
+    getAttribute(attr) { return attr === "src" ? this.src : null; }
+    closest(sel) {
+      if (sel === "[data-node-id]") return this.owner;
+      return null;
+    }
+    querySelectorAll() { return []; }
+  }
   const makeImgNode = () => ({
     hasAttribute(attr) { return attr === "src"; },
     getAttribute(attr) { return attr === "src" ? "assets/skipped.png" : null; },
   });
   const makeBlockNode = () => ({
     getAttribute(attr) { return attr === "data-node-id" ? "block-1" : null; },
-    querySelector(selector) { return selector === "[data-node-id]" ? null : null; },
+    querySelector() { return null; },
     querySelectorAll(selector) { return selector === "img" ? [makeImgNode()] : []; },
   });
+  let observerCallback;
+  globalThis.Element = MockElement;
+  globalThis.HTMLImageElement = MockImg;
+  globalThis.MutationObserver = class {
+    constructor(cb) { observerCallback = cb; }
+    observe() {}
+    disconnect() {}
+  };
   globalThis.document = {
     createElement(name) {
       assert.equal(name, "template");
@@ -181,28 +222,13 @@ test("upload where all images are skipped remains completely silent without emit
     registerAutoUpload(
       plugin,
       scope,
-      () => true, // authorized
+      () => true,
       services,
       { warn() {}, debug() {} },
       notice => notices.push(notice),
     );
 
-    const mockEditor = {
-      querySelectorAll() {
-        const img = {
-          hasAttribute(attr) { return attr === "src"; },
-          getAttribute(attr) { return attr === "src" ? "assets/skipped.png" : null; },
-          closest() {
-            return {
-              dataset: { nodeId: "block-1" },
-              querySelectorAll() { return [img]; },
-            };
-          },
-        };
-        return [img];
-      },
-    };
-
+    const mockEditor = { querySelectorAll: () => [] };
     const listener = listeners.get("before-upload-assets");
     let completeCallback;
     listener({
@@ -217,17 +243,211 @@ test("upload where all images are skipped remains completely silent without emit
       },
     });
 
+    const newImg = new MockImg("assets/skipped.png");
+    const owner = new MockElement();
+    owner.dataset = { nodeId: "block-1" };
+    owner.querySelectorAll = () => [newImg];
+    owner.closest = () => null;
+    newImg.owner = owner;
+    observerCallback([{ type: "childList", addedNodes: [newImg] }]);
+
     completeCallback({
       requestId: "upload-skip",
       status: "success",
       succFiles: [{ index: 0, path: "assets/skipped.png" }],
     });
 
-    await new Promise(resolve => setTimeout(resolve, 140));
+    await new Promise(resolve => setTimeout(resolve, 80));
     assert.equal(compressCalls, 1);
     assert.equal(notices.length, 0);
   } finally {
     globalThis.document = priorDocument;
+    globalThis.MutationObserver = priorObserver;
+    globalThis.Element = priorElement;
+    globalThis.HTMLImageElement = priorHtmlImg;
+    scope.dispose();
+  }
+});
+
+test("I-03: without new MutationObserver evidence or on pre-existing img attribute mutation, existing images are never touched", async () => {
+  const listeners = new Map();
+  const plugin = { eventBus: {
+    on(name, handler) { listeners.set(name, handler); },
+    off(name) { listeners.delete(name); },
+  } };
+  const scope = new FeatureScope();
+  let compressCalls = 0;
+  let updateBlockCalls = 0;
+  const services = {
+    origin: "https://siyuan.test",
+    config: () => ({}),
+    kernel: {
+      async post(url) {
+        if (url === "/api/block/updateBlock") updateBlockCalls++;
+        return { data: {} };
+      },
+    },
+    compressOccurrence: async () => {
+      compressCalls++;
+      return { status: "saved", path: "assets/x.webp", reference: "replaced" };
+    },
+  };
+  const priorObserver = globalThis.MutationObserver;
+  const priorElement = globalThis.Element;
+  const priorHtmlImg = globalThis.HTMLImageElement;
+
+  class MockElement {}
+  class MockImg extends MockElement {
+    constructor(src) { super(); this.src = src; }
+    hasAttribute(attr) { return attr === "src"; }
+    getAttribute(attr) { return attr === "src" ? this.src : null; }
+    closest(sel) { return sel === "[data-node-id]" ? this.owner : null; }
+    querySelectorAll() { return []; }
+  }
+  const existingImg = new MockImg("assets/existing.png");
+  const owner = new MockElement();
+  owner.dataset = { nodeId: "block-existing" };
+  owner.querySelectorAll = () => [existingImg];
+  owner.closest = () => null;
+  existingImg.owner = owner;
+
+  let observerCallback;
+  globalThis.Element = MockElement;
+  globalThis.HTMLImageElement = MockImg;
+  globalThis.MutationObserver = class {
+    constructor(cb) { observerCallback = cb; }
+    observe() {}
+    disconnect() {}
+  };
+
+  try {
+    registerAutoUpload(plugin, scope, () => true, services, { warn() {}, debug() {} });
+
+    const listener = listeners.get("before-upload-assets");
+    let completeCallback;
+    listener({
+      detail: {
+        requestId: "upload-reuse",
+        target: "editor",
+        protyle: {
+          element: { querySelectorAll: () => [existingImg] },
+          block: { rootID: "doc-1", box: "box-1" },
+        },
+        onComplete(cb) { completeCallback = cb; },
+      },
+    });
+
+    // Simulate attribute edit on the pre-existing image (no addedNodes)
+    observerCallback([{ type: "attributes", target: existingImg, oldValue: "assets/existing.png" }]);
+
+    completeCallback({
+      requestId: "upload-reuse",
+      status: "success",
+      succFiles: [{ index: 0, path: "assets/existing.png" }],
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 140));
+    assert.equal(compressCalls, 0);
+    assert.equal(updateBlockCalls, 0);
+  } finally {
+    globalThis.MutationObserver = priorObserver;
+    globalThis.Element = priorElement;
+    globalThis.HTMLImageElement = priorHtmlImg;
+    scope.dispose();
+  }
+});
+
+test("P1-3: single auto-upload with reference === unknown emits singleReason unknown notice", async () => {
+  const listeners = new Map();
+  const plugin = { eventBus: {
+    on(name, handler) { listeners.set(name, handler); },
+    off(name) { listeners.delete(name); },
+  } };
+  const scope = new FeatureScope();
+  const notices = [];
+  const services = {
+    origin: "https://siyuan.test",
+    config: () => ({}),
+    kernel: {
+      async post(url) {
+        if (url === "/api/block/getBlockDOM") {
+          return { data: { id: "block-u", dom: '<div data-node-id="block-u"><img src="assets/u.png"/></div>' } };
+        }
+        return { data: {} };
+      },
+    },
+    compressOccurrence: async () => ({ status: "saved", path: "assets/u.webp", reference: "unknown" }),
+  };
+
+  const priorDocument = globalThis.document;
+  const priorObserver = globalThis.MutationObserver;
+  const priorElement = globalThis.Element;
+  const priorHtmlImg = globalThis.HTMLImageElement;
+
+  class MockElement {}
+  class MockImg extends MockElement {
+    constructor(src) { super(); this.src = src; }
+    hasAttribute(attr) { return attr === "src"; }
+    getAttribute(attr) { return attr === "src" ? this.src : null; }
+    closest(sel) { return sel === "[data-node-id]" ? this.owner : null; }
+    querySelectorAll() { return []; }
+  }
+  const makeImgNode = () => ({
+    hasAttribute(attr) { return attr === "src"; },
+    getAttribute(attr) { return attr === "src" ? "assets/u.png" : null; },
+  });
+  const makeBlockNode = () => ({
+    getAttribute(attr) { return attr === "data-node-id" ? "block-u" : null; },
+    querySelector() { return null; },
+    querySelectorAll(selector) { return selector === "img" ? [makeImgNode()] : []; },
+  });
+
+  let observerCallback;
+  globalThis.Element = MockElement;
+  globalThis.HTMLImageElement = MockImg;
+  globalThis.MutationObserver = class {
+    constructor(cb) { observerCallback = cb; }
+    observe() {}
+    disconnect() {}
+  };
+  globalThis.document = {
+    createElement: () => ({ content: { children: [makeBlockNode()] }, set innerHTML(_) {} }),
+  };
+
+  try {
+    registerAutoUpload(plugin, scope, () => true, services, { warn() {}, debug() {} }, n => notices.push(n));
+    const listener = listeners.get("before-upload-assets");
+    let completeCallback;
+    listener({
+      detail: {
+        requestId: "upload-unknown",
+        target: "editor",
+        protyle: { element: { querySelectorAll: () => [] }, block: { rootID: "doc-u", box: "box-1" } },
+        onComplete(cb) { completeCallback = cb; },
+      },
+    });
+    const newImg = new MockImg("assets/u.png");
+    const owner = new MockElement();
+    owner.dataset = { nodeId: "block-u" };
+    owner.querySelectorAll = () => [newImg];
+    owner.closest = () => null;
+    newImg.owner = owner;
+    observerCallback([{ type: "childList", addedNodes: [newImg] }]);
+
+    completeCallback({
+      requestId: "upload-unknown",
+      status: "success",
+      succFiles: [{ index: 0, path: "assets/u.png" }],
+    });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0].singleReason, "unknown");
+    assert.equal(notices[0].unknown, 1);
+  } finally {
+    globalThis.document = priorDocument;
+    globalThis.MutationObserver = priorObserver;
+    globalThis.Element = priorElement;
+    globalThis.HTMLImageElement = priorHtmlImg;
     scope.dispose();
   }
 });

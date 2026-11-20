@@ -1,9 +1,12 @@
+import { isAbortError } from "../../../core/feedback/UiFeedback.ts";
 import type { FeatureContext } from "../../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../../core/framework/FeatureScope.ts";
 import { combineSignals, resolveEditorRootID, resolveNotebookID } from "../../../core/host/ProtyleAdapter.ts";
 import { recordRewrittenReference, type CompressionBatchSummary, type CompressionProgress } from "../policy/CompressionResult.ts";
 import { isDocumentRootIdentity } from "../policy/DocumentIdentity.ts";
 import type { ImageProcessingServices } from "../services/ImageProcessingServices.ts";
+import { resolveImageOccurrence } from "../services/ImageOccurrenceResolver.ts";
+import { blockDOM } from "../services/references.ts";
 import type { ImageSource } from "../policy/source.ts";
 import type { OccurrenceTarget } from "../policy/contracts.ts";
 import { scanDocumentImages, type DocumentImageOccurrence } from "./scanDocumentImages.ts";
@@ -39,10 +42,21 @@ export async function compressDocumentImages(
   const rootID = options.rootID ?? resolveEditorRootID(detail);
   const summary: CompressionBatchSummary = {
     scanComplete: false, scannedBlocks: 0, total: 0, completed: 0, succeeded: 0, skipped: 0, failed: 0,
-    conflicts: 0, cancelled: false, originalBytes: 0, compressedBytes: 0, referencesRewritten: 0,
+    conflicts: 0, unknown: 0, cancelled: false, originalBytes: 0, compressedBytes: 0, referencesRewritten: 0,
     originalReferencedBytes: 0, newReferencedBytes: 0, logicalReductionBytes: 0, diskReclaimedBytes: 0,
   };
-  const report = (currentFile?: string) => options.onProgress?.({ ...summary, currentFile });
+  let uploaded = 0;
+  let phase: "preparing" | "applying" = "preparing";
+  let prepared = 0;
+  let preparedTotal = 0;
+  const report = (currentFile?: string) => options.onProgress?.({
+    ...summary,
+    currentFile,
+    phase,
+    uploaded,
+    ...(preparedTotal > 0 ? { prepared, preparedTotal } : {}),
+  });
+
   const signal = combineSignals(scope.signal, options.signal) ?? scope.signal;
   if (signal.aborted || !scope.active) {
     return cancelledSummary(summary);
@@ -133,7 +147,7 @@ export async function compressDocumentImages(
   const distinctGroups = [...byKey.entries()];
   const preparedMap = new Map<string, Prepared>();
   const failedKeys = new Set<string>();
-  let uploaded = 0;
+  preparedTotal = distinctGroups.length;
 
   // Preparation phase with bounded concurrency: desktop 2, mobile 1
   const concurrency = services.mobile ? 1 : Math.max(1, config.compression.concurrencyDesktop ?? 2);
@@ -147,7 +161,11 @@ export async function compressDocumentImages(
       const source = locations[0].source;
       report(source.raw);
 
-      if (source.kind !== "asset" || source.box) {
+      if (source.kind !== "asset") {
+        if (!signal.aborted && scope.active) {
+          prepared++;
+          report(source.raw);
+        }
         continue;
       }
 
@@ -171,9 +189,14 @@ export async function compressDocumentImages(
           summary.compressedBytes += compBytes;
         }
       } catch (error) {
-        if (signal.aborted || !scope.active) return;
+        if (signal.aborted || !scope.active || isAbortError(error)) return;
         context.logger.warn(`准备图片资源失败：${source.raw}`, error);
         failedKeys.add(key);
+      } finally {
+        if (!signal.aborted && scope.active) {
+          prepared++;
+          report(source.raw);
+        }
       }
     }
   }
@@ -182,13 +205,18 @@ export async function compressDocumentImages(
   await Promise.all(workers);
   if (signal.aborted || !scope.active) return cancelledSummary(summary);
 
+  phase = "applying";
+  report();
+
+  const dirtyBlocks = new Set<string>();
+
   // Sequential occurrence replacement phase
   for (const [key, locations] of distinctGroups) {
     if (signal.aborted || !scope.active) return cancelledSummary(summary);
     const source = locations[0].source;
     report(source.raw);
 
-    if (source.kind !== "asset" || source.box) {
+    if (source.kind !== "asset") {
       for (const _item of locations) { summary.skipped++; summary.completed++; }
       continue;
     }
@@ -198,34 +226,65 @@ export async function compressDocumentImages(
       continue;
     }
 
-    const prepared = preparedMap.get(key);
-    if (!prepared) {
+    const preparedItem = preparedMap.get(key);
+    if (!preparedItem) {
       for (const _item of locations) { summary.skipped++; summary.completed++; }
       continue;
     }
 
     let anyReplaced = false;
+    let groupHasConflictOrUnknown = false;
     for (const item of locations) {
       if (signal.aborted || !scope.active) return cancelledSummary(summary);
-      const target = item.target;
+      let target = item.target;
       try {
-        const committed = await services.references.commitOccurrence(target, prepared.path, signal);
+        if (dirtyBlocks.has(target.blockID)) {
+          const freshDOM = await blockDOM(services.kernel, target.blockID, target.notebook, signal);
+          const refreshed = resolveImageOccurrence(freshDOM, {
+            rootID: target.rootID,
+            notebook: target.notebook,
+            blockID: target.blockID,
+            imageOrdinal: target.imageOrdinal,
+            oldPath: target.oldPath,
+          });
+          if (!refreshed) {
+            summary.conflicts++;
+            groupHasConflictOrUnknown = true;
+            summary.completed++;
+            report(source.raw);
+            continue;
+          }
+          target = refreshed;
+        }
+        const committed = await services.references.commitOccurrence(target, preparedItem.path, signal);
         if (committed === "replaced") {
           anyReplaced = true;
-          recordRewrittenReference(summary, source.raw, prepared.originalBytes, prepared.compressedBytes, countedPaths);
+          dirtyBlocks.add(target.blockID);
+          recordRewrittenReference(summary, source.key, preparedItem.originalBytes, preparedItem.compressedBytes, countedPaths);
         } else if (committed === "conflict") {
           summary.conflicts++;
+          groupHasConflictOrUnknown = true;
+        } else if (committed === "aborted") {
+          return cancelledSummary(summary);
         } else {
-          summary.failed++;
+          summary.unknown++;
+          groupHasConflictOrUnknown = true;
+          context.logger.warn(`引用写入结果未确认：${source.raw}`);
         }
       } catch (error) {
+        if (signal.aborted || !scope.active || isAbortError(error)) return cancelledSummary(summary);
         context.logger.warn(`提交图片引用失败：${source.raw}`, error);
         summary.failed++;
+        groupHasConflictOrUnknown = true;
       }
       summary.completed++;
       report(source.raw);
     }
-    await services.records.markOperation(source.path, prepared.path, anyReplaced ? "replaced" : "incomplete").catch(() => undefined);
+    await services.records.markOperation(
+      source.kernelPath,
+      preparedItem.path,
+      anyReplaced && !groupHasConflictOrUnknown ? "replaced" : "incomplete",
+    ).catch(() => undefined);
   }
 
   summary.uploaded = uploaded;

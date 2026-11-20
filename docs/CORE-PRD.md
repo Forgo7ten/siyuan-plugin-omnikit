@@ -56,10 +56,11 @@ stateDiagram-v2
 
 - **`onload(): Promise<void>`**：
   - 判定当前窗口运行环境（主工作区窗口或独立设置窗口 `body--settings`）；
-  - 初始化平台环境适配器 `Platform` 与日志管理器 `Logger`；
+  - 初始化平台环境适配器 `Platform`（作为平台探测与兼容性判定的唯一权威来源）与日志管理器 `Logger`；
   - 初始化核心配置存储 `SettingsManager` 并加载 `omnikit-core.json` 及各 Feature 配置；
   - 预构建全局设置窗口实例（`onload()` 阶段仅预热实例与存储，不自动弹出设置对话框；设置对话框统一由 `openSetting()` 响应显式入口打开）；
   - 在主工作区窗口中：注册 Feature 元数据到 `FeatureCatalog`，依据配置声明与平台兼容性契约串行启动 Feature（受支持且配置开启的 Feature 进入激活流程；不受当前平台支持的 Feature 保持休眠并标记状态为 `unsupported`），并注册 Unified Dock、MenuRouter 与 TopBar 入口。
+  - 宿主清单兼容性优先：插件清单 `plugin.json` 的 `frontends` 声明覆盖全部五端（`desktop`、`desktop-window`、`mobile`、`browser-desktop`、`browser-mobile`）；宿主清单元数据闸门优先于 Feature 级 `frontends` 声明，仅在宿主允许加载的端内执行 Feature 级兼容性评估。
 - **`onLayoutReady(): void`**：
   - 思源主界面 DOM 与编辑器完全渲染就绪；
   - Core 平台统筹挂载单例底栏状态栏 `PluginStatusBar`（注入 `FeatureContext.statusBar`）；
@@ -230,21 +231,23 @@ OmniKit 运行于思源笔记丰富的跨端环境（桌面客户端、移动端
    - **绝对不调用 `settings.setFeatureEnabled`**：系统严格禁止修改 `omnikit-core.json` 中的 `featureStates[id].enabled` 偏好状态；
    - **跨端偏好保全机制**：该机制保障思源多端云同步环境下的偏好纯洁性。当用户在桌面端启用了某特性，配置通过云同步流转至移动端后，移动端因平台能力受限将该特性标记为 `unsupported` 并阻断运行，但绝不反向冲刷或覆盖用户在桌面端的开启意图；当用户重新在桌面端打开思源时，该特性依然自动正常启用。
 
-### 3.4 `FeatureScope` 与任务安全中止机制
+### 3.4 `FeatureScope`、任务生命周期与 Dialog 取消边界
 
 每个处于 `enabled` 状态的 Feature 拥有一个独立的 `FeatureScope` 实例：
 1. **统一副作用所有权 (`scope.own`)**：所有事件监听（Protyle 监听、总线事件）、DOM 事件、定时器、Svelte 挂载句柄必须通过 `scope.own(disposer)` 托管。
 2. **原生集成 `AbortSignal`**：
    - `FeatureScope` 内置 `AbortController`；
    - Feature 启动的任何长时间异步任务（下载、图片编码、批量更新）必须在调用链中向下传递 `scope.signal`；
-3. **销毁时序与非回滚保障**：
-   - 当 Feature 被停用或插件卸载时，`scope.dispose()` 被调用；
+3. **停用与卸载中止时序及非回滚保障**：
+   - 当 Feature 被停用、插件卸载（`onunload`）或宿主退出时，`scope.dispose()` 被调用；
    - **第一步**：立即触发 `controller.abort("Feature disabled")`，通知所有运行中的异步任务感知取消；
    - **第二步**：倒序执行所有注册的 `disposers`，注销菜单与监听器；
-   - **状态保留原则**：异步任务感知到 `signal.aborted` 时，立即中止未开始的后续步骤并退出。系统保留已完成上传或已持久化的文件与块内容，不执行事务性逆向回滚。
-4. **任务正常中止与状态判定规范 (Normal Abort & Quiet Exit)**：
-   - **静默退出原则**：在单图操作、批量压缩与任务控制器中，用户按 Esc、切换编辑器标签页、功能停用或触发 `signal.abort` 均判定为**正常中止**，系统必须静默退出，严禁向用户误报为“无法定位引用”、“无效文档”或“并发冲突”；
-   - **精准错误类型边界**：底层写回组件（如 `SafeBlockWriter`）在检测到任务取消或 Abort 信号时，必须显式抛出标准的 `AbortError` 或返回专用的取消状态枚举，严禁将中止与由于内容修改引发的并发编辑冲突（`conflict`）混为一谈。
+   - **状态保留原则**：异步任务感知到 `signal.aborted` 时，立即安全中止尚未开始的后续步骤并退出。系统保留已确认的上传产物、已持久化的业务记录与已提交的块引用修改，不执行事务性逆向回滚，插件重启后不自动续跑中断任务。
+4. **任务取消与 Dialog 生命周期边界**：
+   - **无平台通用取消入口**：平台不提供通用的任务取消按钮、取消菜单项或公开取消 API；
+   - **编辑器生命周期不中断后台任务**：文档标签页切换、失焦或编辑器销毁不中止已启动的后台异步任务；异步任务沿用启动时捕获的文档与笔记本标识，写前通过内核 API 核验目标块实时状态；
+   - **Feature 自有进度 Dialog 边界**：Feature 自有进度 Dialog 的用户关闭行为（如关闭弹窗或按 Esc）是否中止该批次未开始步骤以其对应特性 PRD 为准；控制器因任务完成、空结果或前置扫描失败而程序化关闭弹窗仅销毁 UI，不记为用户取消；
+   - **静默退出与结果状态边界**：在允许中止的场景（Feature 停用、插件卸载、宿主退出或特性 PRD 明确定义的进度 Dialog 用户关闭）触发 `signal.abort` 时，尚未发起写入的步骤判定为正常中止（`aborted`）并静默退出，不向用户误报为“无法定位引用”、“无效文档”或并发冲突（`conflict`）；若写请求已发送至内核但响应因超时、断连或中止而缺失，归类为结果未知（`unknown`），严禁混淆为 `conflict` 或 `aborted`，且严禁自动重试。
 
 ---
 
@@ -290,20 +293,21 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
   - 当为空时，Core 与下游特性默认回退使用内置的现代 Chrome 浏览器 User-Agent（例如 `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36`）；
   - **跨特性复用机制**：由 Core 平台统一集中维护并提供访问能力，供下游需要外网访问的特性（如 `titled-link` 标题抓取、`imageCompressor` 远程外链图片下载等）共同复用，避免在各个 Feature 设置中重复配置与碎片化管理；
 - **`featureStates`**：各 Feature 在平台中的期望启用偏好状态，由 Core 统一管理与持久化。
+- **跨窗口写入语义**：`omnikit-core.json` 在多窗口并发修改场景下采用 last-writer-wins 持久化语义，并通过 `onDataChanged` 向各窗口同步最新已持久化状态。
 
 ### 4.2 底层存储引擎 `JsonStore<T>` 与并发协调
 
 所有 JSON 文件统一通过 `JsonStore<T>` 进行读写，提供以下可靠性与容灾机制：
-1. **精简存储模型与单文件独占串行队列**：基于单文件 Promise 串行队列（Promise Queue）调度所有读写操作，配合思源原生 `Plugin.loadData` / `saveData` 实现持久化，杜绝写竞争；
+1. **精简存储模型与单文件独占串行队列**：基于单文件 Promise 串行队列（Promise Queue）调度所有读写操作，配合思源原生 `/api/file/getFile` 读取与 `Plugin.saveData` 持久化，杜绝写竞争；
 2. **内容指纹防抖**：内存维护序列化内容指纹（Fingerprint），相同数据重复保存自动跳过实际磁盘 I/O；
 3. **读写双路径 30 秒超时保护与不重试契约**：
-   - **读路径超时保护**：主读取通道 `/api/file/getFile` 与 `Plugin.loadData` 降级路径均实施 30 秒超时保护；
+   - **读路径超时保护**：`/api/file/getFile` 读取路径实施 30 秒超时保护；
    - **写路径超时保护与不重试**：`saveConfirmed` 调用 `plugin.saveData` 实施 30 秒超时保护；写入超时后直接抛出错误且不执行重试，防止宿主异步 API 永久挂起而冻结单文件串行队列；
-4. **安全确定性读取与容灾契约 (`readPluginJSON`)**：
-   - 读取操作规范使用思源内核 `/api/file/getFile` REST API（并在特定宿主条件下降级至 `Plugin.loadData`），精确区分文件缺失与系统故障；
-   - **缺失与正常初始化**：当内核响应 HTTP 202 且思源返回体 `code === 404` 时，确认为新安装或文件不存在，安全返回 `codec.defaults()` 并允许后续正常初始化写入；
-   - **错误设防与只读状态暴露**：当读取遭遇网络错误、请求超时（30 秒超时时限）或思源返回其他业务错误码（如 HTTP 202 且 `code` 为 500、503、403 等）时，系统判定为读取失败，立即将当前 Store 锁定为安全只读状态；Store 仅暴露 `needsRecovery` 只读状态标记与 `readOnlyReason`，保留上一次内存有效数据，严格禁止使用默认值或空对象静默覆盖用户的现有持久化文件；
-   - **损坏保护与非空备份隔离**：当文件内容存在 JSON 语法损坏且确认已成功读取到非空物理字节时，系统不使用默认值静默覆盖，而是将损坏文件重命名备份为 `.backup` 容灾文件，并在设置界面展示明确的故障提示以供用户确认修复；未读取到有效物理字节的系统错误严禁创建假备份或触发覆盖；
+4. **安全确定性读取与缺失判定边界**：
+   - 读取操作规范使用思源内核 `/api/file/getFile` REST API，精确区分文件缺失、内容损坏与系统读取失败，且读取失败时严禁降级回退至宿主 `Plugin.loadData()` 的空缓存；
+   - **唯一缺失判定**：仅当 `/api/file/getFile` 返回 HTTP `202` 且 JSON 响应体 `code === 404` 时，确认为新安装或文件不存在，安全返回 `codec.defaults()` 并允许后续正常初始化写入；
+   - **空串与损坏只读保护**：当 `/api/file/getFile` 返回 HTTP `200` 但响应体为空串、全空白字符串或存在 JSON 语法损坏时，判定为文件损坏并立即锁定为 `needsRecovery` 只读保护状态；保留真实原始文本（含空串）用于恢复前诊断与非空 `.backup` 容灾备份，严禁使用默认值静默覆盖；
+   - **读取失败与非缺失错误保护**：当读取遭遇网络错误、请求超时（30 秒超时时限）、非缺失 HTTP 错误（如 HTTP 403、HTTP 404、HTTP 500）或思源其他非 `202 + code: 404` 错误响应时，判定为读取失败，立即将当前 Store 锁定为 `needsRecovery` 只读保护状态并暴露 `readOnlyReason`，保留上一次内存有效数据，严格禁止降级 `loadData()` 空缓存或使用默认值覆盖现有持久化文件；
    - **状态变动驱动重载**：`reload()` 方法在内容指纹变动或只读保护状态变动时均返回 `true`，确保外部状态协调准确响应；
 5. **多 Store 并发容错重载 (`SettingsManager.reloadAfterExternalChange`)**：
    - `SettingsManager.reloadAfterExternalChange()` 采用 `Promise.allSettled` 并发重载核心配置与各 Feature 设置 Store，确保单个 Store 读取异常不阻塞其余 Store 的配置刷新与宿主 `onDataChanged` 事件响应，并按固定顺序汇总变更列表。
@@ -311,12 +315,11 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 ### 4.3 重置边界与业务数据隔离
 
 1. **设置重置作用域边界**：
-   - 单功能重置（Reset Feature Settings）：仅将对应的 `feature-{id}-settings.json` 重置为默认值。
-   - 全局设置重置（Reset All Settings）：仅重置 `omnikit-core.json` 与所有已注册的 `feature-*-settings.json`。
-   - 设置重置操作的作用域严格限定于设置文件，底层存储引擎在重置过程中不读取、修改或删除任何 `feature-*-{dataname}.json` 业务数据文件。
+   - 界面中的单功能重置操作（`settings.resetDraft`）仅将对应 Feature 设置面板中的未保存草稿恢复为初始默认值，不直接改写已持久化的配置文件；
+   - 持久化层的设置重置方法（`resetFeature` / `resetAll`）作用域严格限定于 `omnikit-core.json` 与 `feature-*-settings.json`，不读取、修改或删除任何 `feature-*-{dataname}.json` 业务数据文件。
 2. **业务数据清理与隔离边界**：
-   - 统一设置面板中各 Feature 卡片当前仅开放设置重置（`settings.resetDraft`），不附带抹除业务数据的隐藏动作；
-   - 业务数据记录（如 `feature-image-compressor-records.json` 的映射条目）当前通过各自 Feature 提供的专用交互入口（如 Unified Dock 记录面板中的单条“移除记录”）显式手动移除；在设置窗口集中展示并清空插件业务数据的专用能力见第 9 节后续规划。
+   - 统一设置面板中各 Feature 卡片当前仅开放设置草稿重置（`settings.resetDraft`），不附带抹除业务数据的隐藏动作；
+   - 业务数据记录（如 `feature-image-compressor-records.json` 的映射条目）的清理遵循各自 Feature PRD 的业务规则（如通过 Unified Dock 记录面板显式手动移除，或依据权威确认物理缺失证据移除单条失效配对记录）；设置重置操作不读取或清空业务数据文件，在设置窗口集中展示并清空插件业务数据的专用能力见第 9 节后续规划。
 
 ---
 
@@ -360,10 +363,12 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
   - **左侧导航栏**：列出“全局设置（General）”及所有已注册的 Feature 项；
   - **左侧导航分组与国际化规范**：左侧导航按“全局设置（`general.title`）”、“功能模块（`nav.features`）”规范化分区编排；所有界面文案统一通过 `t(...)` 从语言包解析，不在模板或逻辑中硬编码自然语言字符串；
   - **右侧单页滚动区**：所有选项以卡片分区形式在右侧连续排布；点击左侧导航平滑滚动到指定卡片，右侧滚动时根据视口可见性实时高亮左侧导航对应项；
-  - 采用本地缓冲编辑与显式保存机制，支持实时输入校验；检测到外部 `onDataChanged` 时提示用户重新载入。
-- **特性重置文案规范**：
-  - 各 Feature 设置卡片头部的重置操作按钮文案统一为**“重置为默认设置”**；
-  - 点击后仅将该 Feature 的当前配置重置为声明的初始默认值，不影响任何业务数据文件。
+  - 采用本地缓冲编辑与显式保存机制，支持实时输入校验；检测到外部 `onDataChanged` 时提示用户重新载入；设置保存冲突通过稳定错误码或错误类型判定，不依赖本地化文案子串匹配。
+- **`User-Agent` 编辑草稿脏状态保护**：
+  - 设置面板中的 `general.userAgent` 输入框维护独立的脏状态标记；当用户正在编辑或输入尚未保存时，外部配置同步通知不覆盖当前未保存草稿；仅在未脏或显式保存/重载后同步外部最新值。
+- **特性重置文案与行为规范**：
+  - 各 Feature 设置卡片头部的重置操作按钮文案统一为**“设为默认值（未保存）”**；
+  - 点击后仅将该 Feature 设置面板当前的未保存编辑草稿恢复为默认配置值，不直接改写已持久化的 `feature-{id}-settings.json` 文件，也不影响任何业务数据文件；用户显式保存后方才持久化生效。
 - **平台兼容性设防呈现与交互规范 (方案 A：卡片保持展示，总开关置灰禁用，专属设置可预先调整)**：
   针对在当前宿主平台中不受支持的 Feature（`runtime.status === "unsupported"`），设置中心遵循以下交互契约：
   1. **卡片保持展示与导航可达**：左侧导航栏与右侧滚动区域均完整展示该 Feature 对应的卡片分区，用户可通过点击左侧导航平滑滚动定位，保持全平台设置界面的完整性与视觉一致性；
@@ -392,7 +397,7 @@ SiYuan/data/storage/petal/siyuan-plugin-omnikit/
 - **轻量状态感知与路由防护**：
   - 通过 `MenuRouter` 与 `MenuRegistry` 集中管理菜单派发；
   - 菜单触发时，`MenuRouter` 首先核验对应 Feature 的运行状态（`phase === "enabled"`）；
-  - 若在右键菜单打开期间 Feature 处于禁用状态，系统调用思源原生 `showMessage` 提示功能已停用，不展示模态错误弹窗，且不执行失效回调。
+  - 若在右键菜单打开期间 Feature 处于禁用状态，系统通过 `UiFeedback` 弹出统一规范的停用提示气泡，不展示模态错误弹窗，且不执行失效回调。
 - **平台兼容性菜单联动**：
   - 不支持当前平台的 Feature 处于 `unsupported` 状态，未被激活且不分配 `FeatureScope`；
   - `MenuRegistry` 在渲染宿主上下文菜单与顶栏快捷菜单时，严格校验 `isFeatureRunning(entry.owner)`；不支持当前平台的 Feature 自动排除在外部宿主上下文菜单与顶栏快捷菜单之外，宿主菜单保持纯粹清爽，不响应也不渲染任何无效菜单项。
@@ -418,7 +423,7 @@ Core 平台提供轻量级 `UiFeedback` 服务（注入 `FeatureContext.feedback
   - `BaseFeature.activate()` 在激活时创建当前激活专属的 `FeatureScope`，并通过 `feedback.forScope(scope)` 将 `UiFeedback` 与该 `scope` 深度绑定；
   - 当 Feature 处于未激活（`disabled` / `unsupported`）或插件正在卸载（`unloading`）时，自动静默丢弃未决的通知调用（包括 `copyable` 异步写入剪贴板完成后对 `scope.active` 的二次核验），防止失活回调向界面弹出残存气泡。
 - **`AbortError` 与取消信号自动拦截吞咽**：
-  - 异步任务在遭遇用户按 Esc、切换编辑器标签页、关闭面板或触发 `signal.abort` 中止时，底层抛出的标准 `AbortError` 或传入的中止信号由 `UiFeedback` 自动拦截并静默吞咽；
+  - 异步任务因 Feature 停用、插件卸载、宿主退出或 Feature 专属进度弹窗被用户主动关闭而触发 `signal.abort` 中止时，底层抛出的标准 `AbortError` 或传入的中止信号由 `UiFeedback` 自动拦截并静默吞咽；
   - 严禁向用户弹出错误气泡，保障正常中止时界面完全静默退出。
 - **高频消息防抖抑制 (Notice Debouncing)**：
   - 内置基于消息内容的防抖与去重窗口（默认 300ms）；
@@ -428,7 +433,7 @@ Core 平台提供轻量级 `UiFeedback` 服务（注入 `FeatureContext.feedback
   - `copyable(text: string, notice?: string)`: 统一封装文本复制至系统剪贴板功能（由 `forScope(scope)` 绑定上下文作用域，不提供额外参数嗅探重载，并在剪贴板异步返回后再次校验 `scope.active`），复制成功后触发轻量提示（如 `[OmniKit] 已复制路径`），下游业务特性直接复用；
 - **局域网 HTTP 环境与无 WebCrypto 兼容规范**：
   - 在非 HTTPS/局域网 HTTP 部署环境下，宿主浏览器不暴露 `crypto.randomUUID()` 与 `crypto.subtle` 安全上下文 API；
-  - 平台任务 ID 生成采用进程内时间戳与自增序列号，确保全网络环境可用；
+  - Core 提供统一的运行时任务 ID 生成能力，采用进程内单调计数器与时间戳（不依赖 `crypto.randomUUID()`），确保非安全上下文与全网络环境可用；
   - 当 `navigator.clipboard` 在非安全 HTTP 环境不可用或写入被拒绝时，交互层（如 `ImageTaskUI` / `ImageRecordsDock`）安全回退为选中可复制文本路径或弹窗引导手动 `Ctrl+C` 复制，保证复制操作的确定性闭环。
 
 ### 5.6 通用底栏状态栏管理 (`PluginStatusBar`)
@@ -465,10 +470,11 @@ Core 平台在思源主工作区状态栏区域提供通用的轻量任务进度
 
 ### 6.2 `Platform` 运行环境判断与平台兼容性判定算法
 
-统一导出跨平台环境识别工具与平台兼容性判定算法：
+统一导出跨平台环境识别工具与平台兼容性判定算法，并作为全插件判定当前前端运行环境的唯一权威来源（各 Feature 统一复用 Core `Platform`，不自行直连宿主环境探测）：
 - **宿主前端类型探测**：
   - 调用思源官方 `getFrontend()` 接口获取当前宿主前端类型（`SiyuanFrontend`）：`"desktop"`、`"desktop-window"`、`"mobile"`、`"browser-desktop"`、`"browser-mobile"`；
   - 辅助识别操作系统平台（Windows / macOS / Linux / Android / iOS）；
+  - 插件宿主清单 `plugin.json` 的 `frontends` 覆盖全部五端（`["desktop", "desktop-window", "mobile", "browser-desktop", "browser-mobile"]`），宿主清单准入闸门优先于 Feature 级声明；
 - **对齐思源内核 `IsTargetSupported` 算法**：
   - 核心判定算法 `isFrontendSupported(frontends?: readonly SiyuanFrontend[], current?: SiyuanFrontend): boolean` 在逻辑上与思源内核 Go 实现（`kernel/bazaar/plugin.go` 中 `IsTargetSupported`）保持严格对齐：
     1. **缺省与空列表全端兼容**：当 `frontends` 字段缺失、未定义或为空数组 `[]` 时，跳过平台检查，直接判定为全端支持（返回 `true`，等价于 `["all"]`）；
@@ -489,6 +495,18 @@ Core 平台在思源主工作区状态栏区域提供通用的轻量任务进度
 - **标准属性提取**：从思源标准事件对象及编辑器实例提取核心上下文（如 `detail.protyle.block.rootID`、`detail.protyle.element` 与 `getInstance()`）；
 - **确定性数据流**：以思源原生数据结构为准，直接解构所需字段并执行类型守卫，保持宿主适配层精简、确定；
 - **只读辅助**：适配器仅执行结构化属性解构与信号组合（`combineSignals`），不产生任何副作用。
+
+### 6.5 共享块写租约、错误描述与公共 DOM 守卫常量
+
+为消除跨 Feature 并发写入竞争并保证错误处理与 DOM 安全守卫一致性，Core 提供以下基础设施：
+1. **共享块写租约服务 (`BlockWriteLease`)**：
+   - 以 `notebook/blockID` 为粒度在进程内维护统一的串行排队租约，供所有需要改写思源块的 Feature（如 `imageCompressor`、`titled-link`）共用；
+   - 支持排队期间感知 `AbortSignal` 并立即退出，进入临界区后执行前再次校验中止状态；
+   - 因思源 `/api/block/updateBlock` 不提供内核级原子 CAS，共享写租约仅约束进程内跨 Feature 并发写回的串行化，写前仍须通过内核读接口执行基线快照核验。
+2. **统一结构化错误描述 (`describeError`)**：
+   - 解析 `Error` 实例与思源内核 `{ code, msg }` 结构化响应对象（输出可读消息与错误码），屏蔽 `[object Object]` 等无效对象序列化。
+3. **公共受保护 DOM 容器选择器常量**：
+   - 统一定义并导出应排除自动捕获与扫描的受保护编辑器容器选择器（如嵌入块 `[data-type="NodeBlockQueryEmbed"]`、`.protyle-wysiwyg__embed` 及代码块 `pre`、`code`、`script`、`style`、`[data-type="NodeCodeBlock"]`），供各 Feature 共用。
 
 ---
 

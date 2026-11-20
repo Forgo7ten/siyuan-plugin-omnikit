@@ -93,3 +93,75 @@ test("inspectImage extracts EXIF orientation and swaps dimensions correctly", as
   assert.equal(info.width, 1500);
   assert.equal(info.height, 3000);
 });
+
+test("BicEncoder allows static WebP in manual-quick, blocks animated WebP, and permits drawings_v2.png (D04, I-11)", async () => {
+  // Build a larger valid static WebP input (with extra VP8X/VP8 padding) so compressed output is smaller
+  const largeInputBytes = new Uint8Array(64);
+  const inView = new DataView(largeInputBytes.buffer);
+  largeInputBytes.set(Buffer.from("RIFF"), 0); inView.setUint32(4, 56, true); largeInputBytes.set(Buffer.from("WEBP"), 8);
+  largeInputBytes.set(Buffer.from("VP8X"), 12); inView.setUint32(16, 10, true);
+  largeInputBytes[24] = 99; largeInputBytes[27] = 99;
+  largeInputBytes.set(Buffer.from("VP8 "), 30); inView.setUint32(34, 26, true);
+  largeInputBytes.set([0x9d, 0x01, 0x2a], 41);
+  inView.setUint16(44, 100, true); inView.setUint16(46, 100, true);
+
+  const encoder = new BicEncoder(
+    async () => webp(100, 100),
+    "worker.js",
+    async () => ({ width: 100, height: 100 }),
+  );
+  const staticWebp = new Blob([largeInputBytes], { type: "image/webp" });
+  const quickRes = await encoder.encode(staticWebp, "assets/drawings_v2.webp", config(), undefined, undefined, "manual-quick");
+  assert.equal(quickRes.kind, "encoded");
+
+  const autoRes = await encoder.encode(staticWebp, "assets/photo.webp", config(), undefined, undefined, "auto");
+  assert.deepEqual(autoRes, { kind: "skipped", reason: "protected-extension" });
+
+  const protectedDir = await encoder.encode(png(100, 100), "assets/drawings/flow.png", config(), undefined, undefined, "manual-quick");
+  assert.deepEqual(protectedDir, { kind: "skipped", reason: "protected-extension" });
+
+  // Animated WebP (VP8X with animation bit 0x02 + ANIM chunk) must be skipped even in manual-quick
+  const animBytes = new Uint8Array(44);
+  const view = new DataView(animBytes.buffer);
+  animBytes.set(Buffer.from("RIFF"), 0); view.setUint32(4, 36, true); animBytes.set(Buffer.from("WEBP"), 8);
+  animBytes.set(Buffer.from("VP8X"), 12); view.setUint32(16, 10, true);
+  animBytes[20] = 0x02;
+  animBytes[24] = 99; animBytes[27] = 99;
+  animBytes.set(Buffer.from("ANIM"), 30); view.setUint32(34, 6, true);
+  const animRes = await encoder.encode(new Blob([animBytes], { type: "image/webp" }), "anim.webp", config(), undefined, undefined, "manual-quick");
+  assert.deepEqual(animRes, { kind: "skipped", reason: "animation-protected" });
+});
+
+test("BicEncoder passes maxEdge=64 to output decode verification and verifyBitmap resizes bitmap (B-1)", async () => {
+  const { verifyBitmap } = await import("../../../src/features/image-compressor/services/image.ts");
+  let receivedMaxEdge;
+  const encoder = new BicEncoder(
+    async () => webp(4096, 2048),
+    "worker.js",
+    async (_blob, _signal, maxEdge) => {
+      receivedMaxEdge = maxEdge;
+      return { width: 64, height: 32 };
+    },
+  );
+  const encoded = await encoder.encode(png(4096, 2048), "large.png", config(), undefined, undefined, "auto");
+  assert.equal(encoded.kind, "encoded");
+  assert.equal(receivedMaxEdge, 64);
+  if (encoded.kind === "encoded") {
+    assert.equal(encoded.value.width, 4096);
+    assert.equal(encoded.value.height, 2048);
+  }
+
+  const prevCreateImageBitmap = globalThis.createImageBitmap;
+  let capturedOptions;
+  globalThis.createImageBitmap = async (_blob, options) => {
+    capturedOptions = options;
+    return { width: 64, height: 32, close() {} };
+  };
+  try {
+    const dims = await verifyBitmap(webp(4096, 2048), undefined, 64);
+    assert.deepEqual(dims, { width: 64, height: 32 });
+    assert.deepEqual(capturedOptions, { resizeWidth: 64, resizeHeight: 64, resizeQuality: "low" });
+  } finally {
+    globalThis.createImageBitmap = prevCreateImageBitmap;
+  }
+});

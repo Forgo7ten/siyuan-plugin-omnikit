@@ -41,3 +41,14 @@ test("clearing the cache also invalidates outstanding generations", () => {
   assert.equal(cache.set("https://example.com", "Late", generation), false);
   assert.equal(cache.size, 0);
 });
+
+test("advances generations per url instead of globally", () => {
+  const cache = new TitleCache();
+  const genA = cache.captureGeneration("https://a.example");
+  const genB = cache.captureGeneration("https://b.example");
+  cache.refresh("https://a.example", "Fresh A");
+  assert.equal(cache.set("https://a.example", "Stale A", genA), false);
+  assert.equal(cache.set("https://b.example", "Title B", genB), true);
+  assert.equal(cache.get("https://a.example"), "Fresh A");
+  assert.equal(cache.get("https://b.example"), "Title B");
+});

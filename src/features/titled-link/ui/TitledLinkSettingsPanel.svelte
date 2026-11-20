@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
+  import { describeError } from "../../../core/host/describeError.ts";
   import type { JsonStore } from "../../../core/store/JsonStore.ts";
+  import { SettingsConflictError, isSettingsConflictError } from "../../../core/store/SettingsConflictError.ts";
   import { defaultTitledLinkConfig, parseTitledLinkConfig } from "../policy/settings.ts";
   import type { TitledLinkConfig } from "../policy/types.ts";
 
@@ -54,14 +56,14 @@
       const next = parseTitledLinkConfig($state.snapshot(draft));
       const expected = $state.snapshot(baseline);
       await store.update(current => {
-        if (!same(current, expected)) throw new Error(t("settings.concurrentChange"));
+        if (!same(current, expected)) throw new SettingsConflictError(t("settings.concurrentChange"));
         Object.assign(current, next);
       });
       adopt(store.snapshot());
       notice = t("settings.saved");
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : String(cause);
-      if (error.includes(t("settings.concurrentChange"))) conflict = true;
+      error = describeError(cause);
+      if (isSettingsConflictError(cause)) conflict = true;
     } finally {
       busy = false;
     }
@@ -76,7 +78,7 @@
       adopt(store.snapshot());
       notice = t("recovery.settingsOk");
     } catch (cause) {
-      error = `${t("recovery.settingsFailed")} ${cause instanceof Error ? cause.message : String(cause)}`;
+      error = `${t("recovery.settingsFailed")} ${describeError(cause)}`;
     } finally {
       busy = false;
     }

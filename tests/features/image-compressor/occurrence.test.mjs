@@ -2,32 +2,72 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { resolveImageOccurrence } from "../../../src/features/image-compressor/services/ImageOccurrenceResolver.ts";
 import { commitOneImage } from "../../../src/features/image-compressor/services/SafeBlockWriter.ts";
+import { withBlockWriteLease } from "../../../src/core/host/BlockWriteLease.ts";
 
 const rootID = "20261113000000-abcdef0";
 const blockID = "20261113000001-abcdef0";
 const notebook = "20261113000002-abcdef0";
 
 class Element {
-  constructor(tag, attrs = {}, children = []) { this.tagName = tag.toUpperCase(); this.attrs = new Map(Object.entries(attrs)); this.children = children; }
+  constructor(tag, attrs = {}, children = []) {
+    this.tagName = tag.toUpperCase();
+    this.attrs = new Map(Object.entries(attrs));
+    this.children = children;
+    this.textContent = "";
+  }
   hasAttribute(name) { return this.attrs.has(name); }
   getAttribute(name) { return this.attrs.get(name) ?? null; }
   setAttribute(name, value) { this.attrs.set(name, value); }
+  removeAttribute(name) { this.attrs.delete(name); }
   getAttributeNames() { return [...this.attrs.keys()]; }
-  querySelectorAll(selector) { return this.children.flatMap(child => [ ...(selector === "img" && child.tagName === "IMG" ? [child] : []), ...child.querySelectorAll(selector) ]); }
+  querySelectorAll(selector) {
+    if (selector === "[parent-heading]") {
+      return this.children.flatMap(child => [
+        ...(child.hasAttribute("parent-heading") ? [child] : []),
+        ...child.querySelectorAll(selector),
+      ]);
+    }
+    if (selector === "a[href], span[data-href]") {
+      return this.children.flatMap(child => [
+        ...((child.tagName === "A" && child.hasAttribute("href")) || (child.tagName === "SPAN" && child.hasAttribute("data-href")) ? [child] : []),
+        ...child.querySelectorAll(selector),
+      ]);
+    }
+    return this.children.flatMap(child => [
+      ...(selector === "img" && child.tagName === "IMG" ? [child] : []),
+      ...child.querySelectorAll(selector),
+    ]);
+  }
   querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
   closest() { return null; }
   get outerHTML() {
     const attrs = [...this.attrs].map(([key, value]) => ` ${key}="${value}"`).join("");
-    return `<${this.tagName.toLowerCase()}${attrs}>${this.children.map(child => child.outerHTML).join("")}</${this.tagName.toLowerCase()}>`;
+    if (this.tagName === "IMG") return `<img${attrs}>`;
+    return `<${this.tagName.toLowerCase()}${attrs}>${this.children.map(child => child.outerHTML).join("")}${this.textContent}</${this.tagName.toLowerCase()}>`;
   }
 }
+
 class Template {
   constructor() { this.content = { children: [], querySelector: selector => this.content.children.flatMap(child => child.querySelectorAll(selector))[0] ?? null }; }
   set innerHTML(html) {
     const open = html.match(/^\s*<([\w-]+)([^>]*)>([\s\S]*)<\/\1>\s*$/);
     if (!open) { this.content.children = []; return; }
     const attrs = Object.fromEntries([...open[2].matchAll(/([\w-]+)="([^"]*)"/g)].map(match => [match[1], match[2]]));
-    const children = [...open[3].matchAll(/<img\b([^>]*)>/g)].map(match => new Element("img", Object.fromEntries([...match[1].matchAll(/([\w-]+)="([^"]*)"/g)].map(a => [a[1], a[2]]))));
+    const children = [];
+    const body = open[3];
+    for (const m of body.matchAll(/<img\b([^>]*)>|<span\b([^>]*)>([^<]*)<\/span>|<a\b([^>]*)>([^<]*)<\/a>/g)) {
+      if (m[1] !== undefined) {
+        children.push(new Element("img", Object.fromEntries([...m[1].matchAll(/([\w-]+)="([^"]*)"/g)].map(a => [a[1], a[2]]))));
+      } else if (m[2] !== undefined) {
+        const el = new Element("span", Object.fromEntries([...m[2].matchAll(/([\w-]+)="([^"]*)"/g)].map(a => [a[1], a[2]])));
+        el.textContent = m[3];
+        children.push(el);
+      } else if (m[4] !== undefined) {
+        const el = new Element("a", Object.fromEntries([...m[4].matchAll(/([\w-]+)="([^"]*)"/g)].map(a => [a[1], a[2]])));
+        el.textContent = m[5];
+        children.push(el);
+      }
+    }
     this.content.children = [new Element(open[1], attrs, children)];
   }
 }
@@ -38,9 +78,9 @@ function withDocument(run) {
   return Promise.resolve().then(run).finally(() => { globalThis.document = previous; });
 }
 
-function blockDOM(paths) {
+function blockDOM(paths, extraAttrs = "") {
   const images = paths.map(path => `<img data-src="${path}" src="${path}">`).join("");
-  return `<div data-node-id="${blockID}">${images}</div>`;
+  return `<div data-node-id="${blockID}"${extraAttrs}>${images}</div>`;
 }
 
 test("resolver captures one exact ordinal among duplicate image paths", async () => withDocument(() => {
@@ -67,6 +107,48 @@ test("writer checks block ownership and baseline, then updates occurrence and tr
   assert.deepEqual(calls, ["/api/block/getBlockInfo", "/api/block/getBlockDOM", "/api/block/updateBlock"]);
 }));
 
+test("writer strips render-only parent-heading attribute and preserves decorative suffixes + box", async () => withDocument(async () => {
+  const current = `<div data-node-id="${blockID}" parent-heading="20261113000099-abcdef0"><img data-src="assets/a.png?width=200#fig" src="assets/a.png?width=200#fig"></div>`;
+  const target = resolveImageOccurrence(current, { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/a.png?width=200#fig" });
+  let written = "";
+  const kernel = { async post(path, body) {
+    if (path === "/api/block/getBlockInfo") return { data: { rootID, box: notebook } };
+    if (path === "/api/block/getBlockDOM") return { data: { id: blockID, dom: current } };
+    if (path === "/api/block/updateBlock") { written = body.data; return { data: null }; }
+    throw new Error(`Unexpected endpoint ${path}`);
+  } };
+  const result = await commitOneImage(kernel, target, `assets/a.webp?box=${notebook}`, "http://localhost:6806");
+  assert.equal(result, "replaced");
+  assert.equal(written.includes("parent-heading"), false);
+  assert.equal(written.includes(`assets/a.webp?box=${notebook}&width=200#fig`), true);
+}));
+
+test("writer patches only the selected resource link ordinal without touching images or sibling links (D06)", async () => withDocument(async () => {
+  const dom = `<div data-node-id="${blockID}"><img data-src="assets/a.png" src="assets/a.png"><span data-type="a" data-href="assets/a.png">first</span><a href="assets/a.png">second</a></div>`;
+  const target = {
+    rootID,
+    notebook,
+    blockID,
+    kind: "link",
+    attribute: "data-href",
+    imageOrdinal: 0,
+    oldPath: "assets/a.png",
+    baselineBlockDOM: dom,
+  };
+  let written = "";
+  const kernel = { async post(path, body) {
+    if (path === "/api/block/getBlockInfo") return { data: { rootID, box: notebook } };
+    if (path === "/api/block/getBlockDOM") return { data: { id: blockID, dom } };
+    if (path === "/api/block/updateBlock") { written = body.data; return { data: null }; }
+    throw new Error(`Unexpected endpoint ${path}`);
+  } };
+  const result = await commitOneImage(kernel, target, "assets/a.webp", "http://localhost:6806");
+  assert.equal(result, "replaced");
+  assert.equal(written.includes('<img data-src="assets/a.png" src="assets/a.png">'), true);
+  assert.equal(written.includes('<span data-type="a" data-href="assets/a.webp">first</span>'), true);
+  assert.equal(written.includes('<a href="assets/a.png">second</a>'), true);
+}));
+
 test("writer safely skips a stale baseline without sending updateBlock", async () => withDocument(async () => {
   const baseline = blockDOM(["assets/a.png"]);
   const target = resolveImageOccurrence(baseline, { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/a.png" });
@@ -81,22 +163,48 @@ test("writer safely skips a stale baseline without sending updateBlock", async (
   assert.equal(calls.includes("/api/block/updateBlock"), false);
 }));
 
-test("writer rejects with AbortError when signal is already aborted and never returns conflict", async () => withDocument(async () => {
+test("writer propagates read errors explicitly instead of masking them as conflict (I-07)", async () => withDocument(async () => {
+  const baseline = blockDOM(["assets/a.png"]);
+  const target = resolveImageOccurrence(baseline, { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/a.png" });
+  const kernel = { async post(path) {
+    if (path === "/api/block/getBlockInfo") throw new Error("Kernel unreachable");
+    throw new Error(`Unexpected endpoint ${path}`);
+  } };
+  await assert.rejects(
+    commitOneImage(kernel, target, "assets/a.webp", "http://localhost:6806"),
+    /Kernel unreachable/,
+  );
+}));
+
+test("writer returns unknown without retrying when updateBlock fails after dispatch (I-06)", async () => withDocument(async () => {
+  const baseline = blockDOM(["assets/a.png"]);
+  const target = resolveImageOccurrence(baseline, { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/a.png" });
+  let updateCalls = 0;
+  const kernel = { async post(path) {
+    if (path === "/api/block/getBlockInfo") return { data: { rootID, box: notebook } };
+    if (path === "/api/block/getBlockDOM") return { data: { id: blockID, dom: baseline } };
+    if (path === "/api/block/updateBlock") {
+      updateCalls++;
+      throw new Error("Socket timeout");
+    }
+    throw new Error(`Unexpected endpoint ${path}`);
+  } };
+  const result = await commitOneImage(kernel, target, "assets/a.webp", "http://localhost:6806");
+  assert.equal(result, "unknown");
+  assert.equal(updateCalls, 1);
+}));
+
+test("writer returns aborted when signal is already aborted and never returns conflict", async () => withDocument(async () => {
   const baseline = blockDOM(["assets/a.png"]);
   const target = resolveImageOccurrence(baseline, { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/a.png" });
   const controller = new AbortController();
   controller.abort();
   const kernel = { async post() { throw new Error("Should not be called"); } };
-  await assert.rejects(
-    async () => {
-      const res = await commitOneImage(kernel, target, "assets/a.webp", "http://localhost:6806", controller.signal);
-      assert.notEqual(res, "conflict");
-    },
-    (err) => err?.name === "AbortError",
-  );
+  const res = await commitOneImage(kernel, target, "assets/a.webp", "http://localhost:6806", controller.signal);
+  assert.equal(res, "aborted");
 }));
 
-test("writer rejects with AbortError when signal aborts before updateBlock", async () => withDocument(async () => {
+test("writer returns aborted when signal aborts before updateBlock", async () => withDocument(async () => {
   const baseline = blockDOM(["assets/a.png"]);
   const target = resolveImageOccurrence(baseline, { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/a.png" });
   const controller = new AbortController();
@@ -110,12 +218,44 @@ test("writer rejects with AbortError when signal aborts before updateBlock", asy
     }
     throw new Error(`Unexpected endpoint ${path}`);
   } };
-  await assert.rejects(
-    async () => {
-      const res = await commitOneImage(kernel, target, "assets/a.webp", "http://localhost:6806", controller.signal);
-      assert.notEqual(res, "conflict");
-    },
-    (err) => err?.name === "AbortError",
-  );
+  const res = await commitOneImage(kernel, target, "assets/a.webp", "http://localhost:6806", controller.signal);
+  assert.equal(res, "aborted");
   assert.equal(calls.includes("/api/block/updateBlock"), false);
+}));
+
+test("writer shares Core withBlockWriteLease across notebook/blockID (A-07)", async () => withDocument(async () => {
+  const baseline = blockDOM(["assets/a.png"]);
+  const target = resolveImageOccurrence(baseline, { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/a.png" });
+  const events = [];
+  let releaseLease;
+  let markHeld;
+  const held = new Promise(r => { markHeld = r; });
+  const blocker = new Promise(r => { releaseLease = r; });
+
+  const peer = withBlockWriteLease(notebook, blockID, undefined, async () => {
+    events.push("peer:enter");
+    markHeld();
+    await blocker;
+    events.push("peer:exit");
+  });
+
+  await held;
+  const kernel = { async post(path) {
+    events.push(`image:${path}`);
+    if (path === "/api/block/getBlockInfo") return { data: { rootID, box: notebook } };
+    if (path === "/api/block/getBlockDOM") return { data: { id: blockID, dom: baseline } };
+    if (path === "/api/block/updateBlock") return { data: null };
+    throw new Error(path);
+  } };
+
+  const writePromise = commitOneImage(kernel, target, "assets/a.webp", "http://localhost:6806");
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(events, ["peer:enter"]);
+
+  releaseLease();
+  const [, commitRes] = await Promise.all([peer, writePromise]);
+  assert.equal(commitRes, "replaced");
+  assert.equal(events[1], "peer:exit");
+  assert.equal(events[2], "image:/api/block/getBlockInfo");
 }));

@@ -54,7 +54,11 @@ export class SimilarityWorkerSession {
     this.signal?.addEventListener("abort", this.abortHandler, { once: true });
   }
 
-  initOriginal(original: Blob, maxEdge = 512): Promise<{ width: number; height: number }> {
+  initOriginal(
+    original: Blob,
+    maxEdge = 512,
+    originalDimensions?: { width: number; height: number },
+  ): Promise<{ width: number; height: number }> {
     if (this.disposed || this.signal?.aborted) {
       return Promise.reject(new DOMException("Operation cancelled", "AbortError"));
     }
@@ -62,7 +66,13 @@ export class SimilarityWorkerSession {
     return new Promise<{ width: number; height: number }>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       try {
-        const msg: SimilarityWorkerMessage = { type: "initOriginal", id, original, maxEdge };
+        const msg: SimilarityWorkerMessage = {
+          type: "initOriginal",
+          id,
+          original,
+          maxEdge,
+          ...(originalDimensions ? { width: originalDimensions.width, height: originalDimensions.height } : {}),
+        };
         this.worker.postMessage(msg);
       } catch (err) {
         this.pending.delete(id);

@@ -18,8 +18,8 @@ test("status subscribers observe startup failure and retry, and can unsubscribe"
   const feature = new Feature();
   const catalog = new FeatureCatalog();
   catalog.register(feature);
-  const settings = { getFeatureEnabled: () => true, setFeatureEnabled: async () => {} };
-  const manager = new FeatureManager(catalog, { settings, logger: { debug() {}, error() {} } });
+  const settings = { getFeatureEnabled: () => true, isPreferenceReliable: () => true, setFeatureEnabled: async () => {} };
+  const manager = new FeatureManager(catalog, { settings, logger: { debug() {}, warn() {}, error() {} } });
   const seen = [];
   const unsubscribe = manager.subscribeStatus(statuses => seen.push(statuses[0]));
   await manager.initialize();
@@ -40,8 +40,8 @@ test("turning off a failed feature clears its runtime error", async () => {
   const catalog = new FeatureCatalog();
   catalog.register(new Feature());
   let desired = true;
-  const settings = { getFeatureEnabled: () => desired, setFeatureEnabled: async (_id, value) => { desired = value; } };
-  const manager = new FeatureManager(catalog, { settings, logger: { debug() {}, error() {} } });
+  const settings = { getFeatureEnabled: () => desired, isPreferenceReliable: () => true, setFeatureEnabled: async (_id, value) => { desired = value; } };
+  const manager = new FeatureManager(catalog, { settings, logger: { debug() {}, warn() {}, error() {} } });
   await manager.initialize();
   assert.equal(manager.statuses()[0].status, "error");
   assert.equal(await manager.setEnabled(meta.id, false), true);
@@ -57,8 +57,8 @@ test("external disable clears failed state and a bad observer cannot block trans
   let desired = true;
   const errors = [];
   const manager = new FeatureManager(catalog, {
-    settings: { getFeatureEnabled: () => desired },
-    logger: { debug() {}, error(message) { errors.push(message); } },
+    settings: { getFeatureEnabled: () => desired, isPreferenceReliable: () => true },
+    logger: { debug() {}, warn() {}, error(message) { errors.push(message); } },
   });
   manager.subscribeStatus(() => { throw new Error("observer broke"); });
   await manager.initialize();
@@ -80,12 +80,89 @@ test("reconcileFromLoadedSettings does not fire notifySettingsChanged for alread
   const catalog = new FeatureCatalog();
   catalog.register(new Feature());
   const manager = new FeatureManager(catalog, {
-    settings: { getFeatureEnabled: () => true },
-    logger: { debug() {}, error() {} },
+    settings: { getFeatureEnabled: () => true, isPreferenceReliable: () => true },
+    logger: { debug() {}, warn() {}, error() {} },
   });
   await manager.initialize();
   await manager.reconcileFromLoadedSettings();
   assert.equal(settingsChangedCalls, 0);
   await manager.notifySettingsChanged(meta.id);
   assert.equal(settingsChangedCalls, 1);
+});
+
+test("startup skips an unreliable preference without writing settings", async () => {
+  const meta = { id: "runtime", title: "Runtime", description: "", category: "other", icon: "", defaultEnabled: true };
+  let enabledCalls = 0;
+  let setCalls = 0;
+  const warnings = [];
+  class Feature extends BaseFeature {
+    constructor() { super(meta); }
+    onEnable() { enabledCalls++; }
+  }
+  const catalog = new FeatureCatalog();
+  catalog.register(new Feature());
+  const manager = new FeatureManager(catalog, {
+    settings: {
+      getFeatureEnabled: () => true,
+      isPreferenceReliable: () => false,
+      setFeatureEnabled: async () => { setCalls++; },
+    },
+    logger: { debug() {}, warn(message) { warnings.push(message); }, error() {} },
+  });
+
+  await manager.initialize();
+  assert.equal(enabledCalls, 0);
+  assert.equal(setCalls, 0);
+  assert.equal(manager.statuses()[0].status, "disabled");
+  assert.equal(warnings.length, 1);
+});
+
+test("reconcileFromLoadedSettings keeps a running feature when its preference is unreadable", async () => {
+  const meta = { id: "runtime", title: "Runtime", description: "", category: "other", icon: "", defaultEnabled: true };
+  let reliable = true;
+  let desired = true;
+  let disableCalls = 0;
+  const warnings = [];
+  class Feature extends BaseFeature {
+    constructor() { super(meta); }
+    onEnable() {}
+    onDisable() { disableCalls++; }
+  }
+  const catalog = new FeatureCatalog();
+  catalog.register(new Feature());
+  const manager = new FeatureManager(catalog, {
+    settings: {
+      getFeatureEnabled: () => desired,
+      isPreferenceReliable: () => reliable,
+    },
+    logger: { debug() {}, warn(message) { warnings.push(message); }, error() {} },
+  });
+
+  await manager.initialize();
+  assert.equal(manager.isRunning(meta.id), true);
+
+  reliable = false;
+  desired = false;
+  await manager.reconcileFromLoadedSettings();
+  assert.equal(manager.isRunning(meta.id), true);
+  assert.equal(disableCalls, 0);
+  assert.equal(warnings.length, 1);
+});
+
+test("statuses formats structured { msg, code } startup errors via describeError", async () => {
+  const meta = { id: "runtime", title: "Runtime", description: "", category: "other", icon: "", defaultEnabled: true };
+  class Feature extends BaseFeature {
+    constructor() { super(meta); }
+    onEnable() { throw { msg: "Kernel rejected", code: 500 }; }
+  }
+  const catalog = new FeatureCatalog();
+  catalog.register(new Feature());
+  const manager = new FeatureManager(catalog, {
+    settings: { getFeatureEnabled: () => true, isPreferenceReliable: () => true },
+    logger: { debug() {}, warn() {}, error() {} },
+  });
+
+  await manager.initialize();
+  assert.equal(manager.statuses()[0].status, "error");
+  assert.equal(manager.statuses()[0].error, "Kernel rejected (code 500)");
 });

@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { getFrontend } from "siyuan";
   import type { JsonStore } from "../../../core/store/JsonStore.ts";
   import { KernelClient } from "../../../core/host/KernelClient.ts";
+  import { getCurrentFrontend } from "../../../core/host/Platform.ts";
   import { isDocumentRootIdentity } from "../policy/DocumentIdentity.ts";
   import { NODE_ID, type ImageFeatureConfig } from "../policy/parseImageConfig.ts";
+  import { resolveDocumentTitle } from "../services/documentTitle.ts";
   import ImageSettingsPanel from "./ImageSettingsPanel.svelte";
 
   interface Props {
@@ -19,7 +20,7 @@
 
   onMount(() => {
     const controller = new AbortController();
-    const frontend = getFrontend();
+    const frontend = getCurrentFrontend();
     desktopFrontend = frontend === "desktop" || frontend === "desktop-window" || frontend === "browser-desktop";
     void kernel.post<unknown>("/api/system/version", {}, { signal: controller.signal })
       .then(response => {
@@ -42,24 +43,8 @@
     if (!isDocumentRootIdentity(info, rootID)) {
       throw new Error(t("settings.invalidDocument"));
     }
-    let title = "";
-    try {
-      const hpathRes = await kernel.post<string>("/api/filetree/getFullHPathByID", { id: rootID });
-      if (typeof hpathRes.data === "string" && hpathRes.data.trim()) {
-        title = hpathRes.data.trim();
-      }
-    } catch {
-      try {
-        const fallbackRes = await kernel.post<string>("/api/filetree/getHPathByID", { id: rootID });
-        if (typeof fallbackRes.data === "string" && fallbackRes.data.trim()) {
-          title = fallbackRes.data.trim();
-        }
-      } catch {
-        // Fallback to rootTitle below
-      }
-    }
-    const fallbackTitle = typeof info?.rootTitle === "string" ? info.rootTitle.trim().slice(0, 512) : "";
-    return { id: rootID, title: title || fallbackTitle };
+    const title = await resolveDocumentTitle(kernel, rootID, { fallbackRootTitle: info?.rootTitle });
+    return { id: rootID, title };
   }
 </script>
 

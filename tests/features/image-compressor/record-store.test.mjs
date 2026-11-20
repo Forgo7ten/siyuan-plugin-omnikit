@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   ImageCompressionRecordStore,
+  dryRunRecordMigration,
   imageRecordsFor,
   reloadLoadedImageRecords,
 } from "../../../src/features/image-compressor/store/ImageCompressionRecordStore.ts";
@@ -54,20 +55,103 @@ test("concurrent upserts serialize, replace the latest mapping, and retain indep
   assert.equal(plugin.writes.length, 3);
 });
 
-test("duplicate originals including case and encoding variants are rejected without overwriting corrupt data", async () => {
-  const plugin = createPlugin(new Map([[
+test("keeps 100%.png vs 100%25.png and case variants distinct while rejecting exact duplicates without overwriting corrupt data (I-01, F-01)", async () => {
+  const distinctPlugin = createPlugin(new Map([[
     "feature-image-compressor-records.json",
     { schemaVersion: 1, records: [
-      { originalPath: "assets/Caf%C3%A9.png", compressedPath: "assets/one.webp", updatedAt: 1, lastOperation: "saved-only" },
-      { originalPath: "assets/café.png", compressedPath: "assets/two.webp", updatedAt: 2, lastOperation: "replaced" },
+      { originalPath: "assets/100%.png", compressedPath: "assets/one.webp", updatedAt: 1, lastOperation: "saved-only" },
+      { originalPath: "assets/100%25.png", compressedPath: "assets/two.webp", updatedAt: 2, lastOperation: "replaced" },
+      { originalPath: "assets/Photo.png", compressedPath: "assets/three.webp", updatedAt: 3, lastOperation: "replaced" },
+      { originalPath: "assets/photo.png", compressedPath: "assets/four.webp", updatedAt: 4, lastOperation: "replaced" },
     ] },
   ]]));
+  const distinctStore = new ImageCompressionRecordStore(distinctPlugin);
+  await distinctStore.init();
+  assert.equal(distinctStore.store.needsRecovery, false);
+  assert.equal(distinctStore.snapshot().length, 4);
+
+  const corruptPlugin = createPlugin(new Map([[
+    "feature-image-compressor-records.json",
+    { schemaVersion: 1, records: [
+      { originalPath: "assets/dup.png", compressedPath: "assets/one.webp", updatedAt: 1, lastOperation: "saved-only" },
+      { originalPath: "assets/dup.png", compressedPath: "assets/two.webp", updatedAt: 2, lastOperation: "replaced" },
+    ] },
+  ]]));
+  const corruptStore = new ImageCompressionRecordStore(corruptPlugin);
+  await corruptStore.init();
+
+  assert.equal(corruptStore.store.needsRecovery, true);
+  await assert.rejects(corruptStore.removeRecord("assets/dup.png"), /read-only/);
+  assert.deepEqual(corruptPlugin.writes, []);
+});
+
+test("upsert and markOperation move updated records to the top of the list (I-19)", async () => {
+  const plugin = createPlugin();
   const store = new ImageCompressionRecordStore(plugin);
   await store.init();
 
-  assert.equal(store.store.needsRecovery, true);
-  await assert.rejects(store.removeRecord("assets/Caf%C3%A9.png"), /read-only/);
-  assert.deepEqual(plugin.writes, []);
+  await store.upsert("assets/first.png", "assets/first.webp");
+  await store.upsert("assets/second.png", "assets/second.webp");
+  assert.deepEqual(store.snapshot().map(r => r.originalPath), ["assets/second.png", "assets/first.png"]);
+
+  await store.upsert("assets/first.png", "assets/first-v2.webp");
+  assert.deepEqual(store.snapshot().map(r => r.originalPath), ["assets/first.png", "assets/second.png"]);
+
+  await store.markOperation("assets/second.png", "assets/second.webp", "replaced");
+  assert.deepEqual(store.snapshot().map(r => r.originalPath), ["assets/second.png", "assets/first.png"]);
+  assert.equal(store.snapshot()[0].lastOperation, "replaced");
+});
+
+test("compareAndRemove removes only when both originalPath and compressedPath still match (D01)", async () => {
+  const plugin = createPlugin();
+  const store = new ImageCompressionRecordStore(plugin);
+  await store.init();
+  await store.upsert("assets/a.png", "assets/b.webp");
+  await store.upsert("assets/b.webp", "assets/c.webp");
+
+  // Simulate race: A->B updated to A->D before stale cleanup arrives
+  await store.upsert("assets/a.png", "assets/d.webp");
+  const removedStale = await store.compareAndRemove("assets/a.png", "assets/b.webp");
+  assert.equal(removedStale, false);
+  assert.equal(store.snapshot().find(r => r.originalPath === "assets/a.png")?.compressedPath, "assets/d.webp");
+
+  // Matching A->D removes ONLY A->D and does not cascade to B->C
+  const removedMatch = await store.compareAndRemove("assets/a.png", "assets/d.webp");
+  assert.equal(removedMatch, true);
+  assert.deepEqual(store.snapshot().map(r => r.originalPath), ["assets/b.webp"]);
+});
+
+test("dryRunRecordMigration is read-only and preserves ambiguous or colliding legacy records (I-01)", async () => {
+  const records = [
+    { originalPath: "assets/a%20b.png", compressedPath: "assets/a%20b.webp", updatedAt: 1, lastOperation: "replaced" },
+    { originalPath: "assets/both%20exist.png", compressedPath: "assets/both.webp", updatedAt: 2, lastOperation: "replaced" },
+    { originalPath: "assets/missing%20all.png", compressedPath: "assets/missing.webp", updatedAt: 3, lastOperation: "replaced" },
+    { originalPath: "assets/collide%20x.png", compressedPath: "assets/cx.webp", updatedAt: 4, lastOperation: "replaced" },
+    { originalPath: "assets/collide x.png", compressedPath: "assets/cx2.webp", updatedAt: 5, lastOperation: "replaced" },
+  ];
+  const present = new Set([
+    "assets/a b.png",
+    "assets/a b.webp",
+    "assets/both%20exist.png",
+    "assets/both exist.png",
+    "assets/both.webp",
+    "assets/collide x.png",
+    "assets/cx.webp",
+    "assets/cx2.webp",
+  ]);
+  const report = await dryRunRecordMigration(records, async path => (present.has(path) ? "present" : "unknown"));
+  assert.equal(report.migratableCount, 1);
+  assert.equal(report.entries[0].canMigrate, true);
+  assert.equal(report.entries[0].nextRecord.originalPath, "assets/a b.png");
+  assert.equal(report.entries[0].nextRecord.compressedPath, "assets/a b.webp");
+
+  assert.equal(report.entries[1].canMigrate, false);
+  assert.equal(report.entries[1].original.status, "ambiguous-both-present");
+  assert.equal(report.entries[2].canMigrate, false);
+  assert.equal(report.entries[2].original.status, "ambiguous-both-unreachable");
+  assert.equal(report.entries[3].canMigrate, false);
+  assert.equal(report.entries[3].original.status, "ambiguous-collision");
+  assert.ok(report.diagnostics.length >= 3);
 });
 
 test("stale status updates cannot overwrite a newer compressed path", async () => {
@@ -171,4 +255,3 @@ test("reloadLoadedImageRecords skips uninitialized plugin and reloads initialize
   assert.equal(store.snapshot()[0].compressedPath, "assets/init-v2.webp");
   assert.ok(loadCalls >= 2);
 });
-

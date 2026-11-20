@@ -5,6 +5,7 @@ export type ImageSkipReason =
   | "video"
   | "animated-format"
   | "vector-format"
+  | "unsupported-format"
   | "excluded-extension";
 
 export type ImageCandidateDecision =
@@ -17,10 +18,22 @@ export interface ImageCandidateInput {
   excludedExtensions: readonly string[];
 }
 
+export const DRAWING_DIRECTORY = /(?:^|[\\/])drawings?[\\/]/i;
+
+const SUPPORTED_STATIC = new Set(["png", "jpg", "jpeg", "webp"]);
+
 const VIDEO_EXTENSIONS = new Set([
   "mp4", "m4v", "mov", "avi", "wmv", "flv", "mkv", "webm", "3gp", "ogv",
   "mpeg", "mpg", "mts", "m2ts", "ts", "vob", "asf", "rm", "rmvb", "f4v",
 ]);
+
+export function isProtectedDrawingPath(rawPath: string): boolean {
+  return /excalidraw/i.test(rawPath) || DRAWING_DIRECTORY.test(rawPath);
+}
+
+export function isWebpManualAllowed(extension: string, mode: CompressionMode): boolean {
+  return extension === "webp" && (mode === "manual-dialog" || mode === "manual-quick");
+}
 
 function normalizedPath(raw: string): string {
   let path = raw;
@@ -42,14 +55,15 @@ function extensionOf(path: string): string {
 
 /**
  * Pure classifier evaluating image candidates before disk read or download.
- * Excludes videos, excalidraw/drawings, vector formats (SVG), animated formats (GIF, APNG),
- * and user-excluded extensions (with an exception for WebP in manual-dialog mode).
+ * Excludes videos, excalidraw/drawings directories, vector formats (SVG), animated formats (GIF, APNG),
+ * unsupported non-empty static extensions (preserving extensionless CDN URLs),
+ * and user-excluded extensions (allowing static WebP in manual-dialog and manual-quick modes).
  */
 export function classifyImageCandidate(input: ImageCandidateInput): ImageCandidateDecision {
   const path = normalizedPath(input.path);
   const extension = extensionOf(path);
 
-  if (/excalidraw/i.test(path) || /(?:^|\/)drawings?(?:[\/._-]|$)/i.test(path)) {
+  if (isProtectedDrawingPath(path)) {
     return { eligible: false, reason: "excalidraw", extension };
   }
   if (VIDEO_EXTENSIONS.has(extension)) {
@@ -61,9 +75,12 @@ export function classifyImageCandidate(input: ImageCandidateInput): ImageCandida
   if (extension === "svg") {
     return { eligible: false, reason: "vector-format", extension };
   }
+  if (extension !== "" && !SUPPORTED_STATIC.has(extension)) {
+    return { eligible: false, reason: "unsupported-format", extension };
+  }
   if (
     input.excludedExtensions.includes(extension) &&
-    !(extension === "webp" && input.mode === "manual-dialog")
+    !isWebpManualAllowed(extension, input.mode)
   ) {
     return { eligible: false, reason: "excluded-extension", extension };
   }

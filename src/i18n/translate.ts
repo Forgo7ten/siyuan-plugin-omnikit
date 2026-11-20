@@ -7,8 +7,12 @@ export function translate(source: Record<string, unknown> | undefined, key: stri
   const value = source?.[key];
   if (typeof value !== "string") return key;
   if (!values || Object.keys(values).length === 0) return value;
-  return value.replace(/\$\{([a-zA-Z0-9_]+)\}|\{([a-zA-Z0-9_]+)\}/g, (_match, name1: string | undefined, name2: string | undefined) => {
+  return value.replace(/\$\{([a-zA-Z0-9_]+)\}|\{([a-zA-Z0-9_]+)\}/g, (match, name1: string | undefined, name2: string | undefined) => {
     const placeholder = name1 ?? name2 ?? "";
-    return String(values[placeholder] ?? "");
+    if (!Object.hasOwn(values, placeholder)) return match;
+    const replacement = values[placeholder];
+    // @compat Keep the raw placeholder when a caller forgets an argument: a visible
+    // `${count}` is diagnosable, an empty string is not.
+    return replacement === undefined ? match : String(replacement);
   });
 }

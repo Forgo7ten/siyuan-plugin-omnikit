@@ -52,7 +52,7 @@ async function fetchDirect(options: FetchTitleResourceOptions, timeoutMs: number
   }
   const timeoutController = new AbortController();
   const timeout = setTimeout(() => timeoutController.abort(new DOMException("Request timed out", "TimeoutError")), timeoutMs);
-  const onAbort = () => timeoutController.abort(options.signal?.reason);
+  const onAbort = () => timeoutController.abort(options.signal?.reason ?? new DOMException("Operation cancelled", "AbortError"));
   options.signal?.addEventListener("abort", onAbort, { once: true });
   const cleanup = () => {
     clearTimeout(timeout);
@@ -73,27 +73,41 @@ async function fetchDirect(options: FetchTitleResourceOptions, timeoutMs: number
       status: response.status,
       ok: response.ok,
       contentType: response.headers.get("content-type") ?? "",
-      body: withLifecycle(response.body, cleanup, options.signal),
+      body: withLifecycle(response.body, cleanup, timeoutController.signal, options.signal),
     };
   } catch (error) {
     cleanup();
+    if (timeoutController.signal.aborted && !options.signal?.aborted) {
+      throw new DOMException("Request timed out", "TimeoutError");
+    }
     throw error;
   }
 }
 
-async function fetchThroughProxy(options: FetchTitleResourceOptions, timeoutMs: number): Promise<TitleResource> {
-  // SiYuan's /api/network/forwardProxy returns a complete base64-encoded body rather than a stream;
-  // decode only the bounded prefix required for head/title inspection.
-  const response = await options.kernelClient.post<ForwardProxyData>("/api/network/forwardProxy", {
+async function requestProxy(
+  options: FetchTitleResourceOptions,
+  timeoutMs: number,
+  extraHeaders: Array<Record<string, string>>,
+): Promise<{ data: ForwardProxyData }> {
+  return options.kernelClient.post<ForwardProxyData>("/api/network/forwardProxy", {
     url: options.url,
     method: "GET",
     timeout: timeoutMs,
     responseEncoding: "base64",
-    headers: [
-      { "User-Agent": options.userAgent },
-      { Referer: "" },
-    ],
+    headers: [{ "User-Agent": options.userAgent }, { Referer: "" }, ...extraHeaders],
   }, { signal: options.signal, timeout: timeoutMs });
+}
+
+async function fetchThroughProxy(options: FetchTitleResourceOptions, timeoutMs: number): Promise<TitleResource> {
+  // Request the first 64 KiB via Range to limit proxy payload size on Range-capable servers,
+  // and pass Accept-Encoding: identity under kernel DisableAutoDecode() to avoid transport ambiguity.
+  let response = await requestProxy(options, timeoutMs, [
+    { Range: `bytes=0-${DEFAULT_MAX_BYTES - 1}` },
+    { "Accept-Encoding": "identity" },
+  ]);
+  if (response.data?.status === 416) {
+    response = await requestProxy(options, timeoutMs, [{ "Accept-Encoding": "identity" }]);
+  }
   const data = response.data;
   if (data.bodyEncoding !== "base64" && data.bodyEncoding !== "base64-std") {
     throw new Error(`Unexpected forward proxy encoding: ${data.bodyEncoding}`);
@@ -174,18 +188,19 @@ function positiveTimeout(value?: number): number {
 function withLifecycle(
   stream: ReadableStream<Uint8Array>,
   cleanup: () => void,
-  signal?: AbortSignal,
+  timeoutSignal: AbortSignal,
+  callerSignal?: AbortSignal,
 ): ReadableStream<Uint8Array> {
   const reader = stream.getReader();
   const onAbort = () => {
-    void reader.cancel(signal?.reason).catch(() => undefined);
+    void reader.cancel(timeoutSignal.reason).catch(() => undefined);
   };
-  signal?.addEventListener("abort", onAbort, { once: true });
+  timeoutSignal.addEventListener("abort", onAbort, { once: true });
   let finished = false;
   const finish = () => {
     if (finished) return;
     finished = true;
-    signal?.removeEventListener("abort", onAbort);
+    timeoutSignal.removeEventListener("abort", onAbort);
     cleanup();
   };
   return new ReadableStream<Uint8Array>({
@@ -200,7 +215,11 @@ function withLifecycle(
         }
       } catch (error) {
         finish();
-        controller.error(error);
+        if (timeoutSignal.aborted && !callerSignal?.aborted) {
+          controller.error(new DOMException("Request timed out", "TimeoutError"));
+        } else {
+          controller.error(error);
+        }
       }
     },
     async cancel(reason) {

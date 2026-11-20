@@ -1,10 +1,10 @@
 export const DEFAULT_TITLE_CACHE_CAPACITY = 100;
 export const DEFAULT_TITLE_CACHE_TTL_MS = 5 * 60 * 1000;
+const EPOCH_SHIFT = 2 ** 26;
 
 interface CacheEntry {
   readonly title: string;
   readonly expiresAt: number;
-  readonly generation: number;
 }
 
 export interface TitleCacheOptions {
@@ -13,13 +13,14 @@ export interface TitleCacheOptions {
   now?: () => number;
 }
 
-/** In-memory LRU with generation checks that reject stale asynchronous responses. */
+/** In-memory LRU with per-URL generations and epoch invalidation on clear(). */
 export class TitleCache {
   private readonly entries = new Map<string, CacheEntry>();
   private readonly capacity: number;
   private readonly ttlMs: number;
   private readonly now: () => number;
-  private generation = 0;
+  private epoch = 0;
+  private readonly generations = new Map<string, number>();
 
   constructor(options: TitleCacheOptions = {}) {
     this.capacity = options.capacity ?? DEFAULT_TITLE_CACHE_CAPACITY;
@@ -51,32 +52,34 @@ export class TitleCache {
   }
 
   /** Capture before a request; pass the token to set when the response arrives. */
-  captureGeneration(_url: string): number {
-    return this.generation;
+  captureGeneration(url: string): number {
+    return this.epoch * EPOCH_SHIFT + (this.generations.get(url) ?? 0);
   }
 
-  /** Returns false after any newer manual refresh or clear invalidates the token. */
+  /** Returns false after a newer manual refresh or any clear invalidates the token. */
   set(url: string, title: string, expectedGeneration: number): boolean {
-    if (expectedGeneration !== this.generation) return false;
-    this.store(url, title, this.generation);
+    if (expectedGeneration !== this.captureGeneration(url)) return false;
+    this.store(url, title);
     return true;
   }
 
-  /** Manual refresh advances the generation so older in-flight responses cannot win. */
+  /** Manual refresh advances this URL's generation so older in-flight responses cannot win. */
   refresh(url: string, title: string): number {
-    this.generation += 1;
-    this.store(url, title, this.generation);
-    return this.generation;
+    const next = (this.generations.get(url) ?? 0) + 1;
+    this.generations.set(url, next);
+    this.store(url, title);
+    return this.epoch * EPOCH_SHIFT + next;
   }
 
   clear(): void {
-    this.generation += 1;
+    this.epoch += 1;
+    this.generations.clear();
     this.entries.clear();
   }
 
-  private store(url: string, title: string, generation: number): void {
+  private store(url: string, title: string): void {
     this.entries.delete(url);
-    this.entries.set(url, { title, expiresAt: this.now() + this.ttlMs, generation });
+    this.entries.set(url, { title, expiresAt: this.now() + this.ttlMs });
     this.pruneExpired();
     while (this.entries.size > this.capacity) {
       const oldest = this.entries.keys().next().value as string | undefined;

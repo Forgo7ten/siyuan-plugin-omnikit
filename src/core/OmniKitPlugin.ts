@@ -77,14 +77,14 @@ export class OmniKitPlugin extends Plugin {
     }
     let featureContext: FeatureContext | undefined;
     if (!this.settingsInstance) {
+      const feedback = new UiFeedback(undefined, (msg, timeout, type) => showMessage(msg, timeout, type));
       const menus = new MenuRegistry(
         id => this.manager?.isRunning(id) === true,
         error => this.logger.error("菜单操作失败", error),
         this.logger,
-        () => showMessage(this.t("menu.featureInactive"), 3000),
+        () => feedback.notify(this.t("menu.featureInactive"), "info", { timeout: 3000 }),
       );
       this.menuRegistry = menus;
-      const feedback = new UiFeedback(undefined, (msg, timeout, type) => showMessage(msg, timeout, type));
       this.statusBar = new PluginStatusBar();
       featureContext = {
         plugin: this,

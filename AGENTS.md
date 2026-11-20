@@ -1,166 +1,28 @@
-# OmniKit 开发者与 AI Agent 协作最高准则 (AGENTS.md)
+# OmniKit 开发约束 (AGENTS.md)
 
-> **适用范围**：所有参与 OmniKit 项目开发、维护、重构的 AI Agent（包括各级 Subagent、Swarm Worker）以及人类开发者。  
-> **生效状态**：强制生效（Project Constitution）。本文件为 OmniKit 全平台常驻工程宪章与安全底线，任何代码提交与变更必须无条件遵循本文件规定的准则与红线。
+## 1. 思源官方源码核实
 
----
+- 制定技术方案、调用宿主 API 或判断思源底层行为时，必须对照本地官方源码 `$(ghq root)/github.com/siyuan-note/siyuan`（及 `$(ghq root)/github.com/siyuan-note/petal`、`node_modules/siyuan` 类型声明）进行核实，重点覆盖前端 `app/src/protyle/` 与后端 `kernel/api/`、`kernel/model/`、`kernel/apicontract/`。
+- 讨论方案或编写代码时，必须严格区分源码已确认事实（附路径与行号）与拟议草案，严禁将未落地的示例符号当作现成 API 使用。
+- 思源前端事件触发（如上传 `onComplete`、粘贴或 DOM 变更）可能早于编辑器 `/api/transactions` 提交与内核落盘；涉及写回的位置核验与基线获取必须以内核读接口返回为准，不以事件触发或前端 DOM 推断持久化完成。
 
-## 0. 导言与效力说明 (Preamble & Legal Validity)
+## 2. 文档体系与 Spec-First 约束
 
-OmniKit 是面向思源笔记（SiYuan Note）的生产级多合一工具箱插件。为了在长周期的特性演进、多智能体协同开发以及高敏感的笔记数据操作中保障系统的稳定性、纯粹性与数据安全，特制定本准则。
+- **文档分工与定位**：
+  - [`docs/CORE-PRD.md`](docs/CORE-PRD.md)：平台微内核与通用服务产品需求；
+  - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：全局微内核架构、分层边界、跨端适配与构建契约；
+  - `docs/features/<name>/PRD.md`：特性产品规格（只写功能范围、交互行为、业务规则与验收边界，不写内部类名、私有函数或实现细节）；
+  - `docs/features/<name>/DESIGN.md`：特性技术设计（只写模块拆分、接口时序、数据结构、状态流转与容错细节）。
+- **先对齐文档再实现代码**：新增需求或变更既有行为时，必须先读取并更新相关 `docs/` 文档（按需覆盖 `CORE-PRD.md`、`ARCHITECTURE.md` 及目标特性的 `PRD.md`、`DESIGN.md`），确认跨文档无口径冲突后，方可修改 `src/` 与 `tests/`；严禁未经文档定义擅自增减界面控件（按钮、菜单、快捷键）、设置选项或持久化文件。
+- **终态客观陈述**：`docs/` 下所有文档必须客观陈述当前现行终态实现，严禁写入“不再/改为/废弃旧逻辑”等演进对比与过渡性措辞（历史差异仅保留在提交记录或独立审查报告中）。
 
-### 0.1 法律效力与层级
-- **最高宪法地位**：本准则的法律效力高于任何口头约定或临时提示词。若开发人员或 Agent 发现实现代码与本准则产生冲突，必须以本准则为唯一依据对代码进行修正。
-- **全平台常驻约束**：本文件作为常驻系统级约束，定义跨功能通用的核心铁律、架构底线与安全防线，杜绝任何特定业务特性的过渡性假设。
+## 3. 通用架构与宿主安全底线
 
-### 0.2 文档分工与权威索引
-- **平台架构规范**：平台的全局架构分层、模块交互与核心设计模式详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)；
-- **平台核心 PRD**：核心平台能力、微内核生命周期与通用服务规格详见 [`docs/CORE-PRD.md`](docs/CORE-PRD.md)；
-- **特性业务 PRD**：各具体业务特性（如图片压缩、PDF 工具、格式转换等）的产品规格、业务逻辑与时序推演详见 [`docs/features/`](docs/features/) 下对应的特性 PRD 文档。
+- Feature 之间禁止相互 `import`，跨特性通用能力统一沉淀至 `src/core/` 或 `src/ui/`，Core 代码中不得出现针对具体 Feature ID 的硬编码分支。
+- 严禁直接修改 `.sy` 文档、SQLite 数据库或绕过内核直接扫描、读写、删除工作区 `assets/`；严禁向工作区写入临时日志或 `.tmp` 缓存文件；`/api/query/sql` 仅限只读辅助查询。
+- 思源内核写接口（`/api/block/updateBlock`）不提供原子 CAS，写前须经内核读接口核验目标内容未变化、冲突即放弃，响应状态未知的写操作严禁盲目自动重试；具体持久化契约与资产管理规则以对应 `docs/` 规范为准。
 
----
+## 4. 交付与验证门禁
 
-## 1. 核心准则 1：PRD 先行与唯一权威性 (Spec-First / PRD-First)
-
-### 1.1 代码实现永远“追着文档走”
-- **文档是唯一的真理之源**：业务代码（`src/` 目录下所有实现）必须且只能是 PRD 与架构规范的物理落地。代码实现绝不能超前于文档，更不允许“先写代码，后补文档”。
-- **严禁擅自臆想功能**：严禁脱离 PRD 文档自行增减功能行为、修改交互流程、随意添加用户界面元素（例如未定义的按钮、快捷键或菜单项）、擅自增加设置选项或更改持久化路径。
-- **新功能准入流程**：
-  1. 在 `docs/features/<feature-name>/PRD.md` 编写完整的特性业务与约束 PRD；
-  2. 经过评审并完成需求冻结（Spec-Freeze）；
-  3. 按照 PRD 规划技术实现架构，在 `docs/features/<feature-name>/DESIGN.md` 与 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 完成技术设计；
-  4. 方可启动 `src/features/<feature-name>/` 下的代码开发与自动化测试。
-
-### 1.2 变更同步要求
-- 若在开发或测试过程中发现 PRD 存在设计疏漏或与思源底层行为不符，**必须先停止代码修改**，向用户或主 Agent 提出文档修订申请，经确认并更新相关 PRD 文档后，方可推进对应代码变更。
-
-### 1.3 客观描述与杜绝中间态措辞 (Objective Specification & Zero Transitional Phrasing)
-- **文档是终态真理之源**：`docs/` 下的所有 PRD 与架构规范文档必须且只能客观、确定性地描述**当前系统的现行规格与终态实现**。项目中已经不存在旧实现或废弃原型，严禁在文档中残留演进过程中的中间态描述。
-- **杜绝演进对比与废弃说明**：严禁在文档中使用描述开发过渡、版本对比或废弃清理的措辞（如“不再维护专属 UA”、“废除历史陈旧文案”、“改为...”、“保持版本 X 不升版”、“清理死代码与废弃逻辑”等）。凡涉及当前特性的行为、配置与限制，一律采用客观陈述与现行技术规范直接叙述（例如：“外链图片下载统一使用 Core 平台配置的全局 User-Agent；特性层不设立专属 UA 配置项”）。
-- **区分业务概念与开发过渡**：思源原生概念（如“存量笔记”、“文档历史版本 Doc History”、“事务撤销历史 Undo History”）以及运行时代际概念（如“作废先前在途请求”）属于客观业务与技术契约，应予保留；文档中严禁包含任何描述插件代码自身历史演进过程的过渡性表述。
-
----
-
-## 2. 核心准则 2：技术依据来源 (Authoritative Technical References)
-
-任何技术选型、API 契约判断、时序设计与代码编写，必须遵循官方与源码级的依据链，严禁根据经验或第三方非官方推测假设思源的行为。
-
-### 2.1 技术依据层级链 (Hierarchy of Truth)
-1. **第一级（最高权威）：SiYuan 官方源代码**
-   - 官方仓库：[`siyuan-note/siyuan`](https://github.com/siyuan-note/siyuan)
-   - 本地源码基准：本地克隆的思源官方源码（如 `~/ghq/github.com/siyuan-note/`，在制定技术方案与分析契约时直接参考本地该目录）
-   - 前端 Protyle 编辑器事件管道与上传实现：`app/src/protyle/`、`app/src/protyle/upload/`；
-   - 后端内核 API 契约与操作处理：`kernel/api/`、`kernel/model/`、`kernel/apicontract/`；
-   - 官方类型定义：`app/src/types/`。
-2. **第二级：SiYuan Plugin 官方插件开发规范与 SDK**
-   - 官方插件架构范式、生命周期约束、国际化规范与多端适配规则。
-3. **第三级：SiYuan 官方 API 文档**
-   - 官方公开的 REST API 契约、块属性规范、SQL 查询规范与资源操作手册。
-
-### 2.2 契约防误判规范
-- **禁止假设原子 CAS**：思源内核块更新 API（`/api/block/updateBlock`）不提供原子比较并交换（Compare-And-Swap）机制。不得假定系统具备悲观行锁，必须在插件层实现“写前读回比对（Read-Before-Write Verification）”与进程内串行写租约（Write Lease）进行安全防范。
-- **禁止混淆事件与持久化**：思源前端事件触发（例如上传完成、输入完成、UI 渲染）不等于内核块已落盘持久化。必须显式通过内核接口获取或核验已落盘的真实数据。
-
----
-
-## 3. 核心准则 3：Core 与 Feature 绝对解耦 (Strict Core-Feature Decoupling)
-
-OmniKit 采用严格的微内核（Microkernel）插件化架构，核心平台（Core）与业务功能（Feature）界限分明。平台整体架构与通信契约详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
-
-```
-┌────────────────────────────────────────────────────────┐
-│                      Host (SiYuan)                     │
-└───────────────────────────▲────────────────────────────┘
-                            │
-┌───────────────────────────┴────────────────────────────┐
-│                  OmniKit Plugin Core                   │
-│   (KernelClient / JsonStore / MenuRouter / Dock / UI)  │
-└───────────▲───────────────────────────────▲────────────┘
-            │ 严格单向契约依赖              │ 严格单向契约依赖
-┌───────────┴──────────┐        ┌───────────┴──────────┐
-│      Feature A       │        │      Feature B       │
-│ (独立业务逻辑/独立数据)│ ◄─禁止─►│ (独立业务逻辑/独立数据)│
-└──────────────────────┘ 相互依赖 └──────────────────────┘
-```
-
-### 3.1 跨 Feature 强隔离
-- **禁止跨 Feature 依赖**：Feature 之间彼此绝对独立、互不知晓。严禁在 `src/features/<feature-a>` 中直接 import 或调用 `src/features/<feature-b>` 的任何类、函数、常量、状态或类型定义。
-- **Feature 零感知**：Core 在装配 Feature 时仅通过标准元数据契约（`FeatureRegistration<T>`）交互。Core 核心代码中严禁出现针对具体 Feature ID 的硬编码业务分支或特殊处理逻辑。
-
-### 3.2 通用能力下沉至 Core
-- 所有跨功能的共性机制必须且只能沉淀在 `src/core/` 或 `src/ui/`，包括但不限于：
-  - 思源内核网络调用与错误处理：`KernelClient`
-  - 结构化 JSON 持久化与防写冲突：`JsonStore`
-  - 统一日志与调试开关：`Logger`
-  - 环境识别与平台判断：`Platform`
-  - 统一侧边栏容器与 Tab 调度：Unified Dock
-  - 统一菜单路由与安全校验：`MenuRouter`、`MenuRegistry`
-  - 统一设置面板外壳：响应式多端联动设置组件
-- Feature 仅作为业务实现者，通过 `BaseFeature` 与 `FeatureScope` 面向 Core 提供的标准契约编程。
-
----
-
-## 4. 核心准则 4：存储命名与重置边界规范 (Storage Naming & Reset Boundaries)
-
-OmniKit 的持久化文件严格划分为 **Core 平台配置**、**Feature 用户设置（Settings）** 和 **Feature 业务数据（Data Records）** 三大类别，遵循明确的文件命名法则与完全隔离的重置生命周期。各特性的存储结构定义详见对应的业务 PRD。
-
-### 4.1 文件命名法则
-| 存储类别 | 规范化文件名格式 | 示例 | 职责范围 |
-|---|---|---|---|
-| **Core 平台配置** | `omnikit-core.json` | `omnikit-core.json` | 插件全局通用配置、调试日志级别、各 Feature 的启用/禁用首选项状态等 |
-| **Feature 用户设置** | `feature-{featureid}-settings.json` | `feature-image-compressor-settings.json`<br>`feature-pdf-tools-settings.json` | 用户在设置面板可配置的 Feature 行为参数（如质量阈值、白名单、转换格式等偏好） |
-| **Feature 业务数据** | `feature-{featureid}-{dataname}.json` | `feature-image-compressor-records.json`<br>`feature-ocr-records.json` | 功能在运行过程中沉淀的核心业务数据（如输入与产物映射记录、索引表、操作历史等） |
-
-### 4.2 重置边界防线
-- **规则 1：设置重置绝对严禁触碰数据文件 (Reset Settings Scope Guard)**  
-  无论是单个 Feature 的“重置设置”，还是插件全局的“恢复默认设置”，**操作作用域严格限定为 `omnikit-core.json` 与 `feature-*-settings.json`**。任何设置重置逻辑在代码层面绝对禁止读取、覆盖或删除任何 `feature-*-{dataname}.json` 业务数据文件！
-- **规则 2：业务数据必须独立管理与确认 (Isolated Data Management)**  
-  业务数据记录的清理绝对禁止与设置重置混杂，且不主动删除任何物理图片或资源资产。现行单条业务记录移除由对应特性提供的专门视图（如 Dock 记录面板“移除记录”）显式操作；插件总设置内面向数据文件级的集中清空界面（展示数据文件名、记录条数、占用体积并经二次确认清空全部插件业务数据）作为独立的“数据管理 (Data Management)”专区规划能力进行演进，详见 [`docs/CORE-PRD.md`](docs/CORE-PRD.md)。
-
----
-
-## 5. 核心准则 5：数据与安全底线 (Data & Safety Bottom Lines)
-
-涉及思源笔记内容修改与附件处理的操作，必须坚守以下五条铁律安全红线。各特性具体的处理时序与算法细节详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 与各特性 PRD。
-
-### 5.1 零工作区垃圾文件 (Zero Workspace Pollution)
-- 严禁向思源工作区（包括 `data/`、`data/storage/`、`data/assets/` 等目录）写入临时日志文件、任务排队日志、调试 dump 文件或 `.tmp` 缓存。
-- 崩溃与容灾依托思源原生强大的文档历史版本（Doc History）、块历史版本（Block History）以及数据仓库快照。插件层保持无状态运行与最小数据持久化，彻底避免污染用户的多端云同步环境。
-
-### 5.2 严禁主动删除用户资源与生成资产 (Zero Active Deletion)
-- 插件在任何运行阶段（包括处理成功后、完成引用替换后、用户移除业务记录或重置设置时），**绝对严禁主动调用思源 API 或底层文件系统接口去删除用户的原始附件或已生成的产物资产**。
-- 附件资产的生命周期与清理完全交还给用户及思源原生自带的“清理未引用资源”功能。插件绝不充当资源文件的物理删除者。
-
-### 5.3 块级精确改写 (Occurrence-Level Precision)
-- **禁止全局资源级盲目重链接**：严禁调用思源 `/api/asset/relinkAsset` 进行跨文档、跨数据库的全局盲目重链接。
-- **唯一位置比对改写**：任何对笔记内容或资源引用的修改，必须精确锁定目标位置契约（`OccurrenceTarget`：包含 `rootID`、`blockID`、目标元素在块内的有序序号 `ordinal`、修改前特征 `oldValue/oldPath` 等），杜绝模糊匹配与范围扩散。
-- **写前校验与冲突放弃 (Read-Before-Write Verification)**：调用内核 `/api/block/updateBlock` 前，必须重读块真实数据，严格校验目标位置与内容未发生并发篡改或外部编辑覆盖；若发生变更，必须安全放弃当前位置改写并记录告警，绝不强行覆盖。
-- **严禁 SQL 写入**：思源 SQL API（`/api/query/sql`）仅允许作为只读索引辅助查询，严禁执行任何 `UPDATE`、`DELETE`、`INSERT` 语句。
-
-### 5.4 持久化前置闸门 (Persistence-First Gate)
-- 当异步流水线生成了新的衍生资产（如处理后的衍生文件、生成内容、新附件）后，**必须先将业务记录（如原始输入→生成产物的映射记录与元数据）成功持久化写入磁盘 JSON 文件并收到写入确认，才允许发起对笔记中内容或引用的自动替换**。
-- 若持久化发生异常、写入失败或超时，后续的自动替换流程必须立即无条件阻断，保留已生成的资源并向用户提示可供复制的资源路径，绝不允许产生“笔记已改写但插件无法追踪记录”的游离状态。
-
-### 5.5 无主动取消与生命周期安全中断 (No Manual Cancel & Safe Abort)
-- **不设用户主动取消机制**：后台异步任务执行过程中不提供用户可操作的“取消任务”按钮、菜单项或公开取消接口，避免人为中断导致状态半持久化或引用半改写。
-- **系统生命周期安全中止**：当所属 Feature 被动态禁用、插件卸载或宿主退出时，通过 `FeatureScope.signal`（AbortSignal）广播中断信号。异步任务感知信号后，**仅安全停止未执行的后续步骤，严格保留已确认上传和已持久化的产物与记录，严禁任何形式的事务回滚**。应用重启后不自动恢复在途任务，保持无状态。
-
-### 5.6 零绝对路径与隐私安全底线 (Zero Absolute Path & Privacy Protection)
-- **严禁写入本机绝对路径与用户名**：项目内部所有 Markdown 文档、注释、配置文件及源码中，**严禁硬编码任何包含本地操作系统用户名（如 `/home/<user>/`、`C:\Users\<user>\`）或 `file:///` 协议的绝对路径**。
-- **文档链接必须使用相对路径**：所有仓库内文档之间的跳转与引用，必须且只能使用标准的相对路径（如 `[AGENTS.md](../AGENTS.md)`），违者视为严重安全隐患阻断提交。
-
----
-
-## 6. 开发与代码审查自查清单 (Review Checklist)
-
-在提交任何代码前，AI Agent 与人类开发者必须逐项核对以下清单：
-
-- [ ] **PRD 依从性**：新增或修改的代码是否严格符合对应的 [`docs/CORE-PRD.md`](docs/CORE-PRD.md) 或 [`docs/features/*/PRD.md`](docs/features/)？是否有私自增加的 UI 按钮、未定义的设置项或未记录的副作用？
-- [ ] **解耦性**：新增的 Feature 代码是否完全自包含在自己的目录中？是否存在对其他 Feature 的直接 import？
-- [ ] **存储合规**：新引入的持久化文件是否严格符合 `feature-{featureid}-settings.json` 或 `feature-{featureid}-{dataname}.json` 的命名规范？重置设置时是否绝对不会影响数据文件？
-- [ ] **资源安全性**：代码中是否不存在任何主动删除用户文件或资产产物的行为？是否存在向思源工作区写入非必要临时文件的行为？
-- [ ] **改写安全性**：块修改是否采用 `OccurrenceTarget` 精确比对？是否在写入前重新读取了块进行二次校验？
-- [ ] **持久化闸门**：写回笔记引用前是否已确认业务记录写入磁盘？
-- [ ] **中断友好**：长时间异步循环是否检查了 `scope.signal.aborted`？
-- [ ] **隐私合规**：代码与文档中是否不存在任何本机绝对路径、用户家目录路径或隐私凭据？
-- [ ] **文档客观性**：文档中是否已彻底消除中间态描述与过渡性措辞（如“不再...”、“废除旧文案”、“保持版本不升版”等），是否始终面向现行终态规范进行客观陈述？
+- 界面文案变动必须同步保持 `src/i18n/zh-CN.json` 与 `src/i18n/en.json` 键名一致。
+- 变更交付前须真实执行并通过 `pnpm check`、`pnpm test`、`pnpm build`（涉及发布脚本或产物清单时补充 `pnpm package:verify`），只按实际运行结果如实汇报检查状态与验证范围。

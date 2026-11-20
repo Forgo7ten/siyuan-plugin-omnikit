@@ -53,7 +53,16 @@ export class SourceReader {
     options.signal?.addEventListener("abort", relay, { once: true });
     try {
       const url = source.kind === "asset" ? source.fetchURL : source.url;
-      const response = await this.fetcher(url, { credentials: source.kind === "asset" ? "same-origin" : "omit", referrerPolicy: "no-referrer", redirect: "error", signal: controller.signal });
+      // Align remote redirect semantics with host-native localization (follow platform-permitted HTTP(S) redirects).
+      const response = await this.fetcher(url, {
+        credentials: source.kind === "asset" ? "same-origin" : "omit",
+        referrerPolicy: "no-referrer",
+        redirect: "follow",
+        signal: controller.signal,
+      });
+      if (source.kind === "remote" && response.url) {
+        requireRemotePermission(response.url);
+      }
       return { blob: await boundedResponse(response, options.maxBytes, controller.signal), name: source.name };
     } finally { clearTimeout(timer); options.signal?.removeEventListener("abort", relay); }
   }

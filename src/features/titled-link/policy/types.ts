@@ -41,7 +41,6 @@ export type TitleFetchSource =
   | "hostname";
 
 export type TitleFetchFailureReason =
-  | "unsupported-url"
   | "network"
   | "timeout"
   | "http"
@@ -61,6 +60,7 @@ export type TitleFetchResult =
       readonly status: "failure";
       readonly url: string;
       readonly reason: TitleFetchFailureReason;
+      readonly httpStatus?: number;
       readonly error?: unknown;
     };
 

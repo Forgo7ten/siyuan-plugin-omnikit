@@ -64,15 +64,21 @@ export function clamp01(value: number): number {
 
 /**
  * Pre-multiplies alpha into RGB channels:
- * When alpha === 0, RGB is zeroed out to eliminate invisible background noise.
+ * - When alpha === 0, RGB is zeroed out to eliminate invisible background noise.
+ * - When 0 < alpha < 255, RGB is scaled by alpha/255 (not idempotent in place).
  */
 export function applyAlphaPremultiply(frame: PixelFrame): void {
   const data = frame.data;
   for (let i = 0; i < data.length; i += 4) {
-    if (data[i + 3] === 0) {
+    const alpha = data[i + 3];
+    if (alpha === 0) {
       data[i] = 0;
       data[i + 1] = 0;
       data[i + 2] = 0;
+    } else if (alpha < 255) {
+      data[i] = Math.round((data[i] * alpha) / 255);
+      data[i + 1] = Math.round((data[i + 1] * alpha) / 255);
+      data[i + 2] = Math.round((data[i + 2] * alpha) / 255);
     }
   }
 }

@@ -7,8 +7,10 @@
   "settingsWindow": true,
   "frontends": [
     "desktop",
+    "desktop-window",
     "mobile",
-    "browser-desktop"
+    "browser-desktop",
+    "browser-mobile"
   ],
   "backends": [],
   "displayName": {
@@ -24,6 +26,7 @@
     "zh-CN": "README.zh-CN.md"
   },
   "icon": "icon.png",
+  "preview": "preview.png",
   "keywords": [
     "toolkit",
     "工具箱",

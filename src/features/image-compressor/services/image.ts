@@ -184,10 +184,17 @@ export interface ImageCodec {
   ): Promise<EncodeResult>;
 }
 
-export async function verifyBitmap(blob: Blob, signal?: AbortSignal): Promise<{ width: number; height: number }> {
+const OUTPUT_VERIFY_MAX_EDGE = 64;
+
+export async function verifyBitmap(blob: Blob, signal?: AbortSignal, maxEdge?: number): Promise<{ width: number; height: number }> {
   if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
   if (typeof createImageBitmap === "function") {
-    const bitmap = await createImageBitmap(blob);
+    const options = typeof maxEdge === "number" && maxEdge > 0
+      ? { resizeWidth: maxEdge, resizeHeight: maxEdge, resizeQuality: "low" as const }
+      : undefined;
+    const bitmap = options
+      ? await createImageBitmap(blob, options)
+      : await createImageBitmap(blob);
     try {
       if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
       return { width: bitmap.width, height: bitmap.height };
@@ -242,9 +249,13 @@ export class BicEncoder implements ImageCodec {
     if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
     const c = config.compression;
     const ext = name.split(/[?#]/)[0].split(".").pop()?.toLowerCase() ?? "";
-    if (/excalidraw|(?:^|[\/\\])drawings?[\/\\._-]/i.test(name) ||
-        c.excludedExtensions.includes(ext) && !(ext === "webp" && mode === "manual-dialog")) {
+    const manualWebpAllowed = ext === "webp" && (mode === "manual-dialog" || mode === "manual-quick");
+    if (/excalidraw|(?:^|[\/\\])drawings?[\/\\]/i.test(name) ||
+        c.excludedExtensions.includes(ext) && !manualWebpAllowed) {
       return { kind: "skipped", reason: "protected-extension" };
+    }
+    if (ext !== "" && !["png", "jpg", "jpeg", "webp"].includes(ext)) {
+      return { kind: "skipped", reason: "unsupported-format" };
     }
     if (mode !== "manual-dialog" && blob.size < c.minInputBytes) return { kind: "skipped", reason: "below-minimum-input" };
     if (blob.size > c.maxInputBytes) throw new Error("Input exceeds byte limit");
@@ -278,7 +289,7 @@ export class BicEncoder implements ImageCodec {
         useWebWorker: true,
         libURL: this.libURL,
         signal: controller.signal,
-        preserveExif: false,
+        preserveExif: false, // TODO: expose preserveExif once the WebP encoder reliably preserves EXIF metadata.
         onProgress,
       });
 
@@ -289,15 +300,15 @@ export class BicEncoder implements ImageCodec {
       const actual = inspectImage(new Uint8Array(await output.arrayBuffer()));
       if (actual.mime !== "image/webp" || actual.animated) throw new Error("Encoder output signature mismatch");
 
-      const dimensions = await this.decode(output, controller.signal);
+      const dimensions = await this.decode(output, controller.signal, OUTPUT_VERIFY_MAX_EDGE);
       const strictDimensions = mode === "auto" || mode === "document";
       const expectedMaxEdge = strictDimensions ? Math.max(info.width, info.height)
         : Math.min(c.manualMaxEdge, Math.max(info.width, info.height));
       const expectedScale = Math.min(1, expectedMaxEdge / Math.max(info.width, info.height));
       const expectedWidth = Math.max(1, Math.floor(info.width * expectedScale));
       const expectedHeight = Math.max(1, Math.floor(info.height * expectedScale));
-      if (!dimensions.width || !dimensions.height || dimensions.width !== actual.width || dimensions.height !== actual.height
-        || Math.abs(dimensions.width - expectedWidth) > 1 || Math.abs(dimensions.height - expectedHeight) > 1) {
+      if (!dimensions.width || !dimensions.height || !actual.width || !actual.height
+        || Math.abs(actual.width - expectedWidth) > 1 || Math.abs(actual.height - expectedHeight) > 1) {
         throw new Error("Unexpected output dimensions");
       }
 
@@ -314,7 +325,8 @@ export class BicEncoder implements ImageCodec {
           originalBytes: blob.size,
           outputBytes: output.size,
           quality: c.initialQuality,
-          ...dimensions,
+          width: actual.width,
+          height: actual.height,
         },
       };
     } finally {

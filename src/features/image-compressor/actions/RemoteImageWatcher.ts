@@ -1,3 +1,4 @@
+import { isInsideProtectedContainer } from "../../../core/host/dom.ts";
 import type { FeatureScope } from "../../../core/framework/FeatureScope.ts";
 import { imagePath } from "../services/ImageOccurrenceResolver.ts";
 import type { ImageProcessingServices } from "../services/ImageProcessingServices.ts";
@@ -6,10 +7,8 @@ import type { OccurrenceTarget } from "../policy/contracts.ts";
 import { autoAllowed, type ImageConfig } from "../policy/parseImageConfig.ts";
 import { blockDOM, type DocumentRow } from "../services/references.ts";
 import { scanDOM } from "../policy/dom.ts";
-import { resolveSource, type ImageSource } from "../policy/source.ts";
+import { buildReplacementPath, resolveSource, type ImageSource } from "../policy/source.ts";
 import { classifyImageCandidate } from "../policy/ImageCandidateClassifier.ts";
-
-const PROTECTED_SELECTOR = "pre, code, script, style, [data-type='NodeCodeBlock'], [data-type='NodeBlockQueryEmbed'], .protyle-wysiwyg__embed";
 
 interface Candidate { blockID: string; source: ImageSource; count: number }
 export type RemoteWatcherLogger = Pick<Console, "warn">;
@@ -70,21 +69,21 @@ export async function watchRemoteImages(
   };
 
   const hasUnprotectedImage = (node: Node): boolean => {
-    if (!(node instanceof Element) || node.closest(PROTECTED_SELECTOR)) return false;
+    if (!(node instanceof Element) || isInsideProtectedContainer(node)) return false;
     if (node.matches("img")) return true;
-    return [...node.querySelectorAll("img")].some(img => !img.closest(PROTECTED_SELECTOR));
+    return [...node.querySelectorAll("img")].some(img => !isInsideProtectedContainer(img));
   };
   const observer = new MutationObserver(records => {
     let hasInsert = false;
     let hasRemoval = false;
     for (const record of records) {
       if (record.type === "attributes") {
-        if (record.target instanceof HTMLImageElement && !record.target.closest(PROTECTED_SELECTOR)) {
+        if (record.target instanceof HTMLImageElement && !isInsideProtectedContainer(record.target)) {
           hasInsert = true;
         }
         continue;
       }
-      if (record.target instanceof Element && record.target.closest(PROTECTED_SELECTOR)) continue;
+      if (record.target instanceof Element && isInsideProtectedContainer(record.target)) continue;
       if ([...record.addedNodes].some(hasUnprotectedImage)) hasInsert = true;
       else if ([...record.removedNodes].some(hasUnprotectedImage)) hasRemoval = true;
     }
@@ -194,7 +193,21 @@ export async function watchRemoteImages(
       const localized = await services.references.commitOccurrence(target, localOriginal, task.signal);
       if (localized !== "replaced" || !scope.active || task.signal.aborted) return;
 
-      const nextTarget = { ...target, oldPath: localOriginal };
+      const refreshedDOM = await blockDOM(services.kernel, target.blockID, target.notebook, task.signal);
+      const expectedLocalPath = buildReplacementPath(target.oldPath, localOriginal, services.origin);
+      const refreshedTemplate = document.createElement("template");
+      refreshedTemplate.innerHTML = refreshedDOM;
+      const refreshedRoots = [...refreshedTemplate.content.children]
+        .filter(node => node.getAttribute("data-node-id") === target.blockID);
+      if (refreshedTemplate.content.children.length !== 1 || refreshedRoots.length !== 1 || refreshedRoots[0].querySelector("[data-node-id]")) return;
+      const refreshedImg = [...refreshedRoots[0].querySelectorAll("img")][target.imageOrdinal];
+      if (!refreshedImg || imagePath(refreshedImg) !== expectedLocalPath) return;
+      const nextTarget: OccurrenceTarget = {
+        ...target,
+        oldPath: expectedLocalPath,
+        baselineBlockDOM: refreshedDOM,
+      };
+      if (!scope.active || task.signal.aborted) return;
 
       // prepareImage persists the Dock mapping before a compressed path is eligible for
       // replacement. A skipped format/threshold leaves the localized original in place.
@@ -280,7 +293,7 @@ export async function watchRemoteImages(
   const onSyncEnd = () => {
     paused = false;
     if (disposed || !scope.active || signal.aborted) return;
-    if (!autoAllowed(services.config(), doc.id)) { observing = false; return; }
+    if (!autoAllowed(services.config(), doc.id)) { stopWatching(); return; }
     void snapshot().then(value => {
       if (!disposed && scope.active && !paused) { previous = value; observe(); }
     }).catch(error => { if (!signal.aborted) logger.warn("同步后重建图片基线失败", error); });

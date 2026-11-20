@@ -14,7 +14,8 @@ export interface ReadTitleResourceOptions {
 
 const DEFAULT_MAX_BYTES = 64 * 1024;
 const OVERLAP_TAIL_CHARS = 64;
-const CLOSING_TAG_PATTERN = /<\/(?:title|head)\s*>/i;
+// Stop only at </head> so <meta property="og:title"> / twitter:title after an empty <title></title> are preserved.
+const HEAD_END_PATTERN = /<\/head\s*>/i;
 const LATIN1_DECODER = new TextDecoder("latin1");
 
 export async function readAndDecodeTitleResource(
@@ -58,9 +59,9 @@ export async function readAndDecodeStream(
       total += chunk.byteLength;
 
       const windowText = tail + LATIN1_DECODER.decode(chunk);
-      if (CLOSING_TAG_PATTERN.test(windowText)) {
+      if (HEAD_END_PATTERN.test(windowText)) {
         truncated = true;
-        await reader.cancel("HTML head metadata captured");
+        await reader.cancel("HTML head closed");
         break;
       }
       tail = windowText.length > OVERLAP_TAIL_CHARS

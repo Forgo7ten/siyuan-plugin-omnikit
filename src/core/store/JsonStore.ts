@@ -27,6 +27,22 @@ function serialize(value: unknown): string {
   return JSON.stringify(value);
 }
 
+/** Minimal shape the store needs; avoids re-wrapping the host Response. */
+interface StorageResponse {
+  status: number;
+  ok: boolean;
+  body: string;
+}
+
+function readKernelBody(text: string): { code?: number; msg?: string } | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    return value && typeof value === "object" ? (value as { code?: number; msg?: string }) : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * @design Every JSON document has its own queue and schema; features never share a
  * giant mutable settings object. Core switches and feature options are independent.
@@ -73,12 +89,13 @@ export class JsonStore<T> {
 
   async reload(): Promise<boolean> {
     return this.enqueue(async () => {
-      const before = this.fingerprint;
+      const beforeFingerprint = this.fingerprint;
+      const beforeReadOnlyReason = this.readOnlyReason;
       if (this.plugin.data && typeof this.plugin.data === "object") {
         delete this.plugin.data[this.file];
       }
       await this.readIntoMemory();
-      return before !== this.fingerprint;
+      return beforeFingerprint !== this.fingerprint || beforeReadOnlyReason !== this.readOnlyReason;
     });
   }
 
@@ -152,7 +169,7 @@ export class JsonStore<T> {
     return `/data/storage/petal/${pluginName}/${this.file}`;
   }
 
-  private async fetchStorageFile(path: string, timeoutMs: number): Promise<Response> {
+  private async fetchStorageFile(path: string, timeoutMs: number): Promise<StorageResponse> {
     const fetcher = this.fetchFn || globalThis.fetch;
     if (typeof fetcher !== "function") {
       throw new Error("No fetch implementation available");
@@ -160,79 +177,92 @@ export class JsonStore<T> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("Storage read timed out")), timeoutMs);
     try {
-      return await fetcher("/api/file/getFile", {
+      const response = await fetcher("/api/file/getFile", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path }),
         signal: controller.signal,
       });
+      // @safety The deadline must cover the body, not only the response headers:
+      // a stalled body would otherwise hold the per-file queue (and plugin
+      // initialization) forever. Return a plain object instead of new Response()
+      // to avoid RangeError on 204/205/304 and header re-encoding mismatches.
+      const body = await new Promise<string>((resolve, reject) => {
+        if (controller.signal.aborted) {
+          reject(controller.signal.reason ?? new Error("Storage read timed out"));
+          return;
+        }
+        const onAbort = () => {
+          reject(controller.signal.reason ?? new Error("Storage read timed out"));
+        };
+        controller.signal.addEventListener("abort", onAbort, { once: true });
+        response.text().then(
+          text => {
+            controller.signal.removeEventListener("abort", onAbort);
+            resolve(text);
+          },
+          error => {
+            controller.signal.removeEventListener("abort", onAbort);
+            reject(error);
+          },
+        );
+      });
+      return { status: response.status, ok: response.ok, body };
     } finally {
       clearTimeout(timer);
     }
   }
 
+  /**
+   * @safety A transport failure is NEVER "file missing": Plugin.loadData cannot separate
+   * them and may resolve a stale cache, which would let a later save overwrite the file.
+   */
   private async readIntoMemory(): Promise<void> {
     let raw: unknown;
     const storagePath = this.getStoragePath();
     let isMissing = false;
 
     try {
-      const res = await this.fetchStorageFile(storagePath, READ_TIMEOUT_MS);
-      if (res.status === 202) {
-        const body = await res.json().catch(() => null);
-        if (body && typeof body === "object" && (body as { code?: number }).code === 404) {
-          isMissing = true;
-        } else {
-          const code = (body as { code?: number })?.code ?? 202;
-          const msg = (body as { msg?: string })?.msg ?? "getFile returned 202 error";
-          throw new Error(`Kernel getFile failed: ${code} ${msg}`);
-        }
-      } else if (res.status === 404) {
-        isMissing = true;
-      } else if (!res.ok) {
-        throw new Error(`Server error reading ${this.file}: HTTP ${res.status}`);
+      if (this.canUseHostReader()) {
+        // Capability channel: this host has no browser fetch context (Node test host / legacy shell).
+        const legacy = await withTimeout(
+          Promise.resolve(this.plugin.loadData(this.file)),
+          READ_TIMEOUT_MS,
+          "Storage read timed out",
+        );
+        if (legacy === "" || legacy == null) isMissing = true;
+        else raw = legacy;
       } else {
-        const text = await res.text();
-        if (!text || text.trim() === "") {
-          isMissing = true;
+        const res = await this.fetchStorageFile(storagePath, READ_TIMEOUT_MS);
+        if (res.status === 202) {
+          const body = readKernelBody(res.body);
+          if (body?.code === 404) {
+            isMissing = true;
+          } else {
+            throw new Error(
+              `Kernel getFile failed: ${body?.code ?? 202} ${body?.msg ?? "getFile returned 202 error"}`,
+            );
+          }
+        } else if (!res.ok) {
+          // Only the kernel's documented 202 + code 404 means "missing".
+          // A bare HTTP 404 is a proxy/static-host fault, not an empty file.
+          throw new Error(`Server error reading ${this.file}: HTTP ${res.status}`);
+        } else if (!res.body.trim()) {
+          // HTTP 200 with empty/whitespace body is corrupt, never missing.
+          this.enterReadOnly(`Corrupt empty storage file in ${this.file}`, res.body);
+          return;
         } else {
           try {
-            raw = JSON.parse(text);
+            raw = JSON.parse(res.body);
           } catch (jsonErr) {
-            this.rawToBackup = text;
-            this.readOnlyReason = `Invalid JSON syntax in ${this.file}: ${String(jsonErr)}`;
-            this.emit();
+            this.enterReadOnly(`Invalid JSON syntax in ${this.file}: ${String(jsonErr)}`, res.body);
             return;
           }
         }
       }
     } catch (ioError) {
-      if (
-        !this.fetchFn &&
-        (ioError instanceof TypeError || (ioError as Error)?.message?.includes("Invalid URL")) &&
-        typeof (this.plugin as any).loadData === "function"
-      ) {
-        try {
-          const legacy = await withTimeout(
-            Promise.resolve(this.plugin.loadData(this.file)),
-            READ_TIMEOUT_MS,
-            "Storage read timed out",
-          );
-          if (legacy === "" || legacy == null) {
-            isMissing = true;
-          } else {
-            raw = legacy;
-          }
-        } catch (fallbackError) {
-          this.readOnlyReason = `Unable to read settings: ${String(fallbackError)}`;
-          this.emit();
-          throw fallbackError;
-        }
-      } else {
-        this.readOnlyReason = `Unable to read settings: ${String(ioError)}`;
-        this.emit();
-        throw ioError;
-      }
+      this.enterReadOnly(`Unable to read settings: ${String(ioError)}`, undefined);
+      throw ioError;
     }
 
     try {
@@ -245,15 +275,29 @@ export class JsonStore<T> {
       this.rawToBackup = undefined;
       if (changed) this.emit();
     } catch (parseError) {
-      this.rawToBackup = raw;
-      this.readOnlyReason = `Unable to validate settings: ${String(parseError)}`;
-      this.emit();
+      this.enterReadOnly(`Unable to validate settings: ${String(parseError)}`, raw);
     }
   }
 
+  /** The host reader substitutes a missing channel, never a failed request. */
+  private canUseHostReader(): boolean {
+    if (this.fetchFn) return false;
+    if (typeof (this.plugin as { loadData?: unknown }).loadData !== "function") return false;
+    return typeof globalThis.fetch !== "function" || typeof window === "undefined";
+  }
+
+  private enterReadOnly(reason: string, backup?: unknown): void {
+    // Unconditionally replace rawToBackup so a prior corrupt snapshot cannot survive a later read failure.
+    this.rawToBackup = backup;
+    this.readOnlyReason = reason;
+    this.emit();
+  }
+
   private emit(): void {
+    if (this.listeners.size === 0) return;
+    const snapshot = this.snapshot();
     for (const listener of [...this.listeners]) {
-      try { listener(this.snapshot()); }
+      try { listener(snapshot); }
       catch (error) { console.error("[OmniKit][error] 设置监听器执行失败", error); }
     }
   }

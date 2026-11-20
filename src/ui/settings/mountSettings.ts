@@ -17,30 +17,47 @@ export function createSettingsWindow(deps: {
 }) {
   let current: Dialog | undefined;
   let teardown: (() => void) | undefined;
+
   function close(): void {
+    const dialog = current;
     const cleanup = teardown;
+    // @safety Clear ownership BEFORE destroy(): Dialog.destroy() dispatches
+    // destroyCallback asynchronously (official dialog/index.ts:165-174), so a stale
+    // callback must not be able to reach the next instance's teardown.
+    current = undefined;
     teardown = undefined;
     cleanup?.();
-    current?.destroy();
-    current = undefined;
+    dialog?.destroy();
   }
+
   function open(): void {
     close();
-    const dialog = new Dialog({
+    let dialog!: Dialog;
+    dialog = new Dialog({
       title: "OmniKit",
       content: '<div class="omnikit-settings-host" style="height:100%;min-height:24rem"></div>',
       width: "860px",
       height: "600px",
       destroyCallback: () => {
-        if (teardown) { const fn = teardown; teardown = undefined; fn(); }
-        if (current === dialog) current = undefined;
+        // @invariant Only the dialog that still owns `current` may run its teardown.
+        if (current !== dialog) return;
+        current = undefined;
+        const cleanup = teardown;
+        teardown = undefined;
+        cleanup?.();
       },
     });
-    const target = dialog.element.querySelector<HTMLElement>(".omnikit-settings-host");
-    if (!target) throw new Error("OmniKit settings mount element missing");
-    const instance = mount(SettingsRoot, { target, props: deps });
-    teardown = () => { void unmount(instance); };
-    current = dialog;
+    try {
+      const target = dialog.element.querySelector<HTMLElement>(".omnikit-settings-host");
+      if (!target) throw new Error("OmniKit settings mount element missing");
+      const instance = mount(SettingsRoot, { target, props: deps });
+      teardown = () => { void unmount(instance); };
+      current = dialog;
+    } catch (error) {
+      // Never leave a half-built dialog behind when the view cannot mount.
+      dialog.destroy();
+      throw error;
+    }
   }
   return { open, close };
 }

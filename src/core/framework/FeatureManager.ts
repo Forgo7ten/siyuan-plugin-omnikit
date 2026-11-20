@@ -2,6 +2,7 @@ import type { BaseFeature } from "./BaseFeature.ts";
 import type { FeatureContext } from "./FeatureContext.ts";
 import { FeatureCatalog } from "./FeatureCatalog.ts";
 import { isFrontendSupported } from "../host/Platform.ts";
+import { describeError } from "../host/describeError.ts";
 
 export interface FeatureStatus {
   id: string;
@@ -36,6 +37,10 @@ export class FeatureManager {
       if (this.frozen) return;
       if (!isFrontendSupported(feature.meta.frontends)) {
         this.context.logger.debug(`跳过不支持当前平台的功能：${feature.meta.id}`);
+        continue;
+      }
+      if (!this.context.settings.isPreferenceReliable(feature.meta.id)) {
+        this.context.logger.warn(`功能 ${feature.meta.id} 的配置处于只读保护，跳过启动以保留上次有效偏好`);
         continue;
       }
       const shouldEnable = this.context.settings.getFeatureEnabled(feature.meta.id, feature.meta.defaultEnabled);
@@ -147,6 +152,11 @@ export class FeatureManager {
         this.context.logger.debug(`跳过不支持当前平台的功能：${feature.meta.id}`);
         continue;
       }
+      if (!this.context.settings.isPreferenceReliable(feature.meta.id)) {
+        // @invariant A read-only preference is unknown, not "disabled": keep runtime as-is.
+        this.context.logger.warn(`功能 ${feature.meta.id} 的配置处于只读保护，跳过本次协调`);
+        continue;
+      }
       const desired = this.context.settings.getFeatureEnabled(feature.meta.id, feature.meta.defaultEnabled);
       await this.enqueue(feature.meta.id, async current => {
         if (this.frozen) return false;
@@ -190,13 +200,16 @@ export class FeatureManager {
   }
 
   statuses(): FeatureStatus[] {
-    return this.catalog.all().map(feature => ({
-      id: feature.meta.id,
-      title: feature.meta.title,
-      description: feature.meta.description,
-      status: !isFrontendSupported(feature.meta.frontends) ? "unsupported" : feature.status,
-      error: describeError(this.getStartupError(feature.meta.id)),
-    }));
+    return this.catalog.all().map(feature => {
+      const startupError = this.getStartupError(feature.meta.id);
+      return {
+        id: feature.meta.id,
+        title: feature.meta.title,
+        description: feature.meta.description,
+        status: !isFrontendSupported(feature.meta.frontends) ? "unsupported" : feature.status,
+        error: startupError === undefined ? undefined : describeError(startupError),
+      };
+    });
   }
 
   private enqueue(id: string, operation: (feature: BaseFeature) => Promise<boolean>): Promise<boolean> {
@@ -223,10 +236,4 @@ export class FeatureManager {
       catch (error) { this.context.logger.error("运行状态监听器失败", error); }
     }
   }
-}
-
-function describeError(error: unknown): string | undefined {
-  if (error === undefined) return undefined;
-  if (error instanceof Error) return error.message;
-  return String(error);
 }

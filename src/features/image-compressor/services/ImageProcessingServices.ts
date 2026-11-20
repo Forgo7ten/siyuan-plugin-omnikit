@@ -22,7 +22,7 @@ export interface ImageProcessingServices {
   compressOccurrence(target: OccurrenceTarget, config: ImageConfig, signal: AbortSignal,
     options?: { replace?: boolean; mode?: CompressionMode; providedFile?: File }): Promise<OccurrenceCompressionResult>;
   savePreview(target: OccurrenceTarget, encodedFile: File, signal: AbortSignal,
-    replace: boolean): Promise<OccurrenceCompressionResult>;
+    replace: boolean, metrics?: { originalBytes?: number; compressedBytes?: number; quality?: number; similarity?: number }): Promise<OccurrenceCompressionResult>;
   ui: ImageUI;
   origin: string;
   mobile: boolean;
@@ -46,15 +46,18 @@ export type OccurrenceCompressionResult =
   | {
       status: "saved";
       path: string;
-      reference: "not-requested" | "replaced" | "conflict" | "unknown";
+      reference: "not-requested" | "replaced" | "conflict" | "aborted" | "unknown";
       originalBytes?: number;
       compressedBytes?: number;
       quality?: number;
       similarity?: number;
     };
 
+const COPY_PROMPT_THROTTLE_MS = 5_000;
+const lastCopyPromptByServices = new WeakMap<object, number>();
+
 function formatAssetPath(source: Extract<ImageSource, { kind: "asset" }>): string {
-  return source.path + (source.box ? `?box=${source.box}` : "");
+  return source.kernelPath;
 }
 
 function normalizedAssetPath(rawPath: string, origin: string): string {
@@ -118,7 +121,12 @@ async function persistNormalizedImage(
     await services.recordsReady;
     await services.records.upsert(normalizedOriginal, path);
   } catch (error) {
-    services.ui.copyablePath(path);
+    const now = Date.now();
+    const lastPrompt = lastCopyPromptByServices.get(services) ?? 0;
+    if (now - lastPrompt >= COPY_PROMPT_THROTTLE_MS) {
+      lastCopyPromptByServices.set(services, now);
+      services.ui.copyablePath(path);
+    }
     throw new RecordPersistenceError(path, error);
   }
   return path;
@@ -179,8 +187,10 @@ async function finishSaved(
   originalPath: string, signal: AbortSignal, replace: boolean,
   metrics?: { originalBytes?: number; compressedBytes?: number; quality?: number; similarity?: number },
 ): Promise<OccurrenceCompressionResult> {
-  const reference = !replace || signal.aborted ? "not-requested" : await services.references.commitOccurrence(target, path, signal);
-  if (replace && !signal.aborted) {
+  const reference = !replace || signal.aborted
+    ? "not-requested"
+    : await services.references.commitOccurrence(target, path, signal);
+  if (replace && reference !== "aborted") {
     await services.records.markOperation(originalPath, path,
       reference === "replaced" ? "replaced" : "incomplete").catch(() => undefined);
   }

@@ -11,6 +11,7 @@ export interface CompressionProgress {
   skipped: number;
   failed: number;
   conflicts: number;
+  unknown: number;
   cancelled: boolean;
   originalBytes: number;
   compressedBytes: number;
@@ -20,16 +21,13 @@ export interface CompressionProgress {
   logicalReductionBytes: number;
   diskReclaimedBytes: number;
   uploaded?: number;
-  referenceResult?: {
-    backend: "native" | "sql";
-    state: "verified" | "partial" | "unknown";
-    referencesChanged: number | null;
-    storageRecordsChanged: number | null;
-  };
+  phase?: "preparing" | "applying";
+  prepared?: number;
+  preparedTotal?: number;
   currentFile?: string;
 }
 
-export type CompressionBatchSummary = Omit<CompressionProgress, "currentFile">;
+export type CompressionBatchSummary = Omit<CompressionProgress, "currentFile" | "phase" | "prepared" | "preparedTotal">;
 
 /** Records one successfully rewritten reference and counts resource size once per source path. */
 export function recordRewrittenReference(

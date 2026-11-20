@@ -47,12 +47,13 @@ test("MS-SSIM precalculation produces identical result to computeMSSSIM", () => 
   assert.ok(directScore < 1.0 && directScore > 0.5);
 });
 
-test("applyAlphaPremultiply zeros RGB for alpha = 0 pixels", () => {
+test("applyAlphaPremultiply zeros RGB for alpha = 0 and premultiplies semi-transparent pixels (P2-6)", () => {
   const data = new Uint8ClampedArray([
     100, 150, 200, 0,    // transparent pixel
     50, 60, 70, 255,     // opaque pixel
+    200, 100, 50, 128,   // semi-transparent pixel
   ]);
-  const frame = { width: 2, height: 1, data };
+  const frame = { width: 3, height: 1, data };
   assert.equal(containsTransparency(frame), true);
 
   applyAlphaPremultiply(frame);
@@ -65,6 +66,11 @@ test("applyAlphaPremultiply zeros RGB for alpha = 0 pixels", () => {
   assert.equal(data[5], 60);
   assert.equal(data[6], 70);
   assert.equal(data[7], 255);
+
+  assert.equal(data[8], Math.round((200 * 128) / 255));
+  assert.equal(data[9], Math.round((100 * 128) / 255));
+  assert.equal(data[10], Math.round((50 * 128) / 255));
+  assert.equal(data[11], 128);
 });
 
 test("similarity policy differentiates desktop vs mobile", () => {

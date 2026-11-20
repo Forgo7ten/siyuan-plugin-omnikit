@@ -6,9 +6,9 @@ import {
 } from "./ms-ssim.ts";
 
 export type SimilarityWorkerMessage =
-  | { type: "initOriginal"; id: number; original: Blob; maxEdge?: number }
+  | { type: "initOriginal"; id: number; original: Blob; maxEdge?: number; width?: number; height?: number }
   | { type: "evaluate"; id: number; candidate: Blob }
-  | { id: number; original: Blob; candidate: Blob; maxEdge?: number };
+  | { id: number; original: Blob; candidate: Blob; maxEdge?: number; width?: number; height?: number };
 
 export interface SimilarityWorkerResponse {
   id: number;
@@ -29,17 +29,36 @@ const workerScope = (typeof self !== "undefined" ? self : globalThis) as unknown
   postMessage: (message: SimilarityWorkerResponse) => void;
 };
 
+function computeScaledDimensions(srcWidth: number, srcHeight: number, rawMaxEdge?: number): { width: number; height: number } {
+  const maxEdge = Math.max(128, Math.min(768, Math.floor(rawMaxEdge ?? 512)));
+  const scale = Math.min(1, maxEdge / Math.max(srcWidth, srcHeight));
+  return {
+    width: Math.max(1, Math.round(srcWidth * scale)),
+    height: Math.max(1, Math.round(srcHeight * scale)),
+  };
+}
+
 workerScope.onmessage = async (event: MessageEvent<SimilarityWorkerMessage>) => {
   const req = event.data;
   try {
     if ("type" in req && req.type === "initOriginal") {
       let originalBitmap: ImageBitmap | undefined;
       try {
-        originalBitmap = await createImageBitmap(req.original);
-        const maxEdge = Math.max(128, Math.min(768, Math.floor(req.maxEdge ?? 512)));
-        const scale = Math.min(1, maxEdge / Math.max(originalBitmap.width, originalBitmap.height));
-        cachedWidth = Math.max(1, Math.round(originalBitmap.width * scale));
-        cachedHeight = Math.max(1, Math.round(originalBitmap.height * scale));
+        if (req.width && req.height && req.width > 0 && req.height > 0) {
+          const target = computeScaledDimensions(req.width, req.height, req.maxEdge);
+          cachedWidth = target.width;
+          cachedHeight = target.height;
+          originalBitmap = await createImageBitmap(req.original, {
+            resizeWidth: cachedWidth,
+            resizeHeight: cachedHeight,
+            resizeQuality: "high",
+          });
+        } else {
+          originalBitmap = await createImageBitmap(req.original);
+          const target = computeScaledDimensions(originalBitmap.width, originalBitmap.height, req.maxEdge);
+          cachedWidth = target.width;
+          cachedHeight = target.height;
+        }
 
         const canvas = new OffscreenCanvas(cachedWidth, cachedHeight);
         const ctx = canvas.getContext("2d", { willReadFrequently: true });
@@ -75,7 +94,11 @@ workerScope.onmessage = async (event: MessageEvent<SimilarityWorkerMessage>) => 
       }
       let candidateBitmap: ImageBitmap | undefined;
       try {
-        candidateBitmap = await createImageBitmap(req.candidate);
+        candidateBitmap = await createImageBitmap(req.candidate, {
+          resizeWidth: cachedWidth,
+          resizeHeight: cachedHeight,
+          resizeQuality: "high",
+        });
         const canvas = new OffscreenCanvas(cachedWidth, cachedHeight);
         const ctx = canvas.getContext("2d", { willReadFrequently: true });
         if (!ctx) throw new Error("OffscreenCanvas 2D context unavailable");
@@ -106,32 +129,63 @@ workerScope.onmessage = async (event: MessageEvent<SimilarityWorkerMessage>) => 
     let originalBitmap: ImageBitmap | undefined;
     let candidateBitmap: ImageBitmap | undefined;
     try {
-      [originalBitmap, candidateBitmap] = await Promise.all([
-        createImageBitmap(req.original),
-        createImageBitmap(req.candidate),
-      ]);
-      const maxEdge = Math.max(128, Math.min(768, Math.floor(req.maxEdge ?? 512)));
-      const scale = Math.min(1, maxEdge / Math.max(candidateBitmap.width, candidateBitmap.height));
-      const width = Math.max(1, Math.round(candidateBitmap.width * scale));
-      const height = Math.max(1, Math.round(candidateBitmap.height * scale));
+      if (req.width && req.height && req.width > 0 && req.height > 0) {
+        const target = computeScaledDimensions(req.width, req.height, req.maxEdge);
+        [originalBitmap, candidateBitmap] = await Promise.all([
+          createImageBitmap(req.original, {
+            resizeWidth: target.width,
+            resizeHeight: target.height,
+            resizeQuality: "high",
+          }),
+          createImageBitmap(req.candidate, {
+            resizeWidth: target.width,
+            resizeHeight: target.height,
+            resizeQuality: "high",
+          }),
+        ]);
+        const { width, height } = target;
+        const canvas = new OffscreenCanvas(width, height);
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        if (!ctx) throw new Error("OffscreenCanvas 2D context unavailable");
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
 
-      const canvas = new OffscreenCanvas(width, height);
-      const ctx = canvas.getContext("2d", { willReadFrequently: true });
-      if (!ctx) throw new Error("OffscreenCanvas 2D context unavailable");
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(originalBitmap, 0, 0, width, height);
+        const origPixels = ctx.getImageData(0, 0, width, height);
+        ctx.clearRect(0, 0, width, height);
+        ctx.drawImage(candidateBitmap, 0, 0, width, height);
+        const candPixels = ctx.getImageData(0, 0, width, height);
 
-      ctx.drawImage(originalBitmap, 0, 0, width, height);
-      const origPixels = ctx.getImageData(0, 0, width, height);
-      ctx.clearRect(0, 0, width, height);
-      ctx.drawImage(candidateBitmap, 0, 0, width, height);
-      const candPixels = ctx.getImageData(0, 0, width, height);
+        const similarity = computeMSSSIM(
+          { width, height, data: origPixels.data },
+          { width, height, data: candPixels.data },
+        );
+        workerScope.postMessage({ id: req.id, similarity });
+      } else {
+        [originalBitmap, candidateBitmap] = await Promise.all([
+          createImageBitmap(req.original),
+          createImageBitmap(req.candidate),
+        ]);
+        const { width, height } = computeScaledDimensions(candidateBitmap.width, candidateBitmap.height, req.maxEdge);
 
-      const similarity = computeMSSSIM(
-        { width, height, data: origPixels.data },
-        { width, height, data: candPixels.data },
-      );
-      workerScope.postMessage({ id: req.id, similarity });
+        const canvas = new OffscreenCanvas(width, height);
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        if (!ctx) throw new Error("OffscreenCanvas 2D context unavailable");
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+
+        ctx.drawImage(originalBitmap, 0, 0, width, height);
+        const origPixels = ctx.getImageData(0, 0, width, height);
+        ctx.clearRect(0, 0, width, height);
+        ctx.drawImage(candidateBitmap, 0, 0, width, height);
+        const candPixels = ctx.getImageData(0, 0, width, height);
+
+        const similarity = computeMSSSIM(
+          { width, height, data: origPixels.data },
+          { width, height, data: candPixels.data },
+        );
+        workerScope.postMessage({ id: req.id, similarity });
+      }
     } finally {
       originalBitmap?.close();
       candidateBitmap?.close();

@@ -27,7 +27,9 @@ export class PluginStatusBar {
       position: "left",
     });
 
-    this.mounted = result === this.element;
+    // @safety The host returns the passed element without inserting it when the plugin
+    // is disposed, in a settings window, or when #status is absent. Require real attachment.
+    this.mounted = result === this.element && this.element.isConnected === true;
     if (!this.mounted) {
       this.element.remove();
       this.element = undefined;
@@ -36,6 +38,8 @@ export class PluginStatusBar {
 
   update(taskID: string, text: string): void {
     if (!this.mounted || !this.element) return;
+    // Refresh recency order: Map.set on an existing key keeps the old position.
+    this.tasks.delete(taskID);
     this.tasks.set(taskID, text);
     this.render();
   }

@@ -1,5 +1,6 @@
 import { Dialog, showMessage } from "siyuan";
 import { mount, unmount, type Component } from "svelte";
+import type { UiFeedback } from "../../../core/feedback/UiFeedback.ts";
 import ImageTaskPanel from "./ImageTaskPanel.svelte";
 import ImageCompressionDialog from "./ImageCompressionDialog.svelte";
 import type { ManualCompressionPreview } from "../actions/SingleImageAction.ts";
@@ -12,12 +13,10 @@ export interface ImageTaskState {
   uploaded: number;
   skipped: number;
   failed: number;
+  unknown: number;
   messages: string[];
-  referenceResult?: {
-    backend: string;
-    referencesChanged: number | null;
-    storageRecordsChanged: number | null;
-  };
+  prepared?: number;
+  preparedTotal?: number;
   currentFile?: string;
 }
 
@@ -56,7 +55,8 @@ export function mountDialog<P extends Record<string, unknown>>(
 ): { close(): void } {
   let instance: ReturnType<typeof mount> | undefined;
   let closed = false;
-  let release: () => void = () => undefined;
+  let closingByController = false;
+  let releaseScope: () => void = () => undefined;
   const dialog = new Dialog({
     title,
     content: '<div class="omnikit-image-dialog-host"></div>',
@@ -64,36 +64,60 @@ export function mountDialog<P extends Record<string, unknown>>(
     destroyCallback: () => {
       if (closed) return;
       closed = true;
-      onClose();
+      if (!closingByController) {
+        onClose();
+      }
       if (instance) void unmount(instance);
-      release();
+      releaseScope();
     },
   });
 
   const target = dialog.element.querySelector<HTMLElement>(".omnikit-image-dialog-host");
   if (!target) {
+    closingByController = true;
     dialog.destroy();
     throw new Error("Image task dialog mount element missing");
   }
   instance = mount(View, { target, props });
-  release = scope.own(() => { if (!closed) dialog.destroy(); });
-  return { close: release };
+  releaseScope = scope.own(() => {
+    if (!closed) {
+      closingByController = true;
+      dialog.destroy();
+    }
+  });
+  return {
+    close: () => {
+      if (closed) return;
+      closingByController = true;
+      dialog.destroy();
+    },
+  };
 }
 
-export function createImageUI(scope: ImageTaskScope, t: (key: string) => string): ImageUI {
+export function createImageUI(scope: ImageTaskScope, t: (key: string) => string, feedback?: UiFeedback): ImageUI {
   return {
     notify(message) {
-      if (scope.active) showMessage(message, 5000);
+      if (feedback) feedback.notify(message, "info", { timeout: 5000 });
+      else if (scope.active) showMessage(message, 5000);
     },
 
     copyablePath(path, messageKey = "image.recordSaveFailed") {
       if (!scope.active) return;
+      let closed = false;
+      let release: () => void = () => undefined;
       const dialog = new Dialog({
         title: "OmniKit WebP",
         content: '<div class="b3-dialog__content"><p class="omnikit-copy-reason"></p><input class="b3-text-field omnikit-copy-path" readonly /><button type="button" class="b3-button omnikit-copy-button"></button></div>',
         width: "min(640px, 94vw)",
+        destroyCallback: () => {
+          if (closed) return;
+          closed = true;
+          release();
+        },
       });
-      scope.own(() => dialog.destroy());
+      release = scope.own(() => {
+        if (!closed) dialog.destroy();
+      });
       const reason = dialog.element.querySelector<HTMLElement>(".omnikit-copy-reason");
       const input = dialog.element.querySelector<HTMLInputElement>(".omnikit-copy-path");
       const copy = dialog.element.querySelector<HTMLButtonElement>(".omnikit-copy-button");

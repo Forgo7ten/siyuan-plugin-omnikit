@@ -41,10 +41,11 @@ export class AssetStore {
     if (typeof path !== "string") throw new UploadOutcomeUnknown("Upload returned no exact file mapping");
     const normalized = path.replace(/\\/g, "/");
     try {
-      if (resolveSource(normalized, this.origin).kind !== "asset") throw new Error("non-asset path");
+      const resolved = resolveSource(normalized, this.origin);
+      if (resolved.kind !== "asset") throw new Error("non-asset path");
+      return resolved.kernelPath;
     } catch {
       throw new UploadOutcomeUnknown("Upload returned an invalid resource path");
     }
-    return normalized;
   }
 }

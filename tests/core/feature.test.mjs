@@ -157,3 +157,33 @@ test("BaseFeature deactivate returns a Promise on concurrent and re-entrant call
   assert.equal(disableCalls, 1);
   assert.equal(feature.status, "disabled");
 });
+
+test("deactivate during enabling aborts the scope before awaiting onEnable", async () => {
+  let capturedSignal;
+  let releaseEnable;
+  let disableCalls = 0;
+  const enableBlocked = new Promise(resolve => { releaseEnable = resolve; });
+
+  class Feature extends BaseFeature {
+    constructor() { super(meta); }
+    async onEnable(_ctx, scope) {
+      capturedSignal = scope.signal;
+      await enableBlocked;
+    }
+    onDisable() { disableCalls++; }
+  }
+
+  const feature = new Feature();
+  const activating = feature.activate({});
+  assert.equal(feature.status, "enabling");
+  assert.equal(capturedSignal.aborted, false);
+
+  const deactivating = feature.deactivate();
+  assert.equal(capturedSignal.aborted, true);
+
+  releaseEnable();
+  await assert.rejects(activating, /frozen during initialization/);
+  await deactivating;
+  assert.equal(disableCalls, 1);
+  assert.equal(feature.status, "disabled");
+});

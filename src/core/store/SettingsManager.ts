@@ -88,8 +88,13 @@ export class SettingsManager {
   async load(): Promise<void> {
     const stores = [this.core, ...this.featureStores.values()];
     const results = await Promise.allSettled(stores.map(store => store.load()));
-    const firstFailure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
-    if (firstFailure) throw firstFailure.reason;
+    results.forEach((result, index) => {
+      if (result.status === "rejected") {
+        // @safety A failed read keeps that store read-only; it must not abort startup,
+        // otherwise the recovery UI (SettingsRoot) can never be reached.
+        console.warn(`[OmniKit][warn] 配置读取失败，已进入只读保护 (${stores[index].file}):`, result.reason);
+      }
+    });
   }
 
   get needsRecovery(): boolean {
@@ -116,8 +121,12 @@ export class SettingsManager {
   }
 
   getFeatureEnabled(id: string, defaultEnabled = false): boolean {
-    if (this.core.needsRecovery || this.featureStores.get(id)?.needsRecovery) return false;
     return this.core.snapshot().featureStates[id]?.enabled ?? defaultEnabled;
+  }
+
+  /** A read-only store keeps its last valid memory value; it must not be read as "disabled". */
+  isPreferenceReliable(id: string): boolean {
+    return !this.core.needsRecovery && !this.featureStores.get(id)?.needsRecovery;
   }
 
   setFeatureEnabled(id: string, enabled: boolean): Promise<boolean> {

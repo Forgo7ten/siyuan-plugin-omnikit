@@ -142,10 +142,7 @@
         <input type="checkbox" class="b3-switch" bind:checked={replaceCurrent} disabled={busy} />
         <span class="dialog-option-label">{t("image.dialog.replaceCurrent")}</span>
       </label>
-      <label class="dialog-option-item is-disabled">
-        <input type="checkbox" class="b3-switch" disabled checked={false} />
-        <span class="dialog-option-label">{t("image.dialog.preserveExif")}</span>
-      </label>
+      <!-- EXIF UI intentionally unavailable; metadata.preserveExif remains a reserved option. -->
     </div>
 
     <div class="preview-action-row">
@@ -359,11 +356,6 @@
     gap: 10px;
     cursor: pointer;
     user-select: none;
-
-    &.is-disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
   }
 
   .dialog-option-label {
@@ -448,7 +440,7 @@
         max-height: 100%;
         object-fit: contain;
         border-radius: 4px;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        box-shadow: 0 2px 8px color-mix(in srgb, var(--b3-theme-on-background) 10%, transparent);
       }
     }
 
@@ -499,13 +491,13 @@
     border-radius: 4px;
 
     &--success {
-      background: var(--b3-theme-success, #2ba471);
-      color: #fff;
+      background: var(--b3-theme-success, var(--b3-theme-primary));
+      color: var(--b3-theme-on-primary);
     }
 
     &--warn {
       background: var(--b3-theme-error);
-      color: #fff;
+      color: var(--b3-theme-on-error, var(--b3-theme-on-primary));
     }
   }
 

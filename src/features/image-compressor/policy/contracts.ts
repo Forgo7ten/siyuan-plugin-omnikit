@@ -2,16 +2,19 @@ export type AssetPath = string;
 export type ReferencePath = string;
 export type CompressionMode = "auto" | "manual-quick" | "manual-dialog" | "document";
 export type OperationKind = "saved-only" | "replaced" | "incomplete";
+export type AssetAvailability = "present" | "missing-confirmed" | "unknown";
 
 export interface OccurrenceTarget {
-  rootID: string;
-  notebook: string;
-  blockID: string;
-  oldPath: ReferencePath;
-  /** Absolute image order in the block DOM. Always validate baselineBlockDOM before writing. */
-  imageOrdinal: number;
+  readonly rootID: string;
+  readonly notebook: string;
+  readonly blockID: string;
+  readonly kind?: "image" | "link";
+  readonly attribute?: "data-src" | "src" | "data-href" | "href";
+  /** 0-based order among matching candidate elements in the block DOM. */
+  readonly imageOrdinal: number;
+  readonly oldPath: ReferencePath;
   /** Persisted block snapshot captured before asynchronous work starts. */
-  baselineBlockDOM: string;
+  readonly baselineBlockDOM: string;
 }
 
 export interface DockRecord {

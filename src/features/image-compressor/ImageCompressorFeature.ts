@@ -3,6 +3,7 @@ import { BaseFeature } from "../../core/framework/BaseFeature.ts";
 import type { FeatureContext } from "../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../core/framework/FeatureScope.ts";
 import type { MenuContext } from "../../core/feedback/MenuRegistry.ts";
+import { isAbortError } from "../../core/feedback/UiFeedback.ts";
 import type { SettingsManager } from "../../core/store/SettingsManager.ts";
 import type { Logger } from "../../core/host/Logger.ts";
 import { PageAllowlist } from "./policy/PageAllowlist.ts";
@@ -13,7 +14,7 @@ import { NODE_ID } from "./policy/parseImageConfig.ts";
 import { TaskRegistry } from "./policy/TaskRegistry.ts";
 import { IMAGE_FEATURE_ID } from "./policy/settings.ts";
 import type { ImageFeatureConfig } from "./registration.ts";
-import { registerAutoUpload, type AutoUploadNotice } from "./actions/AutoUploadHandler.ts";
+import { registerAutoUpload } from "./actions/AutoUploadHandler.ts";
 import { shouldAutoCompress } from "./policy/AutoPolicy.ts";
 import { imageMenuContributions } from "./actions/menuContributions.ts";
 import { type SingleImageEditorContext } from "./actions/SingleImageAction.ts";
@@ -23,6 +24,13 @@ import { createImageServices } from "./services/createImageServices.ts";
 import type { ImageProcessingServices } from "./services/ImageProcessingServices.ts";
 import { watchRemoteImages, type RemoteWatcherHandle } from "./actions/RemoteImageWatcher.ts";
 import type { DocumentRow } from "./services/references.ts";
+import { resolveDocumentTitle } from "./services/documentTitle.ts";
+
+export type ResolveDocumentResult =
+  | { status: "ok"; ok: true; notebookId?: string; identity: BlockIdentity; rootTitle?: string }
+  | { status: "invalid"; ok: false; identity?: BlockIdentity }
+  | { status: "error"; ok: false; error: unknown }
+  | { status: "aborted"; ok: false };
 
 /**
  * @invariant The feature owns all business registrations through FeatureScope.
@@ -52,6 +60,14 @@ export class ImageCompressorFeature extends BaseFeature {
 
   private t(ctx: FeatureContext, key: string, values: Record<string, string | number> = {}): string {
     return translate(ctx.plugin.i18n as Record<string, unknown>, key, values);
+  }
+
+  private notify(ctx: FeatureContext, message: string, type: "info" | "error" = "info", timeout?: number): void {
+    if (ctx.feedback) {
+      ctx.feedback.notify(message, type, timeout === undefined ? undefined : { timeout });
+    } else {
+      showMessage(message, timeout, type);
+    }
   }
 
   private config(ctx: FeatureContext): ImageFeatureConfig {
@@ -176,11 +192,10 @@ export class ImageCompressorFeature extends BaseFeature {
   }
 
   /** Only a kernel-confirmed document root can be added to the allowlist. */
-  async resolveDocument(rootID: string, logger?: Logger, notebookId?: string, signal?: AbortSignal): Promise<{
-    ok: boolean; notebookId?: string; identity?: BlockIdentity; rootTitle?: string;
-  }> {
+  async resolveDocument(rootID: string, logger?: Logger, notebookId?: string, signal?: AbortSignal): Promise<ResolveDocumentResult> {
+    if (!NODE_ID.test(rootID)) return { status: "invalid", ok: false };
+    if (signal?.aborted) return { status: "aborted", ok: false };
     try {
-      if (!NODE_ID.test(rootID) || signal?.aborted) return { ok: false };
       const payload = notebookId ? { id: rootID, notebook: notebookId } : { id: rootID };
       const data = (await this.kernel.post<{
         id?: string; type?: string; box?: string; rootID?: string; rootTitle?: string;
@@ -190,15 +205,22 @@ export class ImageCompressorFeature extends BaseFeature {
         : undefined;
       const ok = isDocumentRootIdentity(identity, rootID);
       logger?.debug("文档身份校验完成", { 文档根ID: rootID, 校验通过: ok });
+      if (!ok || !identity) {
+        return { status: "invalid", ok: false, identity };
+      }
       return {
-        ok,
+        status: "ok",
+        ok: true,
         identity,
         notebookId: typeof data?.box === "string" ? data.box : notebookId,
         rootTitle: typeof data?.rootTitle === "string" && data.rootTitle.trim() ? data.rootTitle.trim() : undefined,
       };
     } catch (error) {
-      if (!signal?.aborted) logger?.warn("查询文档身份失败", error);
-      return { ok: false };
+      if (signal?.aborted || isAbortError(error)) {
+        return { status: "aborted", ok: false };
+      }
+      logger?.warn("查询文档身份失败", error);
+      return { status: "error", ok: false, error };
     }
   }
 
@@ -209,39 +231,30 @@ export class ImageCompressorFeature extends BaseFeature {
       const notebookId = resolveNotebookID(detail)
         ?? (typeof detail?.items?.[0]?.notebookId === "string" ? detail.items[0].notebookId : undefined);
       const verified = await this.resolveDocument(menu.rootID, ctx.logger, notebookId, scope.signal);
-      if (!scope.active || scope.signal.aborted) return; // @safety Async kernel response may arrive after disable.
-      if (!verified.ok) {
-        showMessage(this.t(ctx, "menu.notDocument"), 5000, "error");
+      if (!scope.active || scope.signal.aborted || verified.status === "aborted") return;
+      if (verified.status === "error") {
+        this.notify(ctx, this.t(ctx, "menu.resolveFailed"), "error", 5000);
+        return;
+      }
+      if (verified.status === "invalid") {
+        this.notify(ctx, this.t(ctx, "menu.notDocument"), "error", 5000);
         return;
       }
       let title = "";
       if (!this.pages.hasCached(menu.rootID)) {
-        try {
-          const res = await this.kernel.post<string>("/api/filetree/getFullHPathByID", { id: menu.rootID }, { signal: scope.signal });
-          if (typeof res.data === "string" && res.data.trim()) title = res.data.trim();
-        } catch {
-          if (!scope.active || scope.signal.aborted) return;
-          try {
-            const fallback = await this.kernel.post<string>("/api/filetree/getHPathByID", { id: menu.rootID }, { signal: scope.signal });
-            if (typeof fallback.data === "string" && fallback.data.trim()) title = fallback.data.trim();
-          } catch {
-            if (!scope.active || scope.signal.aborted) return;
-            // Fallback to rootTitle below
-          }
-        }
-        if (!scope.active || scope.signal.aborted) return;
-        if (!title && verified.rootTitle) {
-          title = verified.rootTitle;
-        }
+        title = await resolveDocumentTitle(this.kernel, menu.rootID, {
+          fallbackRootTitle: verified.rootTitle,
+          signal: scope.signal,
+        });
       }
       if (!scope.active || scope.signal.aborted) return;
       const enabled = await this.pages.toggle(menu.rootID, { title });
       if (!scope.active || scope.signal.aborted) return;
-      showMessage(this.t(ctx, enabled ? "menu.granted" : "menu.revoked"));
+      this.notify(ctx, this.t(ctx, enabled ? "menu.granted" : "menu.revoked"));
     } catch (error) {
-      if (!scope.active || scope.signal.aborted) return;
+      if (!scope.active || scope.signal.aborted || isAbortError(error)) return;
       ctx.logger.error("保存文档白名单失败", error);
-      showMessage(this.t(ctx, "menu.saveFailed"), 5000, "error");
+      this.notify(ctx, this.t(ctx, "menu.saveFailed"), "error", 5000);
     }
   }
 
@@ -267,7 +280,7 @@ export class ImageCompressorFeature extends BaseFeature {
     controller: ImageController,
   ): Promise<void> {
     const editor = this.editor(menu);
-    if (!editor) { showMessage(this.t(ctx, "image.single.invalidTarget"), 5000, "error"); return; }
+    if (!editor) { this.notify(ctx, this.t(ctx, "image.single.invalidTarget"), "error", 5000); return; }
     await controller.compressSingleQuick(menu.detail, editor);
   }
 
@@ -277,7 +290,7 @@ export class ImageCompressorFeature extends BaseFeature {
     controller: ImageController,
   ): Promise<void> {
     const editor = this.editor(menu);
-    if (!editor) { showMessage(this.t(ctx, "image.single.invalidTarget"), 5000, "error"); return; }
+    if (!editor) { this.notify(ctx, this.t(ctx, "image.single.invalidTarget"), "error", 5000); return; }
     await controller.compressSingleCustom(menu.detail, editor);
   }
 

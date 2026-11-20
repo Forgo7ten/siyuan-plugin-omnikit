@@ -90,6 +90,10 @@ export abstract class BaseFeature {
   private async performDeactivate(promise: Promise<void>): Promise<void> {
     try {
       if (this.phase === "enabling") {
+        // @safety Revoke the scope before waiting so an in-flight onEnable observes abort.
+        this.generation++;
+        this.scope?.dispose();
+        this.scope = undefined;
         await this.activation?.catch(() => undefined);
       }
       if ((this.phase as FeaturePhase) === "disabled") return;

@@ -10,6 +10,7 @@ const files = [
   "index.js",
   "index.css",
   "icon.png",
+  "preview.png",
   "README.md",
   "README.zh-CN.md",
   "browser-image-compression.js",
@@ -77,6 +78,23 @@ test("refuses to replace a directory owned by another plugin", async () => {
       /existing target does not identify as siyuan-plugin-omnikit/,
     );
     assert.equal(JSON.parse(await readFile(path.join(target, "plugin.json"), "utf8")).name, "another-plugin");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("throws an explicit manifest read error when target plugin.json is invalid JSON", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "omnikit install test "));
+  try {
+    const { buildDir, workspace, pluginsDir } = await prepare(root);
+    const target = path.join(pluginsDir, "siyuan-plugin-omnikit");
+    await mkdir(target);
+    await writeFile(path.join(target, "plugin.json"), "{broken-json");
+
+    await assert.rejects(
+      installWorkspace(workspace, { buildDir, log: () => {} }),
+      /Unable to read plugin manifest:/,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

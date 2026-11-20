@@ -1,7 +1,9 @@
+import { combineSignals } from "../../../core/host/ProtyleAdapter.ts";
 import { adaptiveQualitySearch, type QualitySearchProgress } from "./adaptive-quality-search.ts";
 import { SimilarityWorkerSession, type WorkerFactory } from "./SimilarityWorkerSession.ts";
 import { getSimilarityPolicy } from "./similarity-policy.ts";
 import type { CompressionMode } from "../policy/contracts.ts";
+import { isProtectedDrawingPath, isWebpManualAllowed } from "../policy/ImageCandidateClassifier.ts";
 import { inspectImage, type EncodeOptions, type EncodeResult, type ImageCodec } from "../services/image.ts";
 import type { ImageConfig } from "../policy/parseImageConfig.ts";
 
@@ -9,12 +11,60 @@ export interface AdaptiveImageCompressorOptions {
   workerFactory?: WorkerFactory;
 }
 
+const SUPPORTED_STATIC_EXTS = new Set(["png", "jpg", "jpeg", "webp"]);
+
+function withDeadline<T>(
+  promise: Promise<T>,
+  deadlineAt: number,
+  signal?: AbortSignal,
+): Promise<T> {
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) {
+    void promise.catch(() => undefined);
+    return Promise.reject(new Error("Encode deadline exceeded"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      void promise.catch(() => undefined);
+      reject(new Error("Encode deadline exceeded"));
+    }, remaining);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      void promise.catch(() => undefined);
+      reject(signal?.reason ?? new DOMException("Operation cancelled", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      value => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      error => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 /**
  * Opt-in adaptive quality search wrapping an underlying ImageCodec (e.g. BicEncoder).
  * When smartEnabled is false, delegates directly to the underlying codec.
  * When smartEnabled is true, conducts an MS-SSIM bounded search across quality levels,
- * enforcing the 4 KiB / 5% dual savings threshold, and returning unreachable if the target
- * similarity cannot be achieved.
+ * enforcing the 4 KiB / 5% dual savings threshold, a bounded overall time budget, and
+ * returning unreachable if the target similarity cannot be achieved.
  */
 export class AdaptiveImageCompressor implements ImageCodec {
   readonly name = "adaptive-ms-ssim";
@@ -40,10 +90,13 @@ export class AdaptiveImageCompressor implements ImageCodec {
     const c = config.compression;
     const ext = name.split(/[?#]/)[0].split(".").pop()?.toLowerCase() ?? "";
     if (
-      /excalidraw|(?:^|[\/\\])drawings?[\/\\._-]/i.test(name) ||
-      (c.excludedExtensions.includes(ext) && !(ext === "webp" && mode === "manual-dialog"))
+      isProtectedDrawingPath(name) ||
+      (c.excludedExtensions.includes(ext) && !isWebpManualAllowed(ext, mode))
     ) {
       return { kind: "skipped", reason: "protected-extension" };
+    }
+    if (ext !== "" && !SUPPORTED_STATIC_EXTS.has(ext)) {
+      return { kind: "skipped", reason: "unsupported-format" };
     }
     if (mode !== "manual-dialog" && blob.size < c.minInputBytes) {
       return { kind: "skipped", reason: "below_threshold" };
@@ -72,42 +125,69 @@ export class AdaptiveImageCompressor implements ImageCodec {
     }
 
     const policy = getSimilarityPolicy();
+    const budgetMs = Number.isFinite(c.maxEncodeMs) && c.maxEncodeMs > 0 ? c.maxEncodeMs : 45_000;
+    const deadlineAt = Date.now() + budgetMs;
+    const deadlineController = new AbortController();
+    const deadlineTimer = setTimeout(() => {
+      deadlineController.abort(new Error("Encode deadline exceeded"));
+    }, budgetMs);
+    const effectiveSignal = combineSignals(signal, deadlineController.signal) ?? deadlineController.signal;
+
     const worker = new SimilarityWorkerSession({
-      signal,
+      signal: effectiveSignal,
       workerFactory: this.options.workerFactory,
     });
     const encodedByQuality = new Map<number, Extract<EncodeResult, { kind: "encoded" }>["value"]>();
 
     try {
-      await worker.initOriginal(blob, policy.benchmarkMaxEdge);
+      await withDeadline(
+        worker.initOriginal(blob, policy.benchmarkMaxEdge, {
+          width: originalInfo.width,
+          height: originalInfo.height,
+        }),
+        deadlineAt,
+        effectiveSignal,
+      );
 
       const targetSimilarity = config.compression.targetSimilarity ?? 0.99;
-      const search = await adaptiveQualitySearch({
-        targetSimilarity,
-        initialQuality: config.compression.initialQuality,
-        minQuality: policy.minQuality,
-        maxQuality: policy.maxQuality,
-        qualityTolerance: policy.qualityTolerance,
-        maxEvaluations: policy.maxEvaluations,
-        signal,
-        encode: async quality => {
-          const tunedConfig: ImageConfig = {
-            ...config,
-            compression: { ...config.compression, initialQuality: quality },
-          };
-          const encoded = await this.codec.encode(blob, name, tunedConfig, signal, onProgress, mode, {
-            enforceSavings: false,
-            originalInfo,
-          });
-          if (encoded.kind === "skipped") {
-            return { kind: "skipped", reason: encoded.reason };
-          }
-          encodedByQuality.set(quality, encoded.value);
-          return encoded.value.file;
-        },
-        evaluate: candidate => worker.evaluate(candidate),
-        onProgress: options.onSearchProgress as (progress: QualitySearchProgress) => void,
-      });
+      const search = await withDeadline(
+        adaptiveQualitySearch({
+          targetSimilarity,
+          initialQuality: config.compression.initialQuality,
+          minQuality: policy.minQuality,
+          maxQuality: policy.maxQuality,
+          qualityTolerance: policy.qualityTolerance,
+          maxEvaluations: policy.maxEvaluations,
+          signal: effectiveSignal,
+          encode: async (quality, stepSignal) => {
+            const tunedConfig: ImageConfig = {
+              ...config,
+              compression: { ...config.compression, initialQuality: quality },
+            };
+            const encoded = await withDeadline(
+              this.codec.encode(blob, name, tunedConfig, stepSignal ?? effectiveSignal, onProgress, mode, {
+                enforceSavings: false,
+                originalInfo,
+              }),
+              deadlineAt,
+              stepSignal ?? effectiveSignal,
+            );
+            if (encoded.kind === "skipped") {
+              return { kind: "skipped", reason: encoded.reason };
+            }
+            encodedByQuality.set(quality, encoded.value);
+            return encoded.value.file;
+          },
+          evaluate: (candidate, stepSignal) => withDeadline(
+            worker.evaluate(candidate),
+            deadlineAt,
+            stepSignal ?? effectiveSignal,
+          ),
+          onProgress: options.onSearchProgress as (progress: QualitySearchProgress) => void,
+        }),
+        deadlineAt,
+        effectiveSignal,
+      );
 
       if (search.status === "skipped") {
         return { kind: "skipped", reason: search.reason };
@@ -152,6 +232,7 @@ export class AdaptiveImageCompressor implements ImageCodec {
         },
       };
     } finally {
+      clearTimeout(deadlineTimer);
       worker.dispose();
     }
   }

@@ -1,42 +1,44 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import { openTab, showMessage } from "siyuan";
-  import { KernelClient, KernelRequestError } from "../../../core/host/KernelClient.ts";
+  import { Dialog, openTab, showMessage } from "siyuan";
+  import { isAbortError } from "../../../core/feedback/UiFeedback.ts";
+  import { KernelClient } from "../../../core/host/KernelClient.ts";
   import { imageRecordsFor } from "../store/ImageCompressionRecordStore.ts";
-  import { ReferenceService } from "../services/references.ts";
+  import { blockDOM, ReferenceService } from "../services/references.ts";
+  import {
+    checkAssetAvailability,
+    locateAssetOccurrences,
+    reconcileRecordPair,
+    type OccurrenceItem,
+    type UnsupportedReferenceItem,
+  } from "../services/ImageReferences.ts";
+  import { resolveImageOccurrence } from "../services/ImageOccurrenceResolver.ts";
+  import { findLinkCandidates } from "../policy/dom.ts";
+  import { sameAsset, trySource } from "../policy/source.ts";
   import type { FeatureContext } from "../../../core/framework/FeatureContext.ts";
-  import type { CompressionRecord, OccurrenceTarget, OperationKind } from "../policy/contracts.ts";
+  import type { AssetAvailability, CompressionRecord, OccurrenceTarget, OperationKind } from "../policy/contracts.ts";
 
-  interface LocatedAssetReference {
-    type: string;
-    rootID: string;
-    notebook?: string;
-    blockID?: string;
-    reference: string;
-    relinkable: boolean;
-    reason?: string;
-  }
   interface Props {
     context: FeatureContext;
     t: (key: string, values?: Record<string, string | number>) => string;
   }
-  interface OccurrenceItem {
-    key: string;
-    label: string;
-    target: OccurrenceTarget;
-  }
+
+  type DisplayStatus = AssetAvailability | "checking";
+
+  const STATUS_TTL_MS = 10 * 60 * 1000;
 
   let { context, t }: Props = $props();
   const { store, ready } = untrack(() => imageRecordsFor(context.plugin));
   const kernel = new KernelClient();
-  const references = new ReferenceService(kernel, location.origin);
-
-  const DOM_BATCH_SIZE = 50;
+  const origin = typeof location !== "undefined" ? location.origin : "http://127.0.0.1:6806";
+  const references = new ReferenceService(kernel, origin);
 
   let records = $state<CompressionRecord[]>([]);
-  let assetStatuses = $state<Record<string, "checking" | "present" | "missing" | "unknown">>({});
+  let assetStatuses = $state<Record<string, DisplayStatus>>({});
+  const statusCache = new Map<string, { status: "present" | "missing-confirmed"; checkedAt: number }>();
   let expanded = $state<{ path: string; mode: "original" | "compressed" } | null>(null);
   let occurrences = $state<OccurrenceItem[]>([]);
+  let unsupportedRefs = $state<UnsupportedReferenceItem[]>([]);
   let loading = $state(false);
   let busy = $state(false);
   let message = $state("");
@@ -44,12 +46,38 @@
   let lastLocateOk = false;
   let lastLocateComplete = false;
 
-  function isAbortError(error: unknown, signal?: AbortSignal): boolean {
-    return Boolean(signal?.aborted) || (error instanceof Error && error.name === "AbortError");
-  }
+  let imageItems = $derived(occurrences.filter(item => item.target.kind !== "link"));
+  let linkItems = $derived(occurrences.filter(item => item.target.kind === "link"));
 
   function format(key: string, values: Record<string, string | number>): string {
     return t(key, values);
+  }
+
+  function notifyDock(text: string, type: "info" | "error" = "info", timeout = 3000): void {
+    if (context.feedback) {
+      context.feedback.notify(text, type, { timeout });
+    } else {
+      showMessage(text, timeout, type);
+    }
+  }
+
+  function previewSrc(path: string): string {
+    const parsed = trySource(path, origin);
+    return parsed?.kind === "asset" ? parsed.fetchURL : `/${path}`;
+  }
+
+  function badgeVariant(status: DisplayStatus | undefined): "checking" | "present" | "missing" | "unknown" {
+    if (status === "checking") return "checking";
+    if (status === "present") return "present";
+    if (status === "missing-confirmed") return "missing";
+    return "unknown";
+  }
+
+  function badgeTextKey(status: DisplayStatus | undefined): string {
+    if (status === "checking") return "image.records.assetStatus.checking";
+    if (status === "present") return "image.records.assetStatus.present";
+    if (status === "missing-confirmed") return "image.records.assetStatus.missing";
+    return "image.records.assetStatus.unknown";
   }
 
   function jumpToBlock(blockID: string): void {
@@ -65,12 +93,77 @@
 
   let dockAbort: AbortController | undefined;
 
+  function cacheStatus(path: string, status: AssetAvailability): void {
+    if (status === "present" || status === "missing-confirmed") {
+      statusCache.set(path, { status, checkedAt: Date.now() });
+    } else {
+      // Never cache "unknown" so transient kernel/network errors re-check on next activation.
+      statusCache.delete(path);
+    }
+  }
+
+  async function verifySinglePath(path: string, force: boolean, signal?: AbortSignal): Promise<AssetAvailability> {
+    if (!force) {
+      const cached = statusCache.get(path);
+      if (cached && Date.now() - cached.checkedAt < STATUS_TTL_MS) {
+        return cached.status;
+      }
+    }
+    const status = await checkAssetAvailability(kernel, path, signal);
+    cacheStatus(path, status);
+    return status;
+  }
+
+  async function verifyRecords(recordsToCheck: CompressionRecord[], force: boolean, signal?: AbortSignal): Promise<void> {
+    for (let offset = 0; offset < recordsToCheck.length; offset += 3) {
+      if (signal?.aborted) return;
+      await Promise.all(recordsToCheck.slice(offset, offset + 3).map(async record => {
+        try {
+          const result = await reconcileRecordPair(
+            record,
+            (path, sig) => verifySinglePath(path, force, sig),
+            store,
+            signal,
+          );
+          if (signal?.aborted) return;
+          assetStatuses[record.originalPath] = result.original;
+          assetStatuses[record.compressedPath] = result.compressed;
+          if (result.removed && expanded?.path === record.originalPath) {
+            expanded = null;
+            occurrences = [];
+            unsupportedRefs = [];
+          }
+        } catch (error) {
+          if (signal?.aborted || isAbortError(error)) return;
+          assetStatuses[record.originalPath] = "unknown";
+          assetStatuses[record.compressedPath] = "unknown";
+        }
+      }));
+    }
+  }
+
   onMount(() => {
     const unsubscribe = store.store.subscribe(next => {
       const prevByOriginal = new Map(records.map(r => [r.originalPath, r.compressedPath]));
       const prevKeys = new Set(Object.keys(assetStatuses));
+      const nextIndex = new Map<string, string>();
+      const nextPaths = new Set<string>();
+      for (const record of next.records) {
+        nextIndex.set(record.originalPath, record.compressedPath);
+        nextPaths.add(record.originalPath);
+        nextPaths.add(record.compressedPath);
+      }
+
       records = [...next.records];
-      const nextStatuses = { ...assetStatuses };
+      const nextStatuses: Record<string, DisplayStatus> = {};
+      for (const path of Object.keys(assetStatuses)) {
+        if (nextPaths.has(path)) {
+          nextStatuses[path] = assetStatuses[path];
+        } else {
+          statusCache.delete(path);
+        }
+      }
+
       const changedRecords: CompressionRecord[] = [];
       for (const record of next.records) {
         const origNew = !prevKeys.has(record.originalPath);
@@ -83,14 +176,19 @@
         }
       }
       assetStatuses = nextStatuses;
+      if (expanded && !nextIndex.has(expanded.path)) {
+        expanded = null;
+        occurrences = [];
+        unsupportedRefs = [];
+      }
       if (mounted && changedRecords.length > 0) {
-        void verifyRecords(changedRecords, dockAbort?.signal);
+        void verifyRecords(changedRecords, true, dockAbort?.signal);
       }
     });
     mounted = true;
-    const handleTabActivate = () => { if (!busy) void refresh(); };
+    const handleTabActivate = () => { if (!busy) void refresh(false); };
     window.addEventListener("omnikit-dock-tab-activated", handleTabActivate);
-    void refresh();
+    void refresh(true);
     return () => {
       dockAbort?.abort();
       unsubscribe();
@@ -98,36 +196,7 @@
     };
   });
 
-  async function checkAsset(path: string, signal?: AbortSignal): Promise<"present" | "missing" | "unknown"> {
-    try {
-      const res = await kernel.post<unknown>("/api/asset/statAsset", { path }, { signal });
-      return res.code === 0 ? "present" : "unknown";
-    } catch (error) {
-      if (error instanceof KernelRequestError && error.code === 1) return "missing";
-      return "unknown";
-    }
-  }
-
-  async function verifyRecords(recordsToCheck: CompressionRecord[], signal?: AbortSignal): Promise<void> {
-    for (let offset = 0; offset < recordsToCheck.length; offset += 3) {
-      if (signal?.aborted) return;
-      await Promise.all(recordsToCheck.slice(offset, offset + 3).map(async record => {
-        try {
-          const [origStatus, compStatus] = await Promise.all([
-            checkAsset(record.originalPath, signal),
-            checkAsset(record.compressedPath, signal),
-          ]);
-          assetStatuses[record.originalPath] = origStatus;
-          assetStatuses[record.compressedPath] = compStatus;
-        } catch {
-          assetStatuses[record.originalPath] = "unknown";
-          assetStatuses[record.compressedPath] = "unknown";
-        }
-      }));
-    }
-  }
-
-  async function refresh(): Promise<void> {
+  async function refresh(force = false): Promise<void> {
     dockAbort?.abort();
     dockAbort = new AbortController();
     const signal = dockAbort.signal;
@@ -139,27 +208,14 @@
       records = [...store.snapshot()];
       const snapshot = [...records];
       for (const record of snapshot) {
-        assetStatuses[record.originalPath] = "checking";
-        assetStatuses[record.compressedPath] = "checking";
+        const origCached = !force ? statusCache.get(record.originalPath) : undefined;
+        const compCached = !force ? statusCache.get(record.compressedPath) : undefined;
+        assetStatuses[record.originalPath] = origCached && Date.now() - origCached.checkedAt < STATUS_TTL_MS ? origCached.status : "checking";
+        assetStatuses[record.compressedPath] = compCached && Date.now() - compCached.checkedAt < STATUS_TTL_MS ? compCached.status : "checking";
       }
-      for (let offset = 0; offset < snapshot.length; offset += 3) {
-        if (signal.aborted) return;
-        await Promise.all(snapshot.slice(offset, offset + 3).map(async record => {
-          try {
-            const [origStatus, compStatus] = await Promise.all([
-              checkAsset(record.originalPath, signal),
-              checkAsset(record.compressedPath, signal),
-            ]);
-            assetStatuses[record.originalPath] = origStatus;
-            assetStatuses[record.compressedPath] = compStatus;
-          } catch {
-            assetStatuses[record.originalPath] = "unknown";
-            assetStatuses[record.compressedPath] = "unknown";
-          }
-        }));
-      }
-    } catch {
-      if (!signal.aborted) {
+      await verifyRecords(snapshot, force, signal);
+    } catch (error) {
+      if (!signal.aborted && !isAbortError(error)) {
         message = t("image.records.loadFailed");
       }
     } finally {
@@ -169,117 +225,14 @@
     }
   }
 
-  async function findReferences(path: string, signal?: AbortSignal): Promise<{
-    references: LocatedAssetReference[];
-    skippedNotebooks: string[];
-    unavailableAttributeViews: number;
-    metadataIncomplete: boolean;
-  }> {
-    const response = await kernel.post<unknown>("/api/asset/findAssetReferences", { paths: [path] }, { timeout: 120_000, signal });
-    const data = response.data as {
-      references?: unknown;
-      skippedNotebooks?: unknown;
-      unavailableAttributeViews?: unknown;
-    } | undefined;
-    if (!data || !Array.isArray(data.references)) throw new Error("Reference response is incomplete");
-    let rowFiltered = false;
-    const references = data.references.filter((row): row is LocatedAssetReference => {
-      if (!row || typeof row !== "object") { rowFiltered = true; return false; }
-      const item = row as Partial<LocatedAssetReference>;
-      const valid = typeof item.rootID === "string"
-        && (item.relinkable === undefined || typeof item.relinkable === "boolean")
-        && (item.notebook === undefined || typeof item.notebook === "string")
-        && (item.blockID === undefined || typeof item.blockID === "string");
-      if (!valid) rowFiltered = true;
-      return valid;
-    });
-    const skippedValid = Array.isArray(data.skippedNotebooks);
-    const skippedNotebooks = skippedValid
-      ? (data.skippedNotebooks as unknown[]).filter((item): item is string => typeof item === "string" && item.length > 0)
-      : [];
-    const avValid = data.unavailableAttributeViews === undefined || Array.isArray(data.unavailableAttributeViews);
-    const unavailableAttributeViews = Array.isArray(data.unavailableAttributeViews)
-      ? data.unavailableAttributeViews.length
-      : 0;
-    return {
-      references,
-      skippedNotebooks,
-      unavailableAttributeViews,
-      metadataIncomplete: !skippedValid || !avValid || rowFiltered,
-    };
-  }
-
-  async function loadBatchBlockDOMs(notebook: string, blockIDs: string[], signal?: AbortSignal): Promise<{ doms: Map<string, string>; incomplete: boolean }> {
-    const doms = new Map<string, string>();
-    let incomplete = false;
-    for (let offset = 0; offset < blockIDs.length; offset += DOM_BATCH_SIZE) {
-      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-      const chunk = blockIDs.slice(offset, offset + DOM_BATCH_SIZE);
-      try {
-        const res = await kernel.post<Record<string, unknown>>("/api/block/getBlockDOMs", { ids: chunk, notebook }, { signal });
-        const data = res.data;
-        if (!data || typeof data !== "object") {
-          incomplete = true;
-          continue;
-        }
-        for (const id of chunk) {
-          const dom = data[id];
-          if (typeof dom === "string" && dom.trim()) doms.set(id, dom);
-          else incomplete = true;
-        }
-      } catch (error) {
-        if (isAbortError(error, signal)) throw error;
-        for (const id of chunk) {
-          if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-          try {
-            const single = await kernel.post<{ id?: unknown; dom?: unknown }>("/api/block/getBlockDOM", { id, notebook }, { signal });
-            if (single.data?.id === id && typeof single.data.dom === "string" && single.data.dom.trim()) {
-              doms.set(id, single.data.dom);
-            } else {
-              incomplete = true;
-            }
-          } catch (singleErr) {
-            if (isAbortError(singleErr, signal)) throw singleErr;
-            incomplete = true;
-          }
-        }
-      }
-    }
-    return { doms, incomplete };
-  }
-
-  async function resolveDocumentTitle(rootID: string, cache: Map<string, string>, signal?: AbortSignal): Promise<string> {
-    const cached = cache.get(rootID);
-    if (cached) return cached;
-    let docTitle = "";
-    try {
-      const fullRes = await kernel.post<string>("/api/filetree/getFullHPathByID", { id: rootID }, { signal });
-      if (typeof fullRes.data === "string" && fullRes.data.trim()) {
-        docTitle = fullRes.data.trim();
-      }
-    } catch (error) {
-      if (isAbortError(error, signal)) throw error;
-      try {
-        const fallbackRes = await kernel.post<string>("/api/filetree/getHPathByID", { id: rootID }, { signal });
-        if (typeof fallbackRes.data === "string" && fallbackRes.data.trim()) {
-          docTitle = fallbackRes.data.trim();
-        }
-      } catch (fallbackErr) {
-        if (isAbortError(fallbackErr, signal)) throw fallbackErr;
-      }
-    }
-    docTitle = docTitle || rootID;
-    cache.set(rootID, docTitle);
-    return docTitle;
-  }
-
   async function locateOccurrences(
     record: CompressionRecord,
     mode: "original" | "compressed",
-    source: "user_click" | "post_action" = "user_click"
+    source: "user_click" | "post_action" = "user_click",
   ): Promise<void> {
     expanded = { path: record.originalPath, mode };
     occurrences = [];
+    unsupportedRefs = [];
     busy = true;
     lastLocateOk = false;
     lastLocateComplete = false;
@@ -289,86 +242,36 @@
     const searchPath = mode === "original" ? record.originalPath : record.compressedPath;
     const signal = dockAbort?.signal;
     try {
-      if (searchPath.includes("?box=")) {
+      const located = await locateAssetOccurrences(kernel, origin, searchPath, t, signal);
+      if (signal?.aborted) return;
+
+      if (located.encryptedUnavailable) {
+        lastLocateOk = false;
+        lastLocateComplete = false;
         if (source === "user_click") {
-          message = t("image.records.encryptedLookupUnsupported");
+          message = format("image.records.skippedNotebooks", { count: Math.max(1, located.skippedNotebooks.length) });
         }
         return;
       }
-      const { references: rows, skippedNotebooks, unavailableAttributeViews, metadataIncomplete } = await findReferences(searchPath, signal);
-      let complete = skippedNotebooks.length === 0 && unavailableAttributeViews === 0 && !metadataIncomplete;
-      const distinctRows: Array<LocatedAssetReference & { blockID: string; notebook: string }> = [];
-      const seen = new Set<string>();
-      const idsByNotebook = new Map<string, string[]>();
-      for (const row of rows) {
-        if (!row.blockID || !row.rootID || !row.notebook || !row.relinkable) {
-          complete = false;
-          continue;
-        }
-        const identityKey = `${row.notebook}/${row.blockID}`;
-        if (seen.has(identityKey)) continue;
-        seen.add(identityKey);
-        distinctRows.push(row as LocatedAssetReference & { blockID: string; notebook: string });
-        const list = idsByNotebook.get(row.notebook) ?? [];
-        list.push(row.blockID);
-        idsByNotebook.set(row.notebook, list);
-      }
 
-      const domsByNotebook = new Map<string, Map<string, string>>();
-      for (const [notebook, blockIDs] of idsByNotebook) {
-        const batchResult = await loadBatchBlockDOMs(notebook, blockIDs, signal);
-        if (batchResult.incomplete) complete = false;
-        domsByNotebook.set(notebook, batchResult.doms);
-      }
+      occurrences = located.items;
+      unsupportedRefs = located.unsupported;
+      lastLocateOk = located.ok;
+      lastLocateComplete = located.complete;
 
-      const targets: OccurrenceItem[] = [];
-      const docPathCache = new Map<string, string>();
-      for (const row of distinctRows) {
-        const dom = domsByNotebook.get(row.notebook)?.get(row.blockID);
-        if (!dom) { complete = false; continue; }
-        const template = document.createElement("template");
-        template.innerHTML = dom;
-        const roots = [...template.content.children].filter(node => node.getAttribute("data-node-id") === row.blockID);
-        if (template.content.children.length !== 1 || roots.length !== 1 || roots[0].querySelector("[data-node-id]")) {
-          complete = false;
-          continue;
-        }
-        const images = [...roots[0].querySelectorAll("img")];
-        const docTitle = await resolveDocumentTitle(row.rootID, docPathCache, signal);
-
-        for (let imageOrdinal = 0; imageOrdinal < images.length; imageOrdinal++) {
-          const image = images[imageOrdinal];
-          const attribute = image.hasAttribute("data-src") ? "data-src" : "src";
-          const oldPath = image.getAttribute(attribute);
-          if (oldPath !== searchPath) continue;
-          const target: OccurrenceTarget = {
-            rootID: row.rootID,
-            notebook: row.notebook,
-            blockID: row.blockID,
-            imageOrdinal,
-            oldPath,
-            baselineBlockDOM: dom,
-          };
-          const key = `${target.notebook}/${target.blockID}/${target.imageOrdinal}`;
-          if (targets.some(item => item.key === key)) continue;
-          targets.push({
-            key,
-            target,
-            label: `${docTitle} · ${row.blockID} · ${t("image.records.imagePosition")} ${imageOrdinal + 1}`,
-          });
-        }
-      }
-      occurrences = targets;
-      lastLocateOk = true;
-      lastLocateComplete = complete;
       const lookupWarnings = () => {
         const list: string[] = [];
-        if (skippedNotebooks.length > 0) list.push(format("image.records.skippedNotebooks", { count: skippedNotebooks.length }));
-        if (unavailableAttributeViews > 0 || metadataIncomplete) list.push(t("image.records.incompleteLookup"));
+        if (located.skippedNotebooks.length > 0) {
+          list.push(format("image.records.skippedNotebooks", { count: located.skippedNotebooks.length }));
+        }
+        if (located.unavailableAttributeViews > 0 || located.metadataIncomplete) {
+          list.push(t("image.records.incompleteLookup"));
+        }
         return list.join(" ");
       };
+
       if (source === "user_click") {
-        if (!targets.length) {
+        if (!located.items.length && !located.unsupported.length) {
           message = mode === "original"
             ? t("image.records.noOriginalReferences")
             : t("image.records.noCompressedReferences");
@@ -379,13 +282,14 @@
           if (warnText) message = warnText;
         }
       } else {
-        if (!targets.length) {
+        if (!located.items.length && !located.unsupported.length) {
           expanded = null;
           occurrences = [];
+          unsupportedRefs = [];
         }
       }
     } catch (error) {
-      if (!isAbortError(error, signal)) {
+      if (!signal?.aborted && !isAbortError(error) && source === "user_click") {
         message = t("image.records.lookupFailed");
       }
     } finally {
@@ -397,6 +301,7 @@
     if (expanded?.path === record.originalPath && expanded.mode === "original") {
       expanded = null;
       occurrences = [];
+      unsupportedRefs = [];
       message = "";
       return;
     }
@@ -410,6 +315,7 @@
     if (expanded?.path === record.originalPath && expanded.mode === "compressed") {
       expanded = null;
       occurrences = [];
+      unsupportedRefs = [];
       message = "";
       return;
     }
@@ -420,6 +326,30 @@
     if (!lastLocateOk || dockAbort?.signal.aborted) return;
     const nextOp: OperationKind = lastLocateComplete && occurrences.length === 0 && conflicts === 0 ? resolvedOp : "incomplete";
     await store.markOperation(record.originalPath, record.compressedPath, nextOp).catch(() => undefined);
+  }
+
+  function resolveRefreshedTarget(dom: string, previous: OccurrenceTarget): OccurrenceTarget | undefined {
+    if (previous.kind !== "link") {
+      return resolveImageOccurrence(dom, {
+        rootID: previous.rootID,
+        notebook: previous.notebook,
+        blockID: previous.blockID,
+        imageOrdinal: previous.imageOrdinal,
+        oldPath: previous.oldPath,
+      });
+    }
+    const template = document.createElement("template");
+    template.innerHTML = dom;
+    const roots = [...template.content.children].filter(el => el.getAttribute("data-node-id") === previous.blockID);
+    if (template.content.children.length !== 1 || roots.length !== 1 || roots[0].querySelector("[data-node-id]")) {
+      return undefined;
+    }
+    const candidates = findLinkCandidates(roots[0]);
+    const selected = candidates[previous.imageOrdinal];
+    if (!selected) return undefined;
+    if (previous.attribute && selected.attribute !== previous.attribute) return undefined;
+    if (selected.element.getAttribute(selected.attribute) !== previous.oldPath) return undefined;
+    return { ...previous, baselineBlockDOM: dom };
   }
 
   async function applyOccurrenceAction(
@@ -438,45 +368,97 @@
 
     busy = true;
     message = "";
+    const signal = dockAbort?.signal;
     try {
-      await kernel.post<unknown>("/api/asset/statAsset", { path: nextPath }, { signal: dockAbort?.signal });
+      const targetAvail = await checkAssetAvailability(kernel, nextPath, signal);
+      if (signal?.aborted) return;
+      if (targetAvail !== "present") {
+        throw new Error("Target asset is unavailable");
+      }
       const current = store.snapshot().find(r => r.originalPath === record.originalPath && r.compressedPath === record.compressedPath);
       if (!current) throw new Error("Record changed");
+
       let changed = 0;
       let conflicts = 0;
+      const dirtyBlocks = new Set<string>();
+
       for (const item of items) {
-        if (dockAbort?.signal.aborted) return;
-        if (item.target.oldPath !== expectedOldPath) {
+        if (signal?.aborted) return;
+        if (!sameAsset(item.target.oldPath, expectedOldPath, origin)) {
           conflicts++;
           continue;
         }
-        const res = await references.commitOccurrence(item.target, nextPath, dockAbort?.signal);
-        if (res === "replaced") changed++;
-        else conflicts++;
+        let target = item.target;
+        if (dirtyBlocks.has(target.blockID)) {
+          const freshDOM = await blockDOM(kernel, target.blockID, target.notebook, signal);
+          const refreshed = resolveRefreshedTarget(freshDOM, target);
+          if (!refreshed) {
+            conflicts++;
+            continue;
+          }
+          target = refreshed;
+        }
+        const res = await references.commitOccurrence(target, nextPath, signal);
+        if (res === "aborted" || signal?.aborted) return;
+        if (res === "replaced") {
+          changed++;
+          dirtyBlocks.add(target.blockID);
+        } else {
+          conflicts++;
+        }
       }
+
       const msg = format(resultKey, { [countVar]: changed, conflicts });
       message = msg;
-      showMessage(msg, 3000);
-      await locateOccurrences(record, mode, "post_action");
-      await syncOperationAfterAction(record, resolvedOp, conflicts);
-    } catch {
-      if (dockAbort?.signal.aborted) return;
+      notifyDock(msg, "info", 3000);
+
+      // Isolate post_action refresh and record sync so failures never overwrite confirmed action feedback.
+      try {
+        await locateOccurrences(record, mode, "post_action");
+        await syncOperationAfterAction(record, resolvedOp, conflicts);
+      } catch (postError) {
+        if (!signal?.aborted && !isAbortError(postError)) {
+          context.logger.warn("操作后刷新引用状态失败", postError);
+        }
+      }
+    } catch (error) {
+      if (signal?.aborted || isAbortError(error)) return;
       const errText = t(failKey);
       message = errText;
-      showMessage(errText, 3000, "error");
+      notifyDock(errText, "error", 3000);
     } finally {
       busy = false;
     }
   }
 
+  function showManualCopyDialog(path: string): void {
+    const dialog = new Dialog({
+      title: t("image.records.title"),
+      content: '<div class="b3-dialog__content"><p class="omnikit-manual-copy-label"></p><input class="b3-text-field omnikit-manual-copy-input" readonly /></div>',
+      width: "min(520px, 92vw)",
+    });
+    const label = dialog.element.querySelector<HTMLElement>(".omnikit-manual-copy-label");
+    const input = dialog.element.querySelector<HTMLInputElement>(".omnikit-manual-copy-input");
+    if (label) label.textContent = t("image.records.copyManual");
+    if (input) {
+      input.value = path;
+      input.onclick = () => input.select();
+      input.focus();
+      input.select();
+    }
+  }
+
   async function copyPath(path: string): Promise<void> {
     try {
+      if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+        throw new Error("Clipboard API unavailable");
+      }
       await navigator.clipboard.writeText(path);
       message = t("image.records.copied");
-      showMessage(t("image.records.copied"), 2000);
+      notifyDock(t("image.records.copied"), "info", 2000);
     } catch {
       message = t("image.records.copyFailed");
-      showMessage(t("image.records.copyFailed"), 3000, "error");
+      showManualCopyDialog(path);
     }
   }
 
@@ -488,6 +470,7 @@
       if (expanded?.path === record.originalPath) {
         expanded = null;
         occurrences = [];
+        unsupportedRefs = [];
       }
       records = [...store.snapshot()];
       message = t("image.records.removed");
@@ -523,7 +506,7 @@
       type="button"
       class="b3-button b3-button--outline image-records__refresh-btn"
       disabled={busy || loading}
-      onclick={refresh}
+      onclick={() => refresh(true)}
       title={t("image.records.refresh")}
     >
       {#if loading}
@@ -556,11 +539,13 @@
   {:else}
     <ul class="image-records__list">
       {#each records as record (record.originalPath)}
+        {@const origStatus = assetStatuses[record.originalPath] ?? "unknown"}
+        {@const compStatus = assetStatuses[record.compressedPath] ?? "unknown"}
         <li class="image-records__card">
           <div class="image-records__card-preview">
             <img
               class="image-records__img"
-              src={`/${record.compressedPath}`}
+              src={previewSrc(record.compressedPath)}
               alt={t("image.records.previewAlt")}
               loading="lazy"
             />
@@ -582,13 +567,13 @@
                 </svg>
               </button>
               <span
-                class={`image-records__badge image-records__badge--${assetStatuses[record.originalPath] ?? "unknown"}`}
+                class={`image-records__badge image-records__badge--${badgeVariant(origStatus)}`}
                 title={t("image.records.originalStatus")}
               >
-                {#if (assetStatuses[record.originalPath] ?? "unknown") === "checking"}
+                {#if origStatus === "checking"}
                   <span class="image-records__spinner image-records__spinner--small" aria-hidden="true"></span>
                 {/if}
-                {t(`image.records.assetStatus.${assetStatuses[record.originalPath] ?? "unknown"}`)}
+                {t(badgeTextKey(origStatus))}
               </span>
             </div>
 
@@ -607,13 +592,13 @@
                 </svg>
               </button>
               <span
-                class={`image-records__badge image-records__badge--${assetStatuses[record.compressedPath] ?? "unknown"}`}
+                class={`image-records__badge image-records__badge--${badgeVariant(compStatus)}`}
                 title={t("image.records.compressedStatus")}
               >
-                {#if (assetStatuses[record.compressedPath] ?? "unknown") === "checking"}
+                {#if compStatus === "checking"}
                   <span class="image-records__spinner image-records__spinner--small" aria-hidden="true"></span>
                 {/if}
-                {t(`image.records.assetStatus.${assetStatuses[record.compressedPath] ?? "unknown"}`)}
+                {t(badgeTextKey(compStatus))}
               </span>
             </div>
 
@@ -630,7 +615,7 @@
               <button
                 type="button"
                 class="b3-button b3-button--outline"
-                disabled={busy || (assetStatuses[record.originalPath] ?? "unknown") !== "present"}
+                disabled={busy || origStatus !== "present"}
                 onclick={() => locateRestoreOccurrences(record)}
               >
                 {expanded?.path === record.originalPath && expanded.mode === "compressed"
@@ -672,33 +657,92 @@
                   </p>
                 </div>
 
-                {#if occurrences.length}
-                  <div class="image-records__occurrences">
-                    {#each occurrences as item (item.key)}
-                      <div class="image-records__occurrence-row">
-                        <button
-                          type="button"
-                          class="image-records__jump-btn"
-                          title={item.label}
-                          onclick={() => jumpToBlock(item.target.blockID)}
-                        >
-                          <svg class="image-records__jump-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-                            <path d="M4.75 3a.75.75 0 0 0-.75.75v8.5c0 .414.336.75.75.75h6.5a.75.75 0 0 0 .75-.75v-8.5a.75.75 0 0 0-.75-.75h-6.5ZM2.5 3.75A2.25 2.25 0 0 1 4.75 1.5h6.5A2.25 2.25 0 0 1 13.5 3.75v8.5a2.25 2.25 0 0 1-2.25 2.25h-6.5A2.25 2.25 0 0 1 2.5 12.25v-8.5Z"/>
-                          </svg>
-                          <span class="image-records__jump-text">{item.label}</span>
-                        </button>
-                        <button
-                          type="button"
-                          class="b3-button b3-button--outline image-records__action-btn"
-                          disabled={busy}
-                          onclick={() => expanded && applyOccurrenceAction(record, expanded.mode, [item])}
-                        >
-                          {expanded.mode === "original" ? t("image.records.replaceThis") : t("image.records.restoreThis")}
-                        </button>
-                      </div>
-                    {/each}
+                {#if imageItems.length}
+                  <div class="image-records__ref-group">
+                    <span class="image-records__ref-group-title">{t("image.records.imageRefs", { count: imageItems.length })}</span>
+                    <div class="image-records__occurrences">
+                      {#each imageItems as item (item.key)}
+                        <div class="image-records__occurrence-row">
+                          <button
+                            type="button"
+                            class="image-records__jump-btn"
+                            title={item.label}
+                            onclick={() => jumpToBlock(item.target.blockID)}
+                          >
+                            <svg class="image-records__jump-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
+                              <path d="M4.75 3a.75.75 0 0 0-.75.75v8.5c0 .414.336.75.75.75h6.5a.75.75 0 0 0 .75-.75v-8.5a.75.75 0 0 0-.75-.75h-6.5ZM2.5 3.75A2.25 2.25 0 0 1 4.75 1.5h6.5A2.25 2.25 0 0 1 13.5 3.75v8.5a2.25 2.25 0 0 1-2.25 2.25h-6.5A2.25 2.25 0 0 1 2.5 12.25v-8.5Z"/>
+                            </svg>
+                            <span class="image-records__jump-text">{item.label}</span>
+                          </button>
+                          <button
+                            type="button"
+                            class="b3-button b3-button--outline image-records__action-btn"
+                            disabled={busy}
+                            onclick={() => expanded && applyOccurrenceAction(record, expanded.mode, [item])}
+                          >
+                            {expanded.mode === "original" ? t("image.records.replaceThis") : t("image.records.restoreThis")}
+                          </button>
+                        </div>
+                      {/each}
+                    </div>
                   </div>
+                {/if}
 
+                {#if linkItems.length}
+                  <div class="image-records__ref-group">
+                    <span class="image-records__ref-group-title">{t("image.records.linkRefs", { count: linkItems.length })}</span>
+                    <div class="image-records__occurrences">
+                      {#each linkItems as item (item.key)}
+                        <div class="image-records__occurrence-row">
+                          <button
+                            type="button"
+                            class="image-records__jump-btn"
+                            title={item.label}
+                            onclick={() => jumpToBlock(item.target.blockID)}
+                          >
+                            <svg class="image-records__jump-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
+                              <path d="M4.75 3a.75.75 0 0 0-.75.75v8.5c0 .414.336.75.75.75h6.5a.75.75 0 0 0 .75-.75v-8.5a.75.75 0 0 0-.75-.75h-6.5ZM2.5 3.75A2.25 2.25 0 0 1 4.75 1.5h6.5A2.25 2.25 0 0 1 13.5 3.75v8.5a2.25 2.25 0 0 1-2.25 2.25h-6.5A2.25 2.25 0 0 1 2.5 12.25v-8.5Z"/>
+                            </svg>
+                            <span class="image-records__jump-text">{item.label}</span>
+                          </button>
+                          <button
+                            type="button"
+                            class="b3-button b3-button--outline image-records__action-btn"
+                            disabled={busy}
+                            onclick={() => expanded && applyOccurrenceAction(record, expanded.mode, [item])}
+                          >
+                            {expanded.mode === "original" ? t("image.records.replaceThis") : t("image.records.restoreThis")}
+                          </button>
+                        </div>
+                      {/each}
+                    </div>
+                  </div>
+                {/if}
+
+                {#if unsupportedRefs.length}
+                  <div class="image-records__ref-group">
+                    <span class="image-records__ref-group-title">{t("image.records.unsupportedRefs", { count: unsupportedRefs.length })}</span>
+                    <div class="image-records__occurrences">
+                      {#each unsupportedRefs as item (item.key)}
+                        <div class="image-records__occurrence-row">
+                          <button
+                            type="button"
+                            class="image-records__jump-btn"
+                            title={item.label}
+                            onclick={() => jumpToBlock(item.blockID || item.rootID)}
+                          >
+                            <svg class="image-records__jump-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
+                              <path d="M4.75 3a.75.75 0 0 0-.75.75v8.5c0 .414.336.75.75.75h6.5a.75.75 0 0 0 .75-.75v-8.5a.75.75 0 0 0-.75-.75h-6.5ZM2.5 3.75A2.25 2.25 0 0 1 4.75 1.5h6.5A2.25 2.25 0 0 1 13.5 3.75v8.5a2.25 2.25 0 0 1-2.25 2.25h-6.5A2.25 2.25 0 0 1 2.5 12.25v-8.5Z"/>
+                            </svg>
+                            <span class="image-records__jump-text">{item.label}</span>
+                          </button>
+                        </div>
+                      {/each}
+                    </div>
+                  </div>
+                {/if}
+
+                {#if occurrences.length}
                   <div class="image-records__batch-actions">
                     <button
                       type="button"
@@ -709,7 +753,7 @@
                       {expanded.mode === "original" ? t("image.records.replaceAll") : t("image.records.restoreAll")}
                     </button>
                   </div>
-                {:else if !busy}
+                {:else if !busy && !unsupportedRefs.length}
                   <p class="image-records__empty-refs">{expanded?.mode === "original" ? t("image.records.noOriginalReferences") : t("image.records.noCompressedReferences")}</p>
                 {/if}
               </div>
@@ -733,6 +777,7 @@
     align-items: center;
     gap: 12px;
     min-height: 52px;
+    max-height: 56px;
     padding: 8px 12px;
     background: linear-gradient(135deg, color-mix(in srgb, var(--b3-theme-primary) 8%, transparent) 0%, color-mix(in srgb, var(--b3-theme-primary) 2%, transparent) 100%);
     border: 1px solid color-mix(in srgb, var(--b3-theme-primary) 15%, transparent);
@@ -854,7 +899,7 @@
     background: var(--b3-theme-surface);
     border: 1px solid var(--b3-theme-surface-lighter);
     border-radius: 8px;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    box-shadow: 0 1px 3px color-mix(in srgb, var(--b3-theme-on-background) 6%, transparent);
   }
   .image-records__card-preview {
     display: flex;
@@ -1017,11 +1062,23 @@
     color: var(--b3-theme-on-surface);
     opacity: 0.7;
   }
-  .image-records__occurrences {
+  .image-records__ref-group {
     display: flex;
     flex-direction: column;
     gap: 4px;
     margin-top: 4px;
+  }
+  .image-records__ref-group-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--b3-theme-on-surface);
+    opacity: 0.8;
+  }
+  .image-records__occurrences {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 2px;
   }
   .image-records__occurrence-row {
     display: flex;

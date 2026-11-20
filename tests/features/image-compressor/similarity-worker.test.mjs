@@ -293,3 +293,198 @@ test("AdaptiveImageCompressor forwards originalInfo and returns skipped cleanly 
   assert.equal(seenOriginalInfo.length, 1);
   assert.deepEqual(seenOriginalInfo[0], { mime: "image/png", width: 32, height: 24, animated: false });
 });
+
+test("AdaptiveImageCompressor forwards originalInfo dimensions to initOriginal and worker resizes during decode (B-1)", async () => {
+  const { AdaptiveImageCompressor } = await import("../../../src/features/image-compressor/similarity/AdaptiveImageCompressor.ts");
+  const initMessages = [];
+  const compressor = new AdaptiveImageCompressor(
+    {
+      name: "mock-codec",
+      encode: async () => ({ kind: "skipped", reason: "stop-after-init" }),
+    },
+    {
+      workerFactory: () => {
+        const w = createMockWorker();
+        const origPost = w.postMessage.bind(w);
+        w.postMessage = msg => {
+          if (msg.type === "initOriginal") initMessages.push(msg);
+          origPost(msg);
+        };
+        return w;
+      },
+    },
+  );
+  const config = {
+    compression: {
+      smartEnabled: true,
+      targetSimilarity: 0.99,
+      minInputBytes: 0,
+      maxInputBytes: 10 * 1024 * 1024,
+      excludedExtensions: [],
+      initialQuality: 0.8,
+      manualMaxEdge: 4096,
+      minSavingBytes: 0,
+      minSavingRatio: 0,
+      maxPixels: 32_000_000,
+      maxEncodeMs: 10000,
+    },
+  };
+  await compressor.encode(
+    new Blob([buildPngBytes({ width: 4000, height: 2000, animated: false })], { type: "image/png" }),
+    "large.png",
+    config,
+    undefined,
+    undefined,
+    "auto",
+  );
+  assert.equal(initMessages.length, 1);
+  assert.equal(initMessages[0].width, 4000);
+  assert.equal(initMessages[0].height, 2000);
+
+  // Verify similarity.worker.ts calls createImageBitmap with resizeWidth/resizeHeight when dimensions are supplied
+  const priorCreateImageBitmap = globalThis.createImageBitmap;
+  const priorOffscreenCanvas = globalThis.OffscreenCanvas;
+  const priorOnmessage = globalThis.onmessage;
+  const priorPostMessage = globalThis.postMessage;
+  const bitmapCalls = [];
+  const responses = [];
+  globalThis.createImageBitmap = async (_blob, opts) => {
+    bitmapCalls.push(opts);
+    return {
+      width: opts?.resizeWidth ?? 4000,
+      height: opts?.resizeHeight ?? 2000,
+      close() {},
+    };
+  };
+  globalThis.OffscreenCanvas = class {
+    constructor(w, h) { this.w = w; this.h = h; }
+    getContext() {
+      return {
+        imageSmoothingEnabled: false,
+        imageSmoothingQuality: "low",
+        drawImage() {},
+        getImageData: (_x, _y, w, h) => ({ data: new Uint8ClampedArray(w * h * 4) }),
+      };
+    }
+  };
+  globalThis.postMessage = msg => responses.push(msg);
+  try {
+    await import(`../../../src/features/image-compressor/similarity/similarity.worker.ts?b1=${Date.now()}`);
+    await globalThis.onmessage({
+      data: { type: "initOriginal", id: 1, original: new Blob(["x"]), maxEdge: 512, width: 4000, height: 2000 },
+    });
+    await globalThis.onmessage({
+      data: { type: "evaluate", id: 2, candidate: new Blob(["y"]) },
+    });
+    assert.deepEqual(bitmapCalls[0], { resizeWidth: 512, resizeHeight: 256, resizeQuality: "high" });
+    assert.deepEqual(bitmapCalls[1], { resizeWidth: 512, resizeHeight: 256, resizeQuality: "high" });
+    assert.equal(responses[0].width, 512);
+    assert.equal(responses[0].height, 256);
+  } finally {
+    globalThis.createImageBitmap = priorCreateImageBitmap;
+    globalThis.OffscreenCanvas = priorOffscreenCanvas;
+    globalThis.onmessage = priorOnmessage;
+    globalThis.postMessage = priorPostMessage;
+  }
+});
+
+test("AdaptiveImageCompressor enforces maxEncodeMs deadline without unhandled rejections (P2-5)", async () => {
+  const { AdaptiveImageCompressor } = await import("../../../src/features/image-compressor/similarity/AdaptiveImageCompressor.ts");
+  let terminated = false;
+  let unhandled = false;
+  const onUnhandled = () => { unhandled = true; };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const compressor = new AdaptiveImageCompressor(
+      {
+        name: "mock-codec",
+        encode: async () => ({
+          kind: "encoded",
+          value: { file: new File(["webp"], "out.webp", { type: "image/webp" }), originalBytes: 100, outputBytes: 10, width: 32, height: 24 },
+        }),
+      },
+      {
+        workerFactory: () => {
+          const w = {
+            onmessage: null,
+            onerror: null,
+            onmessageerror: null,
+            terminate() { terminated = true; },
+            postMessage(msg) {
+              if (msg.type === "initOriginal") {
+                queueMicrotask(() => w.onmessage?.({ data: { id: msg.id, type: "initOriginal", success: true, width: 32, height: 24 } }));
+              }
+              // Intentionally hang on "evaluate"
+            },
+          };
+          return w;
+        },
+      },
+    );
+    const config = {
+      compression: {
+        smartEnabled: true,
+        targetSimilarity: 0.99,
+        minInputBytes: 0,
+        maxInputBytes: 10 * 1024 * 1024,
+        excludedExtensions: [],
+        initialQuality: 0.8,
+        manualMaxEdge: 4096,
+        minSavingBytes: 0,
+        minSavingRatio: 0,
+        maxPixels: 1000000,
+        maxEncodeMs: 40,
+      },
+    };
+    await assert.rejects(
+      compressor.encode(new Blob([buildPngBytes({ width: 32, height: 24 })], { type: "image/png" }), "static.png", config, undefined, undefined, "auto"),
+      /deadline|AbortError|cancelled/i,
+    );
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(terminated, true);
+    assert.equal(unhandled, false);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("AdaptiveImageCompressor allows static WebP in manual-quick when smartEnabled is true (D04)", async () => {
+  const { AdaptiveImageCompressor } = await import("../../../src/features/image-compressor/similarity/AdaptiveImageCompressor.ts");
+  const webpBytes = new Uint8Array(48);
+  const view = new DataView(webpBytes.buffer);
+  webpBytes.set(Buffer.from("RIFF"), 0); view.setUint32(4, 40, true); webpBytes.set(Buffer.from("WEBP"), 8);
+  webpBytes.set(Buffer.from("VP8X"), 12); view.setUint32(16, 10, true);
+  webpBytes[24] = 9; webpBytes[27] = 9;
+  webpBytes.set(Buffer.from("VP8 "), 30); view.setUint32(34, 10, true);
+  webpBytes.set([0x9d, 0x01, 0x2a], 41);
+  view.setUint16(44, 10, true); view.setUint16(46, 10, true);
+
+  let codecCalled = false;
+  const compressor = new AdaptiveImageCompressor(
+    {
+      name: "mock-codec",
+      encode: async () => {
+        codecCalled = true;
+        return { kind: "skipped", reason: "insufficient-savings" };
+      },
+    },
+    { workerFactory: () => createMockWorker() },
+  );
+  const config = {
+    compression: {
+      smartEnabled: true,
+      targetSimilarity: 0.99,
+      minInputBytes: 0,
+      maxInputBytes: 10 * 1024 * 1024,
+      excludedExtensions: ["gif", "svg", "webp"],
+      initialQuality: 0.8,
+      manualMaxEdge: 4096,
+      minSavingBytes: 0,
+      minSavingRatio: 0,
+      maxPixels: 1000000,
+      maxEncodeMs: 10000,
+    },
+  };
+  await compressor.encode(new Blob([webpBytes], { type: "image/webp" }), "static.webp", config, undefined, undefined, "manual-quick");
+  assert.equal(codecCalled, true);
+});

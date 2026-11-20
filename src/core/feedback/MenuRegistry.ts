@@ -117,9 +117,19 @@ export class MenuRegistry {
       declared++;
       if (!entry.scope.active) { skippedFor.push(`${entry.owner}：功能作用域已停用`); continue; }
       if (!this.isFeatureRunning(entry.owner)) { skippedFor.push(`${entry.owner}：功能未运行`); continue; }
-      if (entry.matcher && !entry.matcher(normalizedContext)) {
-        skippedFor.push(`${entry.owner}：Matcher 条件不满足`);
-        continue;
+      if (entry.matcher) {
+        let matched = false;
+        try {
+          matched = entry.matcher(normalizedContext);
+        } catch (error) {
+          this.reportError(error);
+          skippedFor.push(`${entry.owner}：Matcher 抛错`);
+          continue;
+        }
+        if (!matched) {
+          skippedFor.push(`${entry.owner}：Matcher 条件不满足`);
+          continue;
+        }
       }
 
       let items: readonly OmniMenuItem[];

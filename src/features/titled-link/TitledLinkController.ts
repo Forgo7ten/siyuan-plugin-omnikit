@@ -1,10 +1,12 @@
 import type { FeatureContext } from "../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../core/framework/FeatureScope.ts";
 import type { KernelClient } from "../../core/host/KernelClient.ts";
+import { combineSignals, resolveNotebookID } from "../../core/host/ProtyleAdapter.ts";
+import { isInsideProtectedContainer } from "../../core/host/dom.ts";
 import { extractStaticFileName } from "./services/static-file.ts";
 import { fetchTitleResource } from "./services/dual-track-fetcher.ts";
 import { readAndDecodeTitleResource } from "./services/stream-parser.ts";
-import { extractNormalizedTitle } from "./services/title-normalizer.ts";
+import { finalizeTitle, resolveNormalizedTitle } from "./services/title-normalizer.ts";
 import { TitleCache } from "./services/title-cache.ts";
 import {
   captureLinkTarget,
@@ -13,7 +15,12 @@ import {
   resolveTitledLinkProtyle,
 } from "./services/safe-writer.ts";
 import type { GroupedLinkTitleUpdate } from "./services/safe-writer.ts";
-import type { LinkOccurrenceTarget, TitleFetchResult, TitledLinkConfig } from "./policy/types.ts";
+import type {
+  LinkOccurrenceTarget,
+  TitleFetchFailureReason,
+  TitleFetchResult,
+  TitledLinkConfig,
+} from "./policy/types.ts";
 
 export type LinkActionResult = "updated" | "unchanged" | "conflict" | "failed" | "aborted" | "superseded";
 export interface TitledLinkControllerOptions {
@@ -22,13 +29,15 @@ export interface TitledLinkControllerOptions {
   fetchImpl?: typeof fetch;
   kernel: KernelClient;
   cache?: TitleCache;
-  isComposing?: () => boolean;
+  isComposing?: (protyle?: unknown) => boolean;
   translate?: (key: string, values?: Record<string, string | number>) => string;
+  /** Optional timer injection for deterministic tests; defaults to setTimeout/clearTimeout. */
+  setTimer?: (handler: () => void, ms: number) => number;
+  clearTimer?: (id: number) => void;
 }
 
 interface BatchCandidate extends GroupedLinkTitleUpdate {
   token: number;
-  fallback: boolean;
 }
 
 interface PreparedBatchItem {
@@ -68,6 +77,8 @@ export async function mapWithConcurrency<T, R>(items: readonly T[], limit: numbe
 export class TitledLinkController {
   private readonly tokens = new WeakMap<HTMLElement, number>();
   private readonly pending = new Map<string, Promise<TitleFetchResult>>();
+  private readonly inFlight = new Map<HTMLElement, AbortController>();
+  private readonly inFlightBatches = new Set<string | HTMLElement>();
   private readonly kernel: KernelClient;
   private readonly cache: TitleCache;
   private readonly notify: (message: string) => void;
@@ -84,7 +95,13 @@ export class TitledLinkController {
     this.notify = options.notify ?? (() => undefined);
     this.frontend = options.frontend ?? (() => "unknown");
     this.t = options.translate ?? ((key) => key);
-    scope.own(() => { this.cache.clear(); this.pending.clear(); });
+    scope.own(() => {
+      this.cache.clear();
+      this.pending.clear();
+      this.inFlightBatches.clear();
+      for (const controller of this.inFlight.values()) controller.abort("scope disposed");
+      this.inFlight.clear();
+    });
   }
 
   /** Called synchronously from SiYuan's pre-insertion paste event; never intercepts paste. */
@@ -100,10 +117,15 @@ export class TitledLinkController {
     const parent = selection.anchorNode instanceof Element ? selection.anchorNode : selection.anchorNode?.parentElement;
     const block = parent?.closest<HTMLElement>("[data-node-id]");
     const blockID = block?.getAttribute("data-node-id");
-    if (!block || !blockID || !protyle?.wysiwyg?.element?.contains(block)) return;
+    if (!block || !blockID || !protyle?.wysiwyg?.element?.contains(block) || isInsideProtectedContainer(block)) return;
     const previous = new Set(matchingLinks(block, url));
-    const timer = setTimeout(() => {
-      release();
+    const setTimer = this.options.setTimer ?? ((handler, ms) => setTimeout(handler, ms) as unknown as number);
+    const clearTimer = this.options.clearTimer ?? ((id) => clearTimeout(id));
+    let settled = false;
+    let release: (() => void) | undefined;
+    const timer = setTimer(() => {
+      settled = true;
+      release?.();
       if (!this.scope.active || !this.config().auto.enabled) return;
       const editorElement = protyle?.wysiwyg?.element as HTMLElement | undefined;
       if (!editorElement?.isConnected) return;
@@ -111,12 +133,17 @@ export class TitledLinkController {
       if (!current) return;
       const matches = matchingLinks(current, url);
       const added = matches.filter(link => !previous.has(link));
-      // A re-render of a block with an existing identical URL is ambiguous.
-      const candidate = added.length === 1 && (current === block || previous.size === 0) ? added[0] : undefined;
+      // First paste: rapid consecutive pastes of the same URL produce multiple additions; pick the latest.
+      // Existing identical URL in block: require no re-render and exactly one added node to avoid ambiguity.
+      const candidate = previous.size === 0
+        ? added.at(-1)
+        : (current === block && added.length === 1 ? added[0] : undefined);
       if (!candidate || !isAutomaticLinkCandidate(candidate.textContent ?? "", url)) return;
       void this.runLink(candidate, protyle, "auto");
     }, 200);
-    const release = this.scope.own(() => clearTimeout(timer));
+    if (!settled) {
+      release = this.scope.own(() => clearTimer(timer));
+    }
   }
 
   /** Menu close/removeCB settles before the snapshot is taken. */
@@ -134,98 +161,117 @@ export class TitledLinkController {
   async runBatch(blocks: readonly HTMLElement[], protyle: any): Promise<void> {
     if (!this.scope.active) return;
     this.context.logger?.debug?.("开始批量提取链接标题", { blockCount: blocks.length });
-    const links = [...new Set(blocks.flatMap(block => [...block.querySelectorAll<HTMLElement>('span[data-type~="a"]')]))]
-      .filter(link => isHttpUrl(link.getAttribute("data-href") ?? ""));
-    if (links.length === 0) {
-      this.context.logger?.debug?.("批量提取链接标题：未找到有效 HTTP(S) 链接");
+    const claimedKeys: Array<string | HTMLElement> = [];
+    const eligibleBlocks: HTMLElement[] = [];
+    for (const block of blocks) {
+      const key = batchBlockKey(block, protyle);
+      if (this.inFlightBatches.has(key) || claimedKeys.includes(key)) continue;
+      claimedKeys.push(key);
+      eligibleBlocks.push(block);
+    }
+    if (eligibleBlocks.length === 0) {
+      this.context.logger?.debug?.("批量提取链接标题：目标块已在处理中，跳过重复触发");
       return;
     }
-    this.context.logger?.debug?.("批量提取链接标题：找到候选链接", { count: links.length });
-    const outcomes: BatchOutcome[] = new Array(links.length);
-    const prepared: PreparedBatchItem[] = [];
-    links.forEach((link, index) => {
-      const href = link?.getAttribute?.("data-href");
-      const text = link?.textContent;
-      this.context.logger?.debug?.("批量准备链接", { href, text });
-      const target = captureLinkTarget(link, protyle);
-      if (!target) {
-        const runner = resolveTitledLinkProtyle(protyle);
-        const block = link?.closest<HTMLElement>("[data-node-id]");
-        this.context.logger?.warn?.("批量准备链接失败：无法捕获链接目标", {
-          href,
-          text,
-          hasBlock: Boolean(block),
-          blockID: block?.getAttribute?.("data-node-id") ?? undefined,
-          hasUpdateTransaction: typeof runner?.updateTransactionElement === "function",
-        });
-        outcomes[index] = { result: "failed" };
+    for (const key of claimedKeys) this.inFlightBatches.add(key);
+
+    try {
+      const links = [...new Set(eligibleBlocks.flatMap(block => [...block.querySelectorAll<HTMLElement>('span[data-type~="a"]')]))]
+        .filter(link => isHttpUrl(link.getAttribute("data-href") ?? "") && !isInsideProtectedContainer(link));
+      if (links.length === 0) {
+        this.context.logger?.debug?.("批量提取链接标题：未找到有效 HTTP(S) 链接");
         return;
       }
-      const token = (this.tokens.get(link) ?? 0) + 1;
-      this.tokens.set(link, token);
-      prepared.push({ index, target, token });
-    });
-
-    const fetchedOutcomes = await mapWithConcurrency(prepared, 3, item => this.prepareBatch(item));
-    fetchedOutcomes.forEach((outcome, fetchedIndex) => {
-      outcomes[prepared[fetchedIndex].index] = outcome;
-    });
-    if (!this.scope.active) return;
-    const results = outcomes.map(outcome => outcome.result);
-    const groups = new Map<string, Array<{ index: number; candidate: BatchCandidate }>>();
-    outcomes.forEach((outcome, index) => {
-      const candidate = outcome.candidate;
-      if (!candidate) return;
-      if (!this.current(candidate.target, candidate.token)) {
-        results[index] = this.scope.active ? "superseded" : "aborted";
-        return;
-      }
-      const key = `${candidate.target.notebook}/${candidate.target.blockID}`;
-      const group = groups.get(key) ?? [];
-      group.push({ index, candidate });
-      groups.set(key, group);
-    });
-
-    for (const group of groups.values()) {
-      if (!this.scope.active) return;
-      const updates = group.map(({ candidate }) => ({
-        target: candidate.target,
-        title: candidate.title,
-        isCurrent: () => this.current(candidate.target, candidate.token),
-      }));
-      this.context.logger?.debug?.("开始批量提交块内链接标题写入", {
-        blockID: group[0]?.candidate?.target?.blockID,
-        count: updates.length,
+      this.context.logger?.debug?.("批量提取链接标题：找到候选链接", { count: links.length });
+      const outcomes: BatchOutcome[] = new Array(links.length);
+      const prepared: PreparedBatchItem[] = [];
+      const blockHTMLCache = new Map<HTMLElement, string>();
+      links.forEach((link, index) => {
+        const href = link?.getAttribute?.("data-href");
+        const text = link?.textContent;
+        this.context.logger?.debug?.("批量准备链接", { href, text });
+        const target = captureLinkTarget(link, protyle, blockHTMLCache);
+        if (!target) {
+          const runner = resolveTitledLinkProtyle(protyle);
+          const block = link?.closest<HTMLElement>("[data-node-id]");
+          this.context.logger?.warn?.("批量准备链接失败：无法捕获链接目标", {
+            href,
+            text,
+            hasBlock: Boolean(block),
+            blockID: block?.getAttribute?.("data-node-id") ?? undefined,
+            hasUpdateTransaction: typeof runner?.updateTransactionElement === "function",
+          });
+          outcomes[index] = { result: "failed" };
+          return;
+        }
+        const token = (this.tokens.get(link) ?? 0) + 1;
+        this.tokens.set(link, token);
+        prepared.push({ index, target, token });
       });
-      let writes;
-      try {
-        writes = await commitLinkTitles(updates, {
-          replaceTitle: this.config().replaceTitle,
-          signal: this.scope.signal,
-          kernel: this.kernel,
-          isComposing: this.options.isComposing,
-        });
-        this.context.logger?.debug?.("批量提交块内链接标题写入完成", {
-          blockID: group[0]?.candidate?.target?.blockID,
-          writes,
-        });
-      } catch (error) {
-        this.context.logger?.warn?.("链接标题批量写入失败", error);
-        for (const { index } of group) results[index] = this.scope.active ? "failed" : "aborted";
-        continue;
-      }
-      group.forEach(({ index, candidate }, writeIndex) => {
+
+      const fetchedOutcomes = await mapWithConcurrency(prepared, 3, item => this.prepareBatch(item));
+      fetchedOutcomes.forEach((outcome, fetchedIndex) => {
+        outcomes[prepared[fetchedIndex].index] = outcome;
+      });
+      if (!this.scope.active) return;
+      const results = outcomes.map(outcome => outcome.result);
+      const groups = new Map<string, Array<{ index: number; candidate: BatchCandidate }>>();
+      outcomes.forEach((outcome, index) => {
+        const candidate = outcome.candidate;
+        if (!candidate) return;
         if (!this.current(candidate.target, candidate.token)) {
           results[index] = this.scope.active ? "superseded" : "aborted";
           return;
         }
-        results[index] = writes[writeIndex] ?? "conflict";
+        const key = `${candidate.target.notebook}/${candidate.target.blockID}`;
+        const group = groups.get(key) ?? [];
+        group.push({ index, candidate });
+        groups.set(key, group);
       });
-    }
 
-    const updated = results.filter(result => result === "updated").length;
-    this.context.logger?.debug?.("批量提取链接标题结束", { total: links.length, updated, skipped: links.length - updated });
-    this.notify(this.t("titledLink.batchSummary", { total: links.length, updated, skipped: links.length - updated }));
+      for (const group of groups.values()) {
+        if (!this.scope.active) return;
+        const updates = group.map(({ candidate }) => ({
+          target: candidate.target,
+          title: candidate.title,
+          isCurrent: () => this.current(candidate.target, candidate.token),
+        }));
+        this.context.logger?.debug?.("开始批量提交块内链接标题写入", {
+          blockID: group[0]?.candidate?.target?.blockID,
+          count: updates.length,
+        });
+        let writes;
+        try {
+          writes = await commitLinkTitles(updates, {
+            replaceTitle: this.config().replaceTitle,
+            signal: this.scope.signal,
+            kernel: this.kernel,
+            isComposing: this.options.isComposing,
+          });
+          this.context.logger?.debug?.("批量提交块内链接标题写入完成", {
+            blockID: group[0]?.candidate?.target?.blockID,
+            writes,
+          });
+        } catch (error) {
+          this.context.logger?.warn?.("链接标题批量写入失败", error);
+          for (const { index } of group) results[index] = this.scope.active ? "failed" : "aborted";
+          continue;
+        }
+        group.forEach(({ index, candidate }, writeIndex) => {
+          if (!this.current(candidate.target, candidate.token)) {
+            results[index] = this.scope.active ? "superseded" : "aborted";
+            return;
+          }
+          results[index] = writes[writeIndex] ?? "conflict";
+        });
+      }
+
+      const updated = results.filter(result => result === "updated").length;
+      this.context.logger?.debug?.("批量提取链接标题结束", { total: links.length, updated, skipped: links.length - updated });
+      this.notify(this.t("titledLink.batchSummary", { total: links.length, updated, skipped: links.length - updated }));
+    } finally {
+      for (const key of claimedKeys) this.inFlightBatches.delete(key);
+    }
   }
 
   clear(): void { this.cache.clear(); this.pending.clear(); }
@@ -276,6 +322,15 @@ export class TitledLinkController {
     }
     const token = (this.tokens.get(link) ?? 0) + 1;
     this.tokens.set(link, token);
+    let request: AbortController | undefined;
+    if (mode === "manual") {
+      this.inFlight.get(link)?.abort("superseded by a newer run");
+      request = new AbortController();
+      this.inFlight.set(link, request);
+    }
+    const signal = request
+      ? (combineSignals(this.scope.signal, request.signal) ?? this.scope.signal)
+      : this.scope.signal;
     let loadingTimer: ReturnType<typeof setTimeout> | undefined;
     if (mode === "manual") loadingTimer = setTimeout(() => {
       if (this.current(target, token)) this.notify(this.t("titledLink.loading"));
@@ -286,7 +341,7 @@ export class TitledLinkController {
         mode,
         token,
       });
-      const fetched = await this.titleFor(target, mode);
+      const fetched = await this.titleFor(target, mode, signal);
       this.context.logger?.debug?.("链接标题抓取完成", {
         href: target.originalHref,
         status: fetched.status,
@@ -305,7 +360,7 @@ export class TitledLinkController {
       });
       const result = await commitLinkTitle(target, fetched.title, {
         replaceTitle: this.config().replaceTitle,
-        signal: this.scope.signal,
+        signal,
         kernel: this.kernel,
         isComposing: this.options.isComposing,
         isCurrent: () => this.current(target, token),
@@ -317,7 +372,7 @@ export class TitledLinkController {
       });
       if (!this.current(target, token)) return this.scope.active ? "superseded" : "aborted";
       if (mode === "manual" && !fetched.fallback && (result === "updated" || result === "unchanged")) {
-        this.cache.refresh(target.originalHref, fetched.title);
+        this.cache.refresh(cacheKey(target.originalHref), fetched.title);
       }
       if (mode === "manual") this.notify(this.t(result === "updated"
         ? fetched.fallback ? "titledLink.fallbackUsed" : "titledLink.updated"
@@ -331,6 +386,7 @@ export class TitledLinkController {
       return "failed";
     } finally {
       if (loadingTimer) clearTimeout(loadingTimer);
+      if (request && this.inFlight.get(link) === request) this.inFlight.delete(link);
     }
   }
 
@@ -352,7 +408,7 @@ export class TitledLinkController {
       if (fetched.status === "failure") return { result: "failed" };
       return {
         result: "failed",
-        candidate: { target, title: fetched.title, fallback: fetched.fallback, token },
+        candidate: { target, title: fetched.title, token },
       };
     } catch (error) {
       if (!this.current(target, token)) return { result: this.scope.active ? "superseded" : "aborted" };
@@ -365,53 +421,102 @@ export class TitledLinkController {
     return this.scope.active && this.tokens.get(target.linkElement) === token;
   }
 
-  private async titleFor(target: LinkOccurrenceTarget, mode: "auto" | "manual" | "batch"): Promise<TitleFetchResult> {
-    const url = target.originalHref;
+  private async titleFor(
+    target: LinkOccurrenceTarget,
+    mode: "auto" | "manual" | "batch",
+    signal?: AbortSignal,
+  ): Promise<TitleFetchResult> {
     const config = this.config();
+    const result = await this.resolveTitle(target, mode, config, signal);
+    if (result.status !== "success") return result;
+    const title = finalizeTitle(result.title, config.maxTitleLength);
+    return title ? { ...result, title } : { status: "failure", url: result.url, reason: "missing-title" };
+  }
+
+  private async resolveTitle(
+    target: LinkOccurrenceTarget,
+    mode: "auto" | "manual" | "batch",
+    config: TitledLinkConfig,
+    signal?: AbortSignal,
+  ): Promise<TitleFetchResult> {
+    const url = target.originalHref;
+    const key = cacheKey(url);
     const staticName = extractStaticFileName(url);
     if (staticName) return { status: "success", url, title: staticName, source: "static-file", fallback: false };
     if (mode === "auto") {
-      const cached = this.cache.get(url);
+      const cached = this.cache.get(key);
       if (cached) return { status: "success", url, title: cached, source: "title", fallback: false };
     }
     if (mode !== "manual") {
-      const inFlight = this.pending.get(url);
+      const inFlight = this.pending.get(key);
       if (inFlight) return inFlight;
     }
-    const generation = this.cache.captureGeneration(url);
-    const request = this.fetchAndNormalize(url, config).then(result => {
+    const generation = this.cache.captureGeneration(key);
+    const request = this.fetchAndNormalize(url, config, signal).then(result => {
       if (mode === "auto" && result.status === "success" && !result.fallback && this.scope.active) {
-        this.cache.set(url, result.title, generation);
+        this.cache.set(key, result.title, generation);
       }
       return result;
     });
-    if (mode !== "manual") this.pending.set(url, request);
+    if (mode !== "manual") this.pending.set(key, request);
     try { return await request; }
-    finally { if (this.pending.get(url) === request) this.pending.delete(url); }
+    finally { if (this.pending.get(key) === request) this.pending.delete(key); }
   }
 
-  private async fetchAndNormalize(url: string, config: TitledLinkConfig): Promise<TitleFetchResult> {
+  private async fetchAndNormalize(url: string, config: TitledLinkConfig, signal?: AbortSignal): Promise<TitleFetchResult> {
+    const effective = signal ?? this.scope.signal;
     try {
       const resource = await fetchTitleResource({
         url, frontend: this.frontend(), userAgent: this.context.settings.getUserAgent(),
-        kernelClient: this.kernel, signal: this.scope.signal, fetchImpl: this.options.fetchImpl,
+        kernelClient: this.kernel, signal: effective, fetchImpl: this.options.fetchImpl,
       });
       if (!resource.ok) {
         if (resource.body instanceof ReadableStream) await resource.body.cancel();
-        throw new Error(`HTTP ${resource.status}`);
+        const fallback = resolveNormalizedTitle("", url, config);
+        if (fallback.ok) return { status: "success", url, title: fallback.title, source: fallback.source, fallback: true };
+        return { status: "failure", url, reason: "http", httpStatus: resource.status };
       }
-      const decoded = await readAndDecodeTitleResource(resource, { signal: this.scope.signal });
-      if (this.scope.signal.aborted) return { status: "failure", url, reason: "aborted" };
-      const found = extractNormalizedTitle(decoded.html, url, config);
-      if (found) return { status: "success", url, ...found, fallback: found.source === "hostname" };
-      return { status: "failure", url, reason: "missing-title" };
+      const decoded = await readAndDecodeTitleResource(resource, { signal: effective });
+      if (effective.aborted) return { status: "failure", url, reason: "aborted" };
+      const extracted = resolveNormalizedTitle(decoded.html, url, config);
+      if (extracted.ok) {
+        return {
+          status: "success",
+          url,
+          title: extracted.title,
+          source: extracted.source,
+          fallback: extracted.source === "hostname",
+        };
+      }
+      return { status: "failure", url, reason: extracted.reason };
     } catch (error) {
-      if (this.scope.signal.aborted) return { status: "failure", url, reason: "aborted" };
-      const fallback = extractNormalizedTitle("", url, config);
-      if (fallback) return { status: "success", url, ...fallback, fallback: true };
-      return { status: "failure", url, reason: "network", error };
+      if (effective.aborted) return { status: "failure", url, reason: "aborted" };
+      const fallback = resolveNormalizedTitle("", url, config);
+      if (fallback.ok) return { status: "success", url, title: fallback.title, source: fallback.source, fallback: true };
+      const reason: TitleFetchFailureReason = isTimeoutError(error) ? "timeout" : "network";
+      return { status: "failure", url, reason, error };
     }
   }
+}
+
+function cacheKey(href: string): string {
+  try { return new URL(href).href; } catch { return href; }
+}
+
+function batchBlockKey(block: HTMLElement, protyle: any): string | HTMLElement {
+  const notebook = resolveNotebookID(protyle) ?? "";
+  const blockID = block.getAttribute?.("data-node-id") ?? "";
+  return notebook && blockID ? `${notebook}/${blockID}` : block;
+}
+
+function isTimeoutError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current && typeof current === "object"; depth++) {
+    const err = current as { name?: unknown; code?: unknown; cause?: unknown };
+    if (err.name === "TimeoutError" || err.code === "ETIMEDOUT") return true;
+    current = err.cause;
+  }
+  return false;
 }
 
 function matchingLinks(block: HTMLElement, href: string): HTMLElement[] {

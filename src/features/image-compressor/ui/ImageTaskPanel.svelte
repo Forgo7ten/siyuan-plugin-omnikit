@@ -4,7 +4,7 @@
 
   interface Props {
     job: ImageTaskStateStore;
-    t: (key: string) => string;
+    t: (key: string, values?: Record<string, string | number>) => string;
   }
 
   let { job, t }: Props = $props();
@@ -20,7 +20,7 @@
   </header>
 
   {#if state.phase === "preparing"}
-    <progress max={Math.max(1, state.total)} value={state.completed} aria-label={t("task.progress")}></progress>
+    <progress max={Math.max(1, state.preparedTotal ?? state.total)} value={state.prepared ?? 0} aria-label={t("task.progress")}></progress>
   {:else if active}
     <progress aria-label={t("task.progress")}></progress>
   {/if}
@@ -33,24 +33,17 @@
   {/if}
 
   <div class="metrics">
-    <div><strong>{state.completed} / {state.total}</strong><span>{t("task.prepared")}</span></div>
+    <div>
+      <strong>{state.phase === "preparing" ? `${state.prepared ?? 0} / ${state.preparedTotal ?? state.total}` : `${state.completed} / ${state.total}`}</strong>
+      <span>{t("task.prepared")}</span>
+    </div>
     <div><strong>{state.uploaded}</strong><span>{t("task.uploaded")}</span></div>
     <div><strong>{state.skipped}</strong><span>{t("task.skipped")}</span></div>
     <div><strong>{state.failed}</strong><span>{t("task.failedItems")}</span></div>
+    {#if state.unknown > 0}
+      <div><strong>{state.unknown}</strong><span>{t("image.batch.unknownCount", { count: state.unknown })}</span></div>
+    {/if}
   </div>
-
-  {#if state.referenceResult}
-    <p>{t("task.backend")}: {state.referenceResult.backend}</p>
-    {#if state.referenceResult.backend === "sql"}
-      <p class="note">{t("task.sqlCoverage")}</p>
-    {/if}
-    {#if state.referenceResult.referencesChanged !== null}
-      <p>{t("task.referencesChanged")}: {state.referenceResult.referencesChanged}</p>
-    {/if}
-    {#if state.referenceResult.storageRecordsChanged !== null}
-      <p>{t("task.storageChanged")}: {state.referenceResult.storageRecordsChanged}</p>
-    {/if}
-  {/if}
 
   {#if state.phase === "unknown"}
     <p class="warning" role="alert">{t("task.unknownHelp")}</p>
@@ -76,7 +69,7 @@
   .metrics div { min-width: 0; padding: 12px; border: 1px solid var(--b3-border-color); border-radius: 6px; }
   .metrics strong, .metrics span { display: block; overflow-wrap: anywhere; }
   .metrics strong { font-size: 20px; font-variant-numeric: tabular-nums; }
-  .metrics span, .note { color: var(--b3-theme-on-surface); font-size: 12px; margin-top: 6px; }
+  .metrics span { color: var(--b3-theme-on-surface); font-size: 12px; margin-top: 6px; }
   .warning { color: var(--b3-theme-error); }
   .message { overflow-wrap: anywhere; }
   details { max-height: 200px; overflow: auto; margin: 12px 0; }

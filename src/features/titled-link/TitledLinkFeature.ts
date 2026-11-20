@@ -1,21 +1,40 @@
-import { getFrontend, showMessage } from "siyuan";
+import { showMessage } from "siyuan";
 import { BaseFeature } from "../../core/framework/BaseFeature.ts";
 import type { FeatureContext } from "../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../core/framework/FeatureScope.ts";
 import type { MenuContext } from "../../core/feedback/MenuRegistry.ts";
 import type { SettingsManager } from "../../core/store/SettingsManager.ts";
 import { KernelClient } from "../../core/host/KernelClient.ts";
+import { getCurrentFrontend } from "../../core/host/Platform.ts";
+import { resolveProtyleElement } from "../../core/host/ProtyleAdapter.ts";
+import { isInsideProtectedContainer } from "../../core/host/dom.ts";
 import { translate } from "../../i18n/translate.ts";
 import { TitledLinkController, isHttpUrl } from "./TitledLinkController.ts";
+
+export interface TitledLinkFeatureOptions {
+  now?: () => number;
+}
+
+interface CompositionState {
+  since: number;
+  composing: boolean;
+}
+
+const COMPOSITION_STALE_MS = 10_000;
 
 /** Host adapter for titled-link; all listeners and editor composition hooks belong to its scope. */
 export class TitledLinkFeature extends BaseFeature {
   static readonly ID = "titled-link";
   private controller?: TitledLinkController;
   private readonly kernel = new KernelClient();
-  private readonly composingEditors = new Map<HTMLElement, boolean>();
+  private readonly composingEditors = new Map<HTMLElement, CompositionState>();
+  private readonly now: () => number;
 
-  constructor(plugin: FeatureContext["plugin"], settings: SettingsManager) {
+  constructor(
+    plugin: FeatureContext["plugin"],
+    settings: SettingsManager,
+    options: TitledLinkFeatureOptions = {},
+  ) {
     super({
       id: TitledLinkFeature.ID,
       title: translate(plugin.i18n as Record<string, unknown>, "feature.titledLink.title"),
@@ -26,6 +45,7 @@ export class TitledLinkFeature extends BaseFeature {
       minimumAppVersion: "3.8.4",
       frontends: ["all"],
     });
+    this.now = options.now ?? Date.now;
     // Ensure the registered feature settings file stays aligned with its storage contract.
     settings.store(TitledLinkFeature.ID);
   }
@@ -35,16 +55,35 @@ export class TitledLinkFeature extends BaseFeature {
       translate(context.plugin.i18n as Record<string, unknown>, key, values);
     const controller = new TitledLinkController(context, scope, {
       kernel: this.kernel,
-      notify: message => { if (scope.active) showMessage(message, 3000); },
-      frontend: () => getFrontend(),
-      isComposing: () => [...this.composingEditors.values()].some(Boolean),
+      notify: message => {
+        if (context.feedback) context.feedback.notify(message, "info", { timeout: 3000 });
+        else if (scope.active) showMessage(message, 3000);
+      },
+      frontend: () => getCurrentFrontend(),
+      isComposing: (protyle?: unknown) => {
+        const editor = resolveProtyleElement(protyle);
+        const currentTime = this.now();
+        const lookup = (element: HTMLElement | undefined): boolean => {
+          if (!element) return false;
+          const entry = this.composingEditors.get(element);
+          if (!entry) return false;
+          if (element.isConnected === false) return false;
+          if (entry.composing && currentTime - entry.since > COMPOSITION_STALE_MS) return false;
+          return entry.composing;
+        };
+        if (editor) return lookup(editor);
+        for (const element of this.composingEditors.keys()) {
+          if (lookup(element)) return true;
+        }
+        return false;
+      },
       translate: t,
     });
     this.controller = controller;
     scope.own(() => {
       for (const editor of this.composingEditors.keys()) {
-        editor.removeEventListener("compositionstart", this.onCompositionStart);
-        editor.removeEventListener("compositionend", this.onCompositionEnd);
+        editor.removeEventListener("compositionstart", this.onCompositionStart, { capture: true });
+        editor.removeEventListener("compositionend", this.onCompositionEnd, { capture: true });
       }
       this.composingEditors.clear();
       controller.clear();
@@ -53,7 +92,7 @@ export class TitledLinkFeature extends BaseFeature {
 
     const onPaste = (event: CustomEvent<any>) => {
       const detail = event.detail;
-      this.attachCompositionTracking(detail?.protyle?.element);
+      this.attachCompositionTracking(resolveProtyleElement(detail?.protyle));
       controller.scheduleAutoPaste(detail);
     };
     context.plugin.eventBus.on("paste", onPaste);
@@ -63,15 +102,17 @@ export class TitledLinkFeature extends BaseFeature {
       const detail = menu.detail;
       const link = detail?.element as HTMLElement | undefined;
       const protyle = detail?.protyle;
-      this.attachCompositionTracking(protyle?.element);
+      this.attachCompositionTracking(resolveProtyleElement(protyle));
       const isLink = link?.getAttribute?.("data-type")?.split(" ").includes("a") === true;
       const href = link?.getAttribute?.("data-href");
       const isHttp = isHttpUrl(href ?? "");
-      if (!link || !isLink || !protyle || !isHttp) {
+      const inProtected = link ? isInsideProtectedContainer(link) : false;
+      if (!link || !isLink || !protyle || !isHttp || inProtected) {
         context.logger?.debug("链接菜单跳过生成提取标题项", {
           hasLink: Boolean(link),
           isLink,
           isHttp,
+          inProtected,
           hasProtyle: Boolean(protyle),
         });
         return [];
@@ -94,10 +135,10 @@ export class TitledLinkFeature extends BaseFeature {
       const detail = menu.detail;
       const protyle = detail?.protyle;
       const blocks = Array.isArray(detail?.blockElements) ? detail.blockElements as HTMLElement[] : [];
-      this.attachCompositionTracking(protyle?.element);
+      this.attachCompositionTracking(resolveProtyleElement(protyle));
       const count = new Set(blocks.flatMap(block =>
         [...block.querySelectorAll<HTMLElement>('span[data-type~="a"]')])
-        .filter(link => isHttpUrl(link.getAttribute("data-href") ?? ""))).size;
+        .filter(link => isHttpUrl(link.getAttribute("data-href") ?? "") && !isInsideProtectedContainer(link))).size;
       if (!count || !protyle) {
         context.logger?.debug("块菜单跳过生成批量提取链接标题项", {
           blockCount: blocks.length,
@@ -119,17 +160,17 @@ export class TitledLinkFeature extends BaseFeature {
     };
     context.menus.contribute(scope, this.meta.id, "blockicon", "extract-block-link-titles", onBlockMenu);
 
-    const onEditor = (event: CustomEvent<any>) => this.attachCompositionTracking(event.detail?.protyle?.element);
+    const onEditor = (event: CustomEvent<any>) => this.attachCompositionTracking(resolveProtyleElement(event.detail?.protyle));
     for (const name of ["loaded-protyle-static", "switch-protyle"] as const) {
       context.plugin.eventBus.on(name, onEditor);
       scope.own(() => context.plugin.eventBus.off(name, onEditor));
     }
 
     const onDestroyProtyle = (event: CustomEvent<any>) => {
-      const editor = event.detail?.protyle?.element;
-      if (editor instanceof HTMLElement && this.composingEditors.has(editor)) {
-        editor.removeEventListener("compositionstart", this.onCompositionStart);
-        editor.removeEventListener("compositionend", this.onCompositionEnd);
+      const editor = resolveProtyleElement(event.detail?.protyle);
+      if (editor && this.composingEditors.has(editor)) {
+        editor.removeEventListener("compositionstart", this.onCompositionStart, { capture: true });
+        editor.removeEventListener("compositionend", this.onCompositionEnd, { capture: true });
         this.composingEditors.delete(editor);
       }
     };
@@ -142,20 +183,29 @@ export class TitledLinkFeature extends BaseFeature {
     this.controller = undefined;
   }
 
+  protected onSettingsChanged(): void {
+    this.controller?.clear();
+  }
+
   private readonly onCompositionStart = (event: Event): void => {
     const editor = event.currentTarget;
-    if (editor instanceof HTMLElement) this.composingEditors.set(editor, true);
+    if (editor instanceof HTMLElement) {
+      this.composingEditors.set(editor, { since: this.now(), composing: true });
+    }
   };
 
   private readonly onCompositionEnd = (event: Event): void => {
     const editor = event.currentTarget;
-    if (editor instanceof HTMLElement) this.composingEditors.set(editor, false);
+    if (editor instanceof HTMLElement) {
+      this.composingEditors.set(editor, { since: this.now(), composing: false });
+    }
   };
 
   private attachCompositionTracking(editor: unknown): void {
     if (!(editor instanceof HTMLElement) || this.composingEditors.has(editor)) return;
-    this.composingEditors.set(editor, false);
-    editor.addEventListener("compositionstart", this.onCompositionStart);
-    editor.addEventListener("compositionend", this.onCompositionEnd);
+    this.composingEditors.set(editor, { since: 0, composing: false });
+    // SiYuan's wysiwyg element calls stopPropagation() on compositionstart/end in the bubble phase.
+    editor.addEventListener("compositionstart", this.onCompositionStart, { capture: true });
+    editor.addEventListener("compositionend", this.onCompositionEnd, { capture: true });
   }
 }

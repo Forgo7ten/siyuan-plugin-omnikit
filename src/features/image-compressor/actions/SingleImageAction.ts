@@ -1,13 +1,14 @@
+import { isInsideProtectedContainer } from "../../../core/host/dom.ts";
+import { isAbortError } from "../../../core/feedback/UiFeedback.ts";
 import type { FeatureContext } from "../../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../../core/framework/FeatureScope.ts";
 import { blockDOM } from "../services/references.ts";
-import { resolveImageOccurrence, type ImageOccurrenceEvidence } from "../services/ImageOccurrenceResolver.ts";
+import { resolveImageOccurrence, imagePath, type ImageOccurrenceEvidence } from "../services/ImageOccurrenceResolver.ts";
 import type { OccurrenceTarget } from "../policy/contracts.ts";
 import type { ImageProcessingServices } from "../services/ImageProcessingServices.ts";
 import type { Downloaded } from "../services/download.ts";
 import { NODE_ID } from "../policy/parseImageConfig.ts";
-import { resolveSource } from "../policy/source.ts";
-import { imagePath } from "../services/ImageOccurrenceResolver.ts";
+import { buildReplacementPath, resolveSource } from "../policy/source.ts";
 import { assertImagePayload, calibrateRemoteImageFile } from "./RemoteImageWatcher.ts";
 import { classifyImageCandidate } from "../policy/ImageCandidateClassifier.ts";
 import { translate } from "../../../i18n/translate.ts";
@@ -36,6 +37,16 @@ export interface ManualCompressionPreview {
   searchRounds?: Array<{ quality: number; similarity: number; bytes: number }>;
 }
 
+export class LocalizationOutcomeError extends Error {
+  constructor(
+    readonly outcome: "unknown" | "conflict",
+    readonly localPath?: string,
+  ) {
+    super(`Remote image localization ended with ${outcome}`);
+    this.name = "LocalizationOutcomeError";
+  }
+}
+
 /** Captures the right-clicked image as one exact persisted occurrence. */
 export async function resolveSelectedOccurrence(
   menuDetail: unknown,
@@ -44,7 +55,7 @@ export async function resolveSelectedOccurrence(
   signal: AbortSignal,
 ): Promise<OccurrenceTarget | undefined> {
   const image = findTargetImage(menuDetail);
-  if (!image || image.closest("[data-type='NodeBlockQueryEmbed'], .protyle-wysiwyg__embed, pre, code, script, style, [data-type='NodeCodeBlock']")) {
+  if (!image || isInsideProtectedContainer(image)) {
     return undefined;
   }
   const owner = image.closest("[data-node-id]");
@@ -64,6 +75,26 @@ export async function resolveSelectedOccurrence(
   };
   const dom = await blockDOM(services.kernel, blockID, editor.notebook, signal);
   return resolveImageOccurrence(dom, evidence);
+}
+
+/**
+ * Re-reads the persisted block after localization via kernel API and rebuilds a fresh
+ * `OccurrenceTarget` with the updated `baselineBlockDOM` and `oldPath`.
+ */
+export async function revalidateAndRecaptureTarget(
+  previous: OccurrenceTarget,
+  expectedNewPath: string,
+  services: ImageProcessingServices,
+  signal: AbortSignal,
+): Promise<OccurrenceTarget | undefined> {
+  const dom = await blockDOM(services.kernel, previous.blockID, previous.notebook, signal);
+  return resolveImageOccurrence(dom, {
+    rootID: previous.rootID,
+    notebook: previous.notebook,
+    blockID: previous.blockID,
+    imageOrdinal: previous.imageOrdinal,
+    oldPath: expectedNewPath,
+  });
 }
 
 /** The quick action uses defaults and changes only the clicked occurrence. */
@@ -98,14 +129,24 @@ export async function compressSelectedImageQuick(
       ...(providedFile ? { providedFile } : {}),
     });
     if (!scope.active || signal.aborted) return;
-    const outcomeKey = result.status === "skipped"
-      ? "image.single.noBenefit"
-      : result.reference === "replaced"
-        ? "image.single.quickSuccess"
+    if (result.status === "skipped") return { kind: "notify", key: "image.single.noBenefit" };
+    if (result.reference === "aborted") return { kind: "silent" };
+    const outcomeKey = result.reference === "replaced"
+      ? "image.single.quickSuccess"
+      : result.reference === "unknown"
+        ? "image.single.unknown"
         : "image.single.conflict";
     return { kind: "notify", key: outcomeKey };
   } catch (error) {
-    if (!signal.aborted) {
+    if (error instanceof LocalizationOutcomeError) {
+      if (error.outcome === "unknown") {
+        return error.localPath
+          ? { kind: "copyable-path", path: error.localPath, key: "image.single.unknown" }
+          : { kind: "notify", key: "image.single.unknown" };
+      }
+      return { kind: "notify", key: "image.single.conflict" };
+    }
+    if (!signal.aborted && !isAbortError(error)) {
       context.logger.warn("压缩所选图片失败", error);
       return {
         kind: "notify",
@@ -189,15 +230,45 @@ export async function compressSelectedImageCustom(
         },
         save: async (preview, replace) => {
           if (!scope.active || signal.aborted) return;
-          const localizedTarget = await localizeRemoteOccurrence(target, services, signal, replace, previewOriginal);
-          const result = await services.savePreview(localizedTarget, preview.file, signal, replace);
-          if (result.status === "saved" && result.reference === "conflict") {
+          const metrics = {
+            originalBytes: preview.originalBytes,
+            compressedBytes: preview.compressedBytes,
+            quality: preview.quality,
+            similarity: preview.similarity,
+          };
+          let localizedTarget: OccurrenceTarget;
+          try {
+            // For remote sources, always localize the single selected occurrence to a local original first
+            // even when `replace` (WebP replacement) is unchecked.
+            localizedTarget = await localizeRemoteOccurrence(target, services, signal, true, previewOriginal);
+          } catch (error) {
+            if (error instanceof LocalizationOutcomeError) {
+              if (error.outcome === "unknown") {
+                if (error.localPath) {
+                  services.ui.copyablePath(error.localPath, "image.single.unknown");
+                } else {
+                  services.ui.notify(translate(context.plugin.i18n as Record<string, unknown>, "image.single.unknown"));
+                }
+                return;
+              }
+              services.ui.notify(translate(context.plugin.i18n as Record<string, unknown>, "image.single.conflict"));
+              return;
+            }
+            throw error;
+          }
+          if (!scope.active || signal.aborted) return;
+          const result = await services.savePreview(localizedTarget, preview.file, signal, replace, metrics);
+          if (!scope.active || signal.aborted || result.status !== "saved") return;
+          if (result.reference === "aborted") return;
+          if (result.reference === "unknown") {
+            services.ui.copyablePath(result.path, "image.single.unknown");
+          } else if (result.reference === "conflict") {
             services.ui.copyablePath(result.path, "image.single.conflict");
-          } else if (result.status === "saved" && !replace) {
+          } else if (!replace || result.reference === "not-requested") {
             services.ui.copyablePath(result.path, "image.dialog.savedOnly");
-          } else if (result.status === "saved" && result.reference === "replaced") {
-            services.ui.notify(translate(context.plugin.i18n, "image.single.quickSuccess"));
-          } else if (result.status === "saved") {
+          } else if (result.reference === "replaced") {
+            services.ui.notify(translate(context.plugin.i18n as Record<string, unknown>, "image.single.quickSuccess"));
+          } else {
             services.ui.copyablePath(result.path, "image.single.conflict");
           }
         },
@@ -208,7 +279,7 @@ export async function compressSelectedImageCustom(
       throw error;
     }
   } catch (error) {
-    if (!signal.aborted) {
+    if (!signal.aborted && !isAbortError(error)) {
       context.logger.warn("准备单图压缩预览失败", error);
       return {
         kind: "notify",
@@ -222,7 +293,7 @@ export async function localizeRemoteOccurrence(
   target: OccurrenceTarget,
   services: ImageProcessingServices,
   signal: AbortSignal,
-  replace: boolean = true,
+  _replace: boolean = true,
   suppliedOriginal?: Downloaded,
   onFile?: (file: File) => void,
 ): Promise<OccurrenceTarget> {
@@ -239,12 +310,22 @@ export async function localizeRemoteOccurrence(
   const file = await calibrateRemoteImageFile(original.blob, original.name);
   const localPath = await services.assets.upload(file, target.rootID, signal);
   onFile?.(file);
-  if (!replace) {
-    return { ...target, oldPath: localPath };
-  }
   const committed = await services.references.commitOccurrence(target, localPath, signal);
-  if (committed !== "replaced") throw new Error("Remote image localization could not be verified");
-  return { ...target, oldPath: localPath };
+  if (committed === "aborted") {
+    throw new DOMException("Aborted", "AbortError");
+  }
+  if (committed === "unknown") {
+    throw new LocalizationOutcomeError("unknown", localPath);
+  }
+  if (committed !== "replaced") {
+    throw new LocalizationOutcomeError("conflict", localPath);
+  }
+  const expectedLocalPath = buildReplacementPath(target.oldPath, localPath, services.origin);
+  const recaptured = await revalidateAndRecaptureTarget(target, expectedLocalPath, services, signal);
+  if (!recaptured) {
+    throw new LocalizationOutcomeError("conflict", localPath);
+  }
+  return recaptured;
 }
 
 function findTargetImage(detail: unknown): HTMLImageElement | undefined {

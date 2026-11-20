@@ -1,5 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { withBlockWriteLease } from "../../../src/core/host/BlockWriteLease.ts";
+import { PROTECTED_CONTAINER_SELECTOR } from "../../../src/core/host/dom.ts";
 import {
   captureLinkTarget,
   commitLinkTitle,
@@ -26,21 +28,32 @@ class LinkElement {
 }
 
 class BlockElement {
-  constructor(id, links, prefix = "") {
+  constructor(id, links, prefix = "", attributes = new Map()) {
     this.id = id;
     this.links = links;
     this.prefix = prefix;
+    this.attributes = attributes;
     this.isConnected = true;
     for (const link of links) link.block = this;
   }
-  getAttribute(name) { return name === "data-node-id" ? this.id : null; }
+  getAttribute(name) {
+    if (name === "data-node-id") return this.id;
+    return this.attributes.get(name) ?? null;
+  }
+  removeAttribute(name) {
+    this.attributes.delete(name);
+  }
   querySelectorAll(selector) {
     if (selector === 'span[data-type~="a"]') return this.links;
+    if (selector === "[parent-heading]") return this.links.filter(l => l.getAttribute("parent-heading") !== null);
     if (selector === "[data-node-id]") return [];
     return [];
   }
   querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
-  get outerHTML() { return `<div data-node-id="${this.id}">${this.prefix}${this.links.map(link => link.outerHTML).join("")}</div>`; }
+  get outerHTML() {
+    const extraAttrs = [...this.attributes.entries()].map(([k, v]) => ` ${k}="${v}"`).join("");
+    return `<div data-node-id="${this.id}"${extraAttrs}>${this.prefix}${this.links.map(link => link.outerHTML).join("")}</div>`;
+  }
 }
 
 function parseBlock(html) {
@@ -670,4 +683,153 @@ test("restores collapsed caret on rolled-back text node when updateTransactionEl
     globalThis.getSelection = prevSelection;
     globalThis.document = prevDocument;
   }
+}));
+
+test("drops render-only parent-heading before updateBlock", async () => {
+  const prevDOMParser = globalThis.DOMParser;
+  try {
+    const links = [new LinkElement("https://example.com/0", "https://example.com/0")];
+    const block = new BlockElement("20260101000000-abcdefg", links);
+    const target = {
+      ...captureLinkTarget(links[0], {
+        block: { rootID: "20260101000000-rootabc", box: "notebook" },
+        notebookId: "notebook",
+        updateTransactionElement() {},
+      }),
+      protyle: null,
+    };
+
+    const persistedLink = new LinkElement("https://example.com/0", "https://example.com/0");
+    persistedLink.setAttribute("parent-heading", "20260101000000-heading");
+    const origLinkOuterHTML = Object.getOwnPropertyDescriptor(LinkElement.prototype, "outerHTML").get;
+    Object.defineProperty(persistedLink, "outerHTML", {
+      get() {
+        const ph = this.getAttribute("parent-heading");
+        const base = origLinkOuterHTML.call(this);
+        return ph === null ? base : base.replace("<span ", `<span parent-heading="${ph}" `);
+      },
+    });
+    const persistedBlock = new BlockElement(
+      block.id,
+      [persistedLink],
+      "",
+      new Map([["parent-heading", "20260101000000-heading"], ["updated", "20260101000000"]]),
+    );
+    globalThis.DOMParser = class {
+      parseFromString() {
+        return { querySelectorAll: selector => selector === "[data-node-id]" ? [persistedBlock] : [] };
+      }
+    };
+
+    const updateCalls = [];
+    const kernel = {
+      async post(path, body) {
+        if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-rootabc", box: "notebook" }, code: 0 };
+        if (path === "/api/block/getBlockDOM") return { data: { id: block.id, dom: persistedBlock.outerHTML }, code: 0 };
+        if (path === "/api/block/updateBlock") { updateCalls.push(body); return { code: 0, data: null }; }
+        return { data: {}, code: 0 };
+      },
+    };
+
+    const result = await commitLinkTitle(target, "Clean Title", { replaceTitle: false, kernel });
+    assert.equal(result, "updated");
+    assert.equal(updateCalls.length, 1);
+    assert.doesNotMatch(updateCalls[0].data, /parent-heading/);
+    assert.match(updateCalls[0].data, /updated="20260101000000"/);
+    assert.match(updateCalls[0].data, />Clean Title<\/span>/);
+  } finally {
+    globalThis.DOMParser = prevDOMParser;
+  }
+});
+
+test("shares block write lease with Core withBlockWriteLease", async () => installDOMParser(async () => {
+  const { links, block, protyle, transactions } = fixture();
+  const target = captureLinkTarget(links[0], protyle);
+  const events = [];
+  let releaseLease;
+  let markLeaseAcquired;
+  const leaseAcquired = new Promise(resolve => { markLeaseAcquired = resolve; });
+  const leaseGate = new Promise(resolve => { releaseLease = resolve; });
+
+  const held = withBlockWriteLease("notebook", block.id, undefined, async () => {
+    events.push("core:start");
+    markLeaseAcquired();
+    await leaseGate;
+    events.push("core:end");
+  });
+
+  await leaseAcquired;
+  const commitPromise = commitLinkTitle(target, "After Lease", { replaceTitle: false }).then(res => {
+    events.push(`commit:${res}`);
+    return res;
+  });
+
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(events, ["core:start"]);
+  assert.equal(transactions.length, 0);
+
+  releaseLease();
+  await held;
+  const result = await commitPromise;
+  assert.equal(result, "updated");
+  assert.deepEqual(events, ["core:start", "core:end", "commit:updated"]);
+}));
+
+test("refuses to capture links inside protected containers", () => {
+  const protyle = {
+    block: { rootID: "20260101000000-rootabc", box: "notebook" },
+    notebookId: "notebook",
+    updateTransactionElement() {},
+  };
+  const block = {
+    getAttribute: name => (name === "data-node-id" ? "20260101000000-code" : null),
+    querySelectorAll: () => [protectedLink],
+    outerHTML: '<div data-node-id="20260101000000-code"></div>',
+  };
+  const protectedLink = {
+    textContent: "https://example.com",
+    getAttribute: name => ({ "data-type": "a", "data-href": "https://example.com" }[name] ?? null),
+    closest(selector) {
+      if (selector === PROTECTED_CONTAINER_SELECTOR) return {};
+      if (selector === "[data-node-id]") return block;
+      return null;
+    },
+  };
+  assert.equal(captureLinkTarget(protectedLink, protyle), null);
+});
+
+test("rejects grouped update when duplicate ordinals are present", async () => installDOMParser(async () => {
+  const { links, protyle, transactions } = fixture(1);
+  const first = captureLinkTarget(links[0], protyle);
+  const results = await commitLinkTitles([
+    { target: first, title: "Title A" },
+    { target: first, title: "Title B" },
+  ], { replaceTitle: false });
+  assert.deepEqual(results, ["conflict", "conflict"]);
+  assert.equal(transactions.length, 0);
+}));
+
+test("commitLinkTitle waits for target editor IME without blocking when another editor is composing", async () => installDOMParser(async () => {
+  const { links, protyle: protyleA } = fixture(1);
+  const protyleB = {
+    block: { rootID: "20260101000000-rootbbb", box: "notebook" },
+    notebookId: "notebook",
+    element: { isConnected: true },
+    updateTransactionElement() {},
+  };
+  const targetA = captureLinkTarget(links[0], protyleA);
+  let composingB = true;
+  let checkedProtyle;
+
+  const result = await commitLinkTitle(targetA, "Clean Title", {
+    replaceTitle: false,
+    isComposing: protyle => {
+      checkedProtyle = protyle;
+      return protyle === protyleB ? composingB : false;
+    },
+  });
+
+  assert.equal(result, "updated");
+  assert.equal(checkedProtyle, protyleA);
+  composingB = false;
 }));

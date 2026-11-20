@@ -11,6 +11,7 @@ const requiredFiles = [
   "index.js",
   "index.css",
   "icon.png",
+  "preview.png",
   "README.md",
   "README.zh-CN.md",
   "browser-image-compression.js",
@@ -36,10 +37,12 @@ async function requireRealDirectory(target, workspaceRoot) {
 }
 
 async function readPluginManifest(directory) {
+  const manifestPath = path.join(directory, "plugin.json");
   try {
-    return JSON.parse(await readFile(path.join(directory, "plugin.json"), "utf8"));
-  } catch {
-    return null;
+    return JSON.parse(await readFile(manifestPath, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw new Error(`Unable to read plugin manifest: ${manifestPath}`, { cause: error });
   }
 }
 

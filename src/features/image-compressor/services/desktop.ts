@@ -1,19 +1,28 @@
 import type { DesktopBridge, Downloaded, ReadOptions } from "./download.ts";
 import { requireRemotePermission } from "./download.ts";
+
 export type NodeRequire = (name: string) => any;
 export type LocalConsent = (realPath: string) => Promise<boolean>;
-function abort(signal?: AbortSignal): void { if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError"); }
+
+const MAX_REDIRECT_LOOP_GUARD = 20;
+
+function abort(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+}
+
 function sanitizedUserAgent(raw?: string): string | undefined {
   if (raw === undefined || raw === "") return undefined;
   if (raw.length > 256 || /[\r\n\u0000-\u001f\u007f]/.test(raw)) throw new Error("Invalid User-Agent");
   return raw;
 }
+
 /** Call only after desktop capability detection. Node built-ins are loaded only on demand. */
 export function createDesktopBridge(load: NodeRequire, approve: LocalConsent): DesktopBridge {
   const fs = load("node:fs/promises"), url = load("node:url"), https = load("node:https"), http = load("node:http");
   return {
     async readFile(fileURL: string, options: ReadOptions): Promise<Downloaded> {
-      const u = new URL(fileURL); if (u.protocol !== "file:" || u.host && u.host !== "localhost" || u.search || u.hash) throw new Error("Invalid or network file URL");
+      const u = new URL(fileURL);
+      if (u.protocol !== "file:" || u.host && u.host !== "localhost" || u.search || u.hash) throw new Error("Invalid or network file URL");
       const real: string = await fs.realpath(url.fileURLToPath(u)); abort(options.signal);
       if (!await approve(real)) throw new Error("Local file read not authorised"); abort(options.signal);
       const handle = await fs.open(real, "r"), controller = new AbortController();
@@ -21,9 +30,18 @@ export function createDesktopBridge(load: NodeRequire, approve: LocalConsent): D
       options.signal?.addEventListener("abort", relay, { once: true });
       const timer = setTimeout(() => controller.abort(new Error("File read timed out")), options.timeoutMs);
       try {
-        const before = await handle.stat(); if (!before.isFile() || !before.size || before.size > options.maxBytes) throw new Error("Not a regular file or exceeds byte limit");
-        const chunks: Uint8Array[] = []; let position = 0;
-        while (position < before.size) { abort(controller.signal); const buffer = new Uint8Array(Math.min(262144, before.size - position)); const result = await handle.read(buffer, 0, buffer.length, position); if (!result.bytesRead) throw new Error("Local file shortened while reading"); position += result.bytesRead; chunks.push(buffer.slice(0, result.bytesRead)); }
+        const before = await handle.stat();
+        if (!before.isFile() || !before.size || before.size > options.maxBytes) throw new Error("Not a regular file or exceeds byte limit");
+        const chunks: Uint8Array[] = [];
+        let position = 0;
+        while (position < before.size) {
+          abort(controller.signal);
+          const buffer = new Uint8Array(Math.min(262144, before.size - position));
+          const result = await handle.read(buffer, 0, buffer.length, position);
+          if (!result.bytesRead) throw new Error("Local file shortened while reading");
+          position += result.bytesRead;
+          chunks.push(buffer.slice(0, result.bytesRead));
+        }
         const after = await handle.stat(); abort(controller.signal);
         if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ino !== after.ino) throw new Error("Local file changed while reading");
         return { blob: new Blob(chunks.map(chunk => chunk.slice().buffer as ArrayBuffer)), name: real.replace(/\\/g, "/").split("/").pop() || "image" };
@@ -32,8 +50,13 @@ export function createDesktopBridge(load: NodeRequire, approve: LocalConsent): D
     async download(raw: string, options: ReadOptions): Promise<Downloaded> {
       let current = requireRemotePermission(raw);
       const userAgent = sanitizedUserAgent(options.userAgent);
-      for (let redirects = 0; redirects <= 3; redirects++) {
+      const deadline = Date.now() + Math.max(1, options.timeoutMs);
+
+      for (let redirects = 0; redirects <= MAX_REDIRECT_LOOP_GUARD; redirects++) {
         abort(options.signal);
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) throw new Error("Download timed out");
+
         const result = await new Promise<{ blob?: Blob; location?: string }>((resolve, reject) => {
           let settled = false, response: any;
           const finish = (error?: unknown, value?: { blob?: Blob; location?: string }) => {
@@ -87,13 +110,13 @@ export function createDesktopBridge(load: NodeRequire, approve: LocalConsent): D
           });
           const onAbort = () => { finish(new DOMException("Cancelled", "AbortError")); response?.destroy(); request.destroy(); };
           options.signal?.addEventListener("abort", onAbort, { once: true });
-          const timer = setTimeout(() => { finish(new Error("Download timed out")); request.destroy(); }, options.timeoutMs);
+          const timer = setTimeout(() => { finish(new Error("Download timed out")); request.destroy(); }, remainingMs);
           request.on("close", () => clearTimeout(timer));
           request.on("error", finish);
           if (options.signal?.aborted) onAbort(); else request.end();
         });
         if (result.location) {
-          if (redirects === 3) throw new Error("Too many redirects");
+          if (redirects === MAX_REDIRECT_LOOP_GUARD) throw new Error("Too many redirects");
           const next = new URL(result.location, current);
           current = requireRemotePermission(next.href);
           continue;

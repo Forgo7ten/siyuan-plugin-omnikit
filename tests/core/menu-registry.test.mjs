@@ -222,3 +222,41 @@ test("menu router dispatches multi-document selection to context without droppin
 
   dispose();
 });
+
+test("a throwing matcher skips only its own entry and continues rendering", () => {
+  const scope = new FeatureScope();
+  const reported = [];
+  const debugLogs = [];
+  const logger = {
+    debug(message, data) { debugLogs.push({ message, data }); },
+    info() {},
+    warn() {},
+    error() {},
+  };
+  const menu = new MenuRegistry(() => true, error => reported.push(error), logger);
+
+  menu.contribute(
+    scope,
+    "brokenFeature",
+    "doc-tree",
+    "broken",
+    () => [{ id: "broken", label: "Broken", run: () => {} }],
+    () => { throw new Error("matcher failed"); },
+  );
+  menu.contribute(
+    scope,
+    "healthyFeature",
+    "doc-tree",
+    "healthy",
+    () => [{ id: "healthy", label: "Healthy", run: () => {} }],
+    () => true,
+  );
+
+  const items = [];
+  menu.render("doc-tree", { addItem: item => items.push(item) }, { location: "doc-tree" });
+  assert.equal(items.length, 1);
+  assert.equal(items[0].label, "[OmniKit] Healthy");
+  assert.equal(reported.length, 1);
+  assert.match(reported[0].message, /matcher failed/);
+  assert.ok(debugLogs.at(-1)?.data?.跳过项?.some(entry => entry.includes("Matcher 抛错")));
+});

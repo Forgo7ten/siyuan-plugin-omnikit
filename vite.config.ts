@@ -30,6 +30,7 @@ export default defineConfig({
           rename: { stripBase: true },
         },
         { src: ".generated/icon.png", dest: ".", rename: { stripBase: true } },
+        { src: ".generated/preview.png", dest: ".", rename: { stripBase: true } },
         { src: "assets/omnikit-*.svg", dest: "assets", rename: { stripBase: true } },
       ],
     }),

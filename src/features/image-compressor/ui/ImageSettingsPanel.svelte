@@ -1,9 +1,12 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import type { JsonStore } from "../../../core/store/JsonStore.ts";
+  import { SettingsConflictError, isSettingsConflictError } from "../../../core/store/SettingsConflictError.ts";
+  import { describeError } from "../../../core/host/describeError.ts";
   import type { ImageFeatureConfig } from "../policy/parseImageConfig.ts";
   import { defaultImageFeatureConfig, NODE_ID, parseImageConfig } from "../policy/parseImageConfig.ts";
   import { KernelClient } from "../../../core/host/KernelClient.ts";
+  import { resolveDocumentTitle } from "../services/documentTitle.ts";
 
   interface Props {
     store: JsonStore<ImageFeatureConfig>;
@@ -25,21 +28,15 @@
   async function resolveHPath(id: string, signal: AbortSignal): Promise<void> {
     if (signal.aborted || resolvedHPaths[id]) return;
     try {
-      const res = await kernel.post<string>("/api/filetree/getFullHPathByID", { id }, { signal });
-      if (!signal.aborted && typeof res.data === "string" && res.data.trim()) {
-        resolvedHPaths[id] = res.data.trim();
-        return;
+      const title = await resolveDocumentTitle(kernel, id, {
+        signal,
+        endpoints: ["/api/filetree/getFullHPathByID", "/api/filetree/getHPathByID"],
+      });
+      if (!signal.aborted && title && title !== id) {
+        resolvedHPaths[id] = title;
       }
     } catch {
-      if (signal.aborted) return;
-      try {
-        const fallback = await kernel.post<string>("/api/filetree/getHPathByID", { id }, { signal });
-        if (!signal.aborted && typeof fallback.data === "string" && fallback.data.trim()) {
-          resolvedHPaths[id] = fallback.data.trim();
-        }
-      } catch {
-        // Fallback: leave unresolved so meta.title or id is used
-      }
+      // Fallback: leave unresolved so meta.title or id is used
     }
   }
 
@@ -130,14 +127,18 @@
       const next = parseImageConfig(plain);
       const expected = $state.snapshot(baseline);
       await store.update(current => {
-        if (!same(current, expected)) throw new Error(t("settings.concurrentChange"));
+        if (!same(current, expected)) throw new SettingsConflictError(t("settings.concurrentChange"));
         Object.assign(current, next);
       });
       adopt(store.snapshot());
       notice = t("settings.saved");
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : String(cause);
-      if (error.includes(t("settings.concurrentChange"))) conflict = true;
+      if (isSettingsConflictError(cause)) {
+        conflict = true;
+        error = t("settings.concurrentChange");
+      } else {
+        error = describeError(cause);
+      }
     } finally {
       busy = false;
     }
@@ -157,7 +158,7 @@
       }
       rootID = "";
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : String(cause);
+      error = describeError(cause);
     } finally {
       busy = false;
     }
@@ -172,7 +173,7 @@
       adopt(store.snapshot());
       notice = t("recovery.settingsOk");
     } catch (cause) {
-      error = `${t("recovery.settingsFailed")} ${cause instanceof Error ? cause.message : String(cause)}`;
+      error = `${t("recovery.settingsFailed")} ${describeError(cause)}`;
     } finally {
       busy = false;
     }
@@ -183,7 +184,7 @@
       const plain = $state.snapshot(draft);
       parseImageConfig(plain);
       return "";
-    } catch (cause) { return cause instanceof Error ? cause.message : String(cause); }
+    } catch (cause) { return describeError(cause); }
   }
 
   let validationError = $derived(dirty ? validateDraft() : "");
@@ -242,13 +243,7 @@
       </label>
     </section>
 
-    <section class="setting-card">
-      <header><h3>{t("settings.metadata")}</h3></header>
-      <label class="setting-row">
-        <span><strong>{t("settings.preserveExif")}</strong><small>{t("settings.exifUnavailable")}</small></span>
-        <input type="checkbox" class="b3-switch" checked={draft.metadata.preserveExif} disabled />
-      </label>
-    </section>
+    <!-- preserveExif remains in the settings schema, default false; hidden until encoder supports it. -->
 
     <section class="setting-card">
       <header><h3>{t("settings.documents")} · {Object.keys(draft.auto.pageAllowlist).length}</h3>
@@ -360,11 +355,11 @@
     -webkit-backdrop-filter: blur(20px) saturate(180%);
     border: 1px solid var(--b3-border-color);
     border-radius: 9999px;
-    box-shadow: 0 10px 28px -4px rgba(0, 0, 0, 0.16), 0 2px 8px -2px rgba(0, 0, 0, 0.08);
+    box-shadow: var(--b3-dialog-shadow, 0 10px 28px -4px color-mix(in srgb, var(--b3-theme-on-background) 16%, transparent));
     transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
   }
   .save-bar:hover {
-    box-shadow: 0 14px 36px -4px rgba(0, 0, 0, 0.22), 0 4px 12px -2px rgba(0, 0, 0, 0.1);
+    box-shadow: var(--b3-dialog-shadow, 0 14px 36px -4px color-mix(in srgb, var(--b3-theme-on-background) 22%, transparent));
   }
   .save-bar__status {
     display: flex;
@@ -384,17 +379,17 @@
     transition: background 0.2s, box-shadow 0.2s;
   }
   .status-dot--saved {
-    background: #10b981;
-    box-shadow: 0 0 6px rgba(16, 185, 129, 0.5);
+    background: var(--b3-theme-success, var(--b3-theme-primary));
+    box-shadow: 0 0 6px color-mix(in srgb, var(--b3-theme-success, var(--b3-theme-primary)) 50%, transparent);
   }
   .status-dot--dirty {
-    background: #f59e0b;
-    box-shadow: 0 0 8px rgba(245, 158, 11, 0.6);
+    background: var(--b3-card-warning-color, var(--b3-theme-secondary));
+    box-shadow: 0 0 8px color-mix(in srgb, var(--b3-card-warning-color, var(--b3-theme-secondary)) 60%, transparent);
     animation: omnikit-pulse 2s infinite ease-in-out;
   }
   .status-dot--busy {
     background: var(--b3-theme-primary);
-    box-shadow: 0 0 8px rgba(var(--b3-theme-primary-rgb, 66, 133, 244), 0.6);
+    box-shadow: 0 0 8px color-mix(in srgb, var(--b3-theme-primary) 60%, transparent);
     animation: omnikit-pulse 1s infinite ease-in-out;
   }
   .status-text {
@@ -432,7 +427,7 @@
     border: 1px solid transparent;
   }
   .bar-btn--ghost:hover:not(:disabled) {
-    background: var(--b3-theme-surface-lighter, rgba(125, 125, 125, 0.12));
+    background: var(--b3-theme-surface-lighter);
     color: var(--b3-theme-on-background);
   }
   .bar-btn--ghost:disabled {
@@ -441,16 +436,16 @@
   }
   .bar-btn--primary {
     background: var(--b3-theme-primary);
-    color: #ffffff;
-    box-shadow: 0 2px 8px rgba(var(--b3-theme-primary-rgb, 66, 133, 244), 0.35);
+    color: var(--b3-theme-on-primary);
+    box-shadow: 0 2px 8px color-mix(in srgb, var(--b3-theme-primary) 35%, transparent);
   }
   .bar-btn--primary:hover:not(:disabled) {
     filter: brightness(1.08);
-    box-shadow: 0 4px 14px rgba(var(--b3-theme-primary-rgb, 66, 133, 244), 0.45);
+    box-shadow: 0 4px 14px color-mix(in srgb, var(--b3-theme-primary) 45%, transparent);
     transform: translateY(-0.5px);
   }
   .bar-btn--primary:disabled {
-    background: var(--b3-theme-surface-lighter, rgba(125, 125, 125, 0.15));
+    background: var(--b3-theme-surface-lighter);
     color: var(--b3-theme-on-surface);
     opacity: 0.5;
     box-shadow: none;

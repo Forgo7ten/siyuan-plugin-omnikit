@@ -19,9 +19,9 @@ test("decodes UTF-8, GBK/GB2312 and Big5 from headers or meta tags", () => {
   assert.match(decodeHtmlBytes(big5, "text/html; charset=big5").html, /中文/);
 });
 
-test("cancels a direct response stream immediately after a closing title tag", async () => {
+test("cancels a direct response stream as soon as the head closes", async () => {
   let cancelled = false;
-  const first = new TextEncoder().encode("<html><head><title>Captured</title>");
+  const first = new TextEncoder().encode("<html><head><title>Captured</title></head>");
   const stream = new ReadableStream({
     start(controller) {
       controller.enqueue(first);
@@ -61,11 +61,11 @@ test("aborting a stream read cancels the underlying reader", async () => {
   assert.equal(cancelled, true);
 });
 
-test("detects split closing tag with whitespace across multiple chunks using 64-char overlap window", async () => {
+test("detects split closing head tag with whitespace across multiple chunks using 64-char overlap window", async () => {
   let cancelled = false;
   const encoder = new TextEncoder();
-  const c1 = encoder.encode("<html><head><title>Split Title</ti");
-  const c2 = encoder.encode(`tle${" ".repeat(40)}`);
+  const c1 = encoder.encode("<html><head><title>Split Title</he");
+  const c2 = encoder.encode(`ad${" ".repeat(40)}`);
   const c3 = encoder.encode(`${" ".repeat(10)}>`);
   const stream = new ReadableStream({
     start(controller) {
@@ -81,4 +81,25 @@ test("detects split closing tag with whitespace across multiple chunks using 64-
   assert.equal(result.truncated, true);
   assert.equal(result.bytesRead, c1.byteLength + c2.byteLength + c3.byteLength);
   assert.match(result.html, /Split Title/);
+});
+
+test("keeps reading past an empty title element so og:title is captured", async () => {
+  let cancelled = false;
+  const encoder = new TextEncoder();
+  const parts = [
+    encoder.encode('<html><head><title></title><meta prop'),
+    encoder.encode('erty="og:title" content="Real Title"></head>'),
+  ];
+  const stream = new ReadableStream({
+    start(controller) {
+      for (const part of parts) controller.enqueue(part);
+      controller.enqueue(new Uint8Array(80_000));
+    },
+    cancel() { cancelled = true; },
+  });
+  const result = await readAndDecodeStream(stream, "text/html; charset=utf-8");
+  assert.equal(cancelled, true);
+  assert.equal(result.truncated, true);
+  assert.match(result.html, /og:title" content="Real Title"/);
+  assert.ok(result.bytesRead < 64 * 1024);
 });

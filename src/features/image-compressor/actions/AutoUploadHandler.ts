@@ -1,8 +1,9 @@
 import type { Plugin } from "siyuan";
 import type { FeatureScope } from "../../../core/framework/FeatureScope.ts";
+import { isInsideProtectedContainer } from "../../../core/host/dom.ts";
 import type { ImageProcessingServices } from "../services/ImageProcessingServices.ts";
 import { waitForPersistedImageOccurrence, type ImageOccurrenceEvidence } from "../services/ImageOccurrenceResolver.ts";
-import { resolveSource } from "../policy/source.ts";
+import { resolveSource, trySource } from "../policy/source.ts";
 import { classifyImageCandidate } from "../policy/ImageCandidateClassifier.ts";
 import type { ImageConfig } from "../policy/parseImageConfig.ts";
 
@@ -16,7 +17,8 @@ export interface AutoUploadNotice {
   successful: number;
   skipped: number;
   failed: number;
-  singleReason?: "success" | "noBenefit" | "notAuthorized" | "conflict" | "notMatched" | "failed" | "other";
+  unknown?: number;
+  singleReason?: "success" | "noBenefit" | "notAuthorized" | "conflict" | "notMatched" | "failed" | "unknown" | "other";
 }
 
 interface UploadSuccess {
@@ -44,7 +46,7 @@ export function hasCompressibleInput(input: UploadInput | undefined, config: Ima
   const paths = input.kind === "files"
     ? (Array.isArray(input.files) ? input.files.map(file => file.name) : [])
     : (Array.isArray(input.files) ? input.files.filter(f => !f.isDir).map(f => f.path) : []);
-  if (paths.length === 0) return true;
+  if (paths.length === 0) return false;
   const excluded = config?.compression?.excludedExtensions ?? ["gif", "svg", "webp"];
   return paths.some(path => classifyImageCandidate({
     path,
@@ -69,6 +71,18 @@ export function completedUploadPaths(result: UploadSuccess): string[] {
       .map(path => path.replaceAll("\\", "/")))];
   }
   return [];
+}
+
+function capturePreExistingAssets(editor: HTMLElement | undefined, origin: string): WeakSet<Element> {
+  const existing = new WeakSet<Element>();
+  if (!editor || typeof editor.querySelectorAll !== "function") return existing;
+  for (const image of editor.querySelectorAll("img")) {
+    const raw = image.hasAttribute("data-src") ? image.getAttribute("data-src") : image.getAttribute("src");
+    if (!raw) continue;
+    const source = trySource(raw.replaceAll("\\", "/"), origin);
+    if (source?.kind === "asset") existing.add(image);
+  }
+  return existing;
 }
 
 /**
@@ -106,12 +120,17 @@ export function registerAutoUpload(
       });
 
       const editor = detail.protyle?.element;
+      const preExistingAssets = capturePreExistingAssets(editor, services.origin);
       const observed: InsertedImage[] = [];
       observer = editor && typeof MutationObserver !== "undefined"
-        ? new MutationObserver(records => collectNewImages(records, rootID, notebook, services.origin, observed))
+        ? new MutationObserver(records => collectNewImages(records, rootID, notebook, services.origin, observed, preExistingAssets))
         : undefined;
       observer?.observe(editor!, {
-        subtree: true, childList: true, attributes: true, attributeFilter: ["src", "data-src"],
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeOldValue: true,
+        attributeFilter: ["src", "data-src"],
       });
       releaseObserver = scope.own(() => observer?.disconnect());
 
@@ -129,8 +148,8 @@ export function registerAutoUpload(
         // onComplete may run before editor DOM mutation and kernel persistence. Keep the
         // observer briefly and retry only the exact successful paths from this request.
         queueMicrotask(() => {
-          void processCompletedUpload(result, rootID, notebook, observed, scope, shouldCompress,
-            services, logger, editor, onNotice).finally(() => releaseObserver?.());
+          void processCompletedUpload(result, rootID, observed, scope, shouldCompress,
+            services, logger, onNotice).finally(() => releaseObserver?.());
         });
       });
     } catch (error) {
@@ -150,23 +169,47 @@ export function registerAutoUpload(
 }
 
 function collectNewImages(
-  records: MutationRecord[], rootID: string, notebook: string, origin: string, observed: InsertedImage[],
+  records: MutationRecord[],
+  rootID: string,
+  notebook: string,
+  origin: string,
+  observed: InsertedImage[],
+  preExistingAssets: WeakSet<Element>,
 ): void {
   const images = new Set<HTMLImageElement>();
-  const inspectNode = (node: Node) => {
+  const inspectAddedNode = (node: Node) => {
     if (!(node instanceof Element)) return;
+    if (isInsideProtectedContainer(node)) return;
     if (node instanceof HTMLImageElement) images.add(node);
-    node.querySelectorAll("img").forEach(image => images.add(image as HTMLImageElement));
+    if (typeof node.querySelectorAll === "function") {
+      node.querySelectorAll("img").forEach(image => {
+        if (!isInsideProtectedContainer(image)) images.add(image as HTMLImageElement);
+      });
+    }
   };
+
   for (const record of records) {
-    if (record.type === "attributes") inspectNode(record.target);
-    for (const node of record.addedNodes) inspectNode(node);
+    if (record.type === "attributes") {
+      const target = record.target;
+      if (!(target instanceof HTMLImageElement) || isInsideProtectedContainer(target)) continue;
+      // Ignore attribute edits on pre-existing asset images or transitions from an existing asset path.
+      if (preExistingAssets.has(target)) continue;
+      if (typeof record.oldValue === "string" && trySource(record.oldValue.replaceAll("\\", "/"), origin)?.kind === "asset") {
+        continue;
+      }
+      images.add(target);
+      continue;
+    }
+    for (const node of record.addedNodes) inspectAddedNode(node);
   }
+
   for (const image of images) {
+    if (isInsideProtectedContainer(image)) continue;
     const raw = image.hasAttribute("data-src") ? image.getAttribute("data-src") : image.getAttribute("src");
     const owner = image.closest<HTMLElement>("[data-node-id]");
-    const blockID = owner?.dataset.nodeId;
-    if (!raw || !blockID) continue;
+    if (!raw || !owner || isInsideProtectedContainer(owner)) continue;
+    const blockID = owner.dataset.nodeId;
+    if (!blockID) continue;
     let key: string;
     try { key = resolveSource(raw.replaceAll("\\", "/"), origin).key; } catch { continue; }
     if (!key.startsWith("asset:")) continue;
@@ -176,36 +219,14 @@ function collectNewImages(
   }
 }
 
-function scanEditorForImage(
-  editor: HTMLElement, rootID: string, notebook: string, origin: string, key: string,
-): InsertedImage[] {
-  const found: InsertedImage[] = [];
-  const images = [...editor.querySelectorAll("img")];
-  for (const image of images) {
-    const raw = image.hasAttribute("data-src") ? image.getAttribute("data-src") : image.getAttribute("src");
-    const owner = image.closest<HTMLElement>("[data-node-id]");
-    const blockID = owner?.dataset.nodeId;
-    if (!raw || !blockID) continue;
-    let imgKey: string;
-    try { imgKey = resolveSource(raw.replaceAll("\\", "/"), origin).key; } catch { continue; }
-    if (imgKey !== key) continue;
-    const ordinal = [...owner.querySelectorAll("img")].indexOf(image);
-    if (ordinal < 0) continue;
-    found.push({ rootID, notebook, blockID, imageOrdinal: ordinal, oldPath: raw.replaceAll("\\", "/"), key: imgKey });
-  }
-  return found;
-}
-
 async function processCompletedUpload(
   result: UploadSuccess,
   rootID: string,
-  notebook: string,
   observed: InsertedImage[],
   scope: FeatureScope,
   shouldCompress: (rootID: string) => boolean,
   services: ImageProcessingServices,
   logger: DebugLogger,
-  editor?: HTMLElement,
   onNotice?: (notice: AutoUploadNotice) => void,
 ): Promise<void> {
   const paths = completedUploadPaths(result);
@@ -216,8 +237,8 @@ async function processCompletedUpload(
     return;
   }
 
-  let successful = 0, skipped = 0, failed = 0;
-  let lastSkipReason: "noBenefit" | "notAuthorized" | "conflict" | "notMatched" | "other" = "other";
+  let successful = 0, skipped = 0, failed = 0, unknownCount = 0;
+  let lastSkipReason: "noBenefit" | "notAuthorized" | "conflict" | "notMatched" | "unknown" | "other" = "other";
 
   const authorized = shouldCompress(rootID);
   logger.debug?.("检查自动压缩授权", { rootID, authorized });
@@ -249,10 +270,7 @@ async function processCompletedUpload(
         lastSkipReason = "other";
         continue;
       }
-      let candidates = await waitForObservedImages(observed, source.key, scope.signal);
-      if (candidates.length === 0 && editor) {
-        candidates = scanEditorForImage(editor, rootID, notebook, services.origin, source.key);
-      }
+      const candidates = await waitForObservedImages(observed, source.key, scope.signal);
       logger.debug?.("检索图片插入位置候选", { path, key: source.key, candidateCount: candidates.length });
 
       if (candidates.length !== 1) {
@@ -279,6 +297,12 @@ async function processCompletedUpload(
         lastSkipReason = "noBenefit";
       } else if (outcome.reference === "replaced") {
         successful++;
+      } else if (outcome.reference === "unknown") {
+        unknownCount++;
+        skipped++;
+        lastSkipReason = "unknown";
+      } else if (outcome.reference === "aborted") {
+        break;
       } else {
         skipped++;
         lastSkipReason = "conflict";
@@ -292,7 +316,7 @@ async function processCompletedUpload(
 
   const total = successful + skipped + failed;
   if (total > 0 && scope.active) {
-    if (successful === 0 && failed === 0) {
+    if (successful === 0 && failed === 0 && unknownCount === 0) {
       logger.debug?.("所有图片均已跳过，静默结束", { total, skipped });
       return;
     }
@@ -302,6 +326,7 @@ async function processCompletedUpload(
         successful,
         skipped,
         failed,
+        ...(unknownCount > 0 ? { unknown: unknownCount } : {}),
         singleReason: total === 1
           ? (successful === 1 ? "success" : failed === 1 ? "failed" : lastSkipReason)
           : undefined,

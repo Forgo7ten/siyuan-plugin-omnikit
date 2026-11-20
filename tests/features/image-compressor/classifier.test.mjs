@@ -39,22 +39,32 @@ test("classifyImageCandidate excludes all specified video extensions", () => {
   }
 });
 
-test("classifyImageCandidate protects Excalidraw and drawings paths", () => {
-  const samples = [
+test("classifyImageCandidate protects Excalidraw and drawing/drawings directories without blocking drawings_v2.png (I-11)", () => {
+  const protectedSamples = [
     "assets/excalidraw-2024.png",
     "assets/my-excalidraw.jpg",
     "drawings/diagram.png",
     "assets/drawings/flow.png",
-    "assets/drawings_v2.png",
+    "assets/drawing/sketch.png",
   ];
-  for (const path of samples) {
+  for (const path of protectedSamples) {
     const res = classifyImageCandidate({
       path,
       mode: "manual-quick",
       excludedExtensions: excluded,
     });
-    assert.equal(res.eligible, false);
+    assert.equal(res.eligible, false, path);
     assert.equal(res.reason, "excalidraw");
+  }
+
+  for (const allowedPath of ["assets/drawings_v2.png", "assets/drawing-foo.png"]) {
+    const res = classifyImageCandidate({
+      path: allowedPath,
+      mode: "auto",
+      excludedExtensions: excluded,
+    });
+    assert.equal(res.eligible, true, allowedPath);
+    assert.equal(res.extension, "png");
   }
 });
 
@@ -72,7 +82,27 @@ test("classifyImageCandidate excludes animated (gif, apng) and vector (svg) form
   assert.equal(svg.reason, "vector-format");
 });
 
-test("classifyImageCandidate treats WebP differently in auto vs manual-dialog", () => {
+test("classifyImageCandidate skips non-empty unsupported static extensions while allowing extensionless CDN URLs (P2-2)", () => {
+  for (const ext of ["bmp", "ico", "tiff", "heif", "avif"]) {
+    const res = classifyImageCandidate({
+      path: `assets/pic.${ext}`,
+      mode: "auto",
+      excludedExtensions: excluded,
+    });
+    assert.equal(res.eligible, false, ext);
+    assert.equal(res.reason, "unsupported-format");
+  }
+
+  const cdn = classifyImageCandidate({
+    path: "https://avatars.githubusercontent.com/u/12345?v=4",
+    mode: "auto",
+    excludedExtensions: excluded,
+  });
+  assert.equal(cdn.eligible, true);
+  assert.equal(cdn.extension, "");
+});
+
+test("classifyImageCandidate treats static WebP as skipped in auto/document and eligible in manual-quick/manual-dialog (D04)", () => {
   const auto = classifyImageCandidate({
     path: "assets/image.webp",
     mode: "auto",
@@ -94,8 +124,8 @@ test("classifyImageCandidate treats WebP differently in auto vs manual-dialog", 
     mode: "manual-quick",
     excludedExtensions: excluded,
   });
-  assert.equal(quick.eligible, false);
-  assert.equal(quick.reason, "excluded-extension");
+  assert.equal(quick.eligible, true);
+  assert.equal(quick.extension, "webp");
 
   const dialog = classifyImageCandidate({
     path: "assets/image.webp",

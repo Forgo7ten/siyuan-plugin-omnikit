@@ -1,4 +1,6 @@
-import { combineSignals, resolveNotebookID } from "../../core/host/ProtyleAdapter.ts";
+import { resolveNotebookID } from "../../core/host/ProtyleAdapter.ts";
+import { createRuntimeId } from "../../core/host/id.ts";
+import { describeError } from "../../core/host/describeError.ts";
 import type { FeatureContext } from "../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../core/framework/FeatureScope.ts";
 import { translate } from "../../i18n/translate.ts";
@@ -59,8 +61,12 @@ export class ImageController {
     if (notice.total === 1 && notice.singleReason) {
       if (notice.singleReason === "success") {
         notify(this.t("image.autoUpload.singleSuccess"), "info", 3000);
-      } else if (notice.singleReason === "noBenefit" || notice.singleReason === "other") {
+      } else if (notice.singleReason === "unknown") {
+        notify(this.t("image.autoUpload.singleUnknown"), "info", 4000);
+      } else if (notice.singleReason === "noBenefit") {
         notify(this.t("image.autoUpload.singleNoBenefit"), "info", 4000);
+      } else if (notice.singleReason === "other") {
+        notify(this.t("image.autoUpload.singleSkipped"), "info", 4000);
       } else if (notice.singleReason === "notAuthorized") {
         notify(this.t("image.autoUpload.singleNotAuthorized"), "info", 4000);
       } else if (notice.singleReason === "conflict") {
@@ -73,16 +79,20 @@ export class ImageController {
       return;
     }
 
+    const unknownCount = notice.unknown ?? 0;
     if (notice.successful === notice.total) {
       notify(this.t("image.autoUpload.allSuccess", { count: notice.successful }), "info", 4000);
-    } else if (notice.skipped === notice.total) {
+    } else if (notice.skipped === notice.total && unknownCount === 0) {
       // Silent when all skipped
     } else {
-      const msg = this.t("image.autoUpload.summary", {
+      const base = this.t("image.autoUpload.summary", {
         successful: notice.successful,
         skipped: notice.skipped,
         failed: notice.failed,
       });
+      const msg = unknownCount > 0
+        ? `${base} (${this.t("image.batch.unknownCount", { count: unknownCount })})`
+        : base;
       notify(msg, notice.failed > 0 ? "error" : "info", 5000);
     }
   }
@@ -131,6 +141,8 @@ export class ImageController {
 
   /**
    * Batches all compressible images in the current document with live progress tracking.
+   * Editor navigation/closure does not cancel an already-started document task; only
+   * feature/plugin shutdown or explicit dismissal of the progress dialog aborts pending work.
    */
   async compressDocument(
     menuDetail: unknown,
@@ -154,84 +166,72 @@ export class ImageController {
     }
     this.activeDocuments.add(rootID);
 
-    const controller = this.tasks.create(this.scope.signal);
-    const modalAbortController = new AbortController();
-    const abortOnScope = () => modalAbortController.abort(this.scope.signal.reason);
-    if (this.scope.signal.aborted) abortOnScope();
-    else this.scope.signal.addEventListener("abort", abortOnScope, { once: true });
-
-    let state: ImageTaskState = {
-      id: crypto.randomUUID(),
-      phase: "preparing",
-      total: 0,
-      completed: 0,
-      uploaded: 0,
-      skipped: 0,
-      failed: 0,
-      messages: [],
-    };
-
-    const listeners = new Set<(value: ImageTaskState) => void>();
-    const publish = (next: Partial<ImageTaskState>) => {
-      state = { ...state, ...next };
-      for (const listener of listeners) listener(state);
-    };
-
-    const view = this.services.ui.progress(
-      {
-        snapshot: () => state,
-        subscribe: listener => {
-          listeners.add(listener);
-          listener(state);
-          return () => listeners.delete(listener);
-        },
-      },
-      () => {
-        modalAbortController.abort(new DOMException("Task modal dismissed", "AbortError"));
-      },
-    );
-
-    const onSwitchEditor = (event: CustomEvent<any>) => {
-      const switchedRootID = event.detail?.protyle?.block?.rootID;
-      if (switchedRootID && switchedRootID !== rootID) {
-        modalAbortController.abort(new DOMException("Editor switched", "AbortError"));
-      }
-    };
-    const onDestroyProtyle = (event: CustomEvent<any>) => {
-      const destroyedRootID = event.detail?.protyle?.block?.rootID;
-      if (destroyedRootID === rootID) {
-        modalAbortController.abort(new DOMException("Editor destroyed", "AbortError"));
-      }
-    };
-    this.context.plugin.eventBus?.on("switch-protyle", onSwitchEditor);
-    this.context.plugin.eventBus?.on("destroy-protyle", onDestroyProtyle);
-
-    const cleanupAbort = () => {
-      this.context.plugin.eventBus?.off("switch-protyle", onSwitchEditor);
-      this.context.plugin.eventBus?.off("destroy-protyle", onDestroyProtyle);
-      this.scope.signal.removeEventListener("abort", abortOnScope);
-    };
+    let controller: AbortController | undefined;
+    let view: { close(): void } | undefined;
+    let taskId = "";
+    let state: ImageTaskState | undefined;
 
     try {
-      const combined = combineSignals(controller.signal, modalAbortController.signal) ?? modalAbortController.signal;
+      controller = this.tasks.create(this.scope.signal);
+      taskId = createRuntimeId("img-task");
+      state = {
+        id: taskId,
+        phase: "preparing",
+        total: 0,
+        completed: 0,
+        uploaded: 0,
+        skipped: 0,
+        failed: 0,
+        unknown: 0,
+        messages: [],
+      };
+
+      const listeners = new Set<(value: ImageTaskState) => void>();
+      const publish = (next: Partial<ImageTaskState>) => {
+        if (!state) return;
+        state = { ...state, ...next };
+        for (const listener of listeners) listener(state);
+      };
+
+      view = this.services.ui.progress(
+        {
+          snapshot: () => state!,
+          subscribe: listener => {
+            listeners.add(listener);
+            listener(state!);
+            return () => listeners.delete(listener);
+          },
+        },
+        () => {
+          controller?.abort(new DOMException("Task modal dismissed", "AbortError"));
+        },
+      );
+
       const options: BatchActionOptions = {
         rootID,
         notebook: editorNotebook,
-        signal: combined,
+        signal: controller.signal,
         onProgress: update => {
           if (!this.scope.active) return;
-          publish({
+          const next: Partial<ImageTaskState> = {
             total: update.total,
             completed: update.completed,
             uploaded: update.uploaded ?? 0,
             skipped: update.skipped,
             failed: update.failed,
-            referenceResult: update.referenceResult,
+            unknown: update.unknown,
             currentFile: update.currentFile,
-          });
+          };
+          if (update.phase) next.phase = update.phase;
+          if (update.prepared !== undefined) next.prepared = update.prepared;
+          if (update.preparedTotal !== undefined) next.preparedTotal = update.preparedTotal;
+          publish(next);
           if (update.total > 0 && this.context.statusBar) {
             const fileSuffix = update.currentFile ? ` · ${update.currentFile}` : "";
-            this.context.statusBar.update(state.id, `图片压缩 ${update.completed}/${update.total}${fileSuffix}`);
+            const stepText = update.phase === "preparing" && update.preparedTotal
+              ? `${update.prepared ?? 0}/${update.preparedTotal}`
+              : `${update.completed}/${update.total}`;
+            this.context.statusBar.update(taskId, `图片压缩 ${stepText}${fileSuffix}`);
           }
         },
       };
@@ -251,37 +251,18 @@ export class ImageController {
         }
         if (result.total === 0 && result.scanComplete) {
           view.close();
-          const msg = this.t("image.batch.noImages");
-          if (this.context.feedback) {
-            this.context.feedback.notify(msg, "info", { timeout: 4000 });
-          } else {
-            this.services.ui.notify(msg);
-          }
+          this.notifyFeedback(this.t("image.batch.noImages"), "info", 4000);
           return;
         }
         if (!result.scanComplete) {
-          const scanFailedMsg = this.t("image.batch.scanFailed");
-          publish({
-            phase: "failed",
-            total: result.total,
-            completed: result.completed,
-            uploaded: result.uploaded ?? 0,
-            skipped: result.skipped,
-            failed: result.failed,
-            referenceResult: result.referenceResult,
-            messages: [scanFailedMsg],
-          });
-          if (this.context.feedback) {
-            this.context.feedback.notify(scanFailedMsg, "error", { timeout: 5000 });
-          } else {
-            this.services.ui.notify(scanFailedMsg);
-          }
+          view.close();
+          this.notifyFeedback(this.t("image.batch.scanFailed"), "error", 5000);
           return;
         }
         publish({
-          phase: result.referenceResult?.state === "unknown"
+          phase: result.unknown > 0
             ? "unknown"
-            : result.failed || result.conflicts || result.referenceResult?.state === "partial"
+            : result.failed || result.conflicts
               ? "partial"
               : "done",
           total: result.total,
@@ -289,7 +270,7 @@ export class ImageController {
           uploaded: result.uploaded ?? 0,
           skipped: result.skipped,
           failed: result.failed,
-          referenceResult: result.referenceResult,
+          unknown: result.unknown,
         });
 
         const formatBytes = (size: number) => size < 1024 ? `${size} B` : `${(size / 1024).toFixed(1)} KB`;
@@ -301,17 +282,24 @@ export class ImageController {
           logical: formatBytes(result.logicalReductionBytes),
           reclaimed: formatBytes(result.diskReclaimedBytes),
         });
-        this.notifyFeedback(summaryMsg, "info", 7000);
+        const finalMsg = result.unknown > 0
+          ? `${summaryMsg} (${this.t("image.batch.unknownCount", { count: result.unknown })})`
+          : summaryMsg;
+        this.notifyFeedback(finalMsg, "info", 7000);
       }
     } catch (error) {
       this.context.logger.error("批量压缩文档图片失败", error);
-      if (this.scope.active) publish({ phase: "failed", messages: [String(error)] });
+      if (this.scope.active && state) {
+        const msg = describeError(error);
+        state = { ...state, phase: "failed", messages: [msg] };
+        view?.close();
+        this.notifyFeedback(msg, "error", 5000);
+      }
     } finally {
-      cleanupAbort();
       this.activeDocuments.delete(rootID);
-      this.context.statusBar?.clear(state.id);
-      this.tasks.release(controller);
-      if (!this.scope.active) view.close();
+      if (taskId) this.context.statusBar?.clear(taskId);
+      if (controller) this.tasks.release(controller);
+      if (!this.scope.active) view?.close();
     }
   }
 }

@@ -21,7 +21,7 @@ OmniKit 是基于现代前端与思源笔记插件生态构建的高效、高可
 ### 1.2 核心设计哲学
 1. **微内核与单向依赖**：Core 平台层不感知具体 Feature 的内部实现，所有功能通过元数据驱动注入；
 2. **多实例与环境防护**：针对思源独立设置窗口（`body--settings`）进行无副作用纯渲染隔离；
-3. **确定性存储体系**：单文件 Promise 串行队列、内存缓存指纹跳写、思源原生 loadData/saveData 与配置/数据物理隔离；
+3. **确定性存储体系**：单文件 Promise 串行队列、内存缓存指纹跳写、思源原生 `/api/file/getFile` 与 `saveData` 持久化及配置/数据物理隔离；
 4. **防御性块级改写**：写前基于 `OccurrenceTarget` 进行精确节点读回核验、采用进程内写租约（Write Lease）与持久化前置闸门；
 5. **可重现与确定性工程体系**：统一工程脚本体系、全自动化质量门禁与多入口幂等发版闭环。
 
@@ -47,6 +47,8 @@ flowchart TD
         
         subgraph CoreInfra["基础设施与驱动"]
             KernelClient["KernelClient (安全 API 调用门面)"]
+            BlockWriteLease["BlockWriteLease (跨 Feature 共享块写租约)"]
+            CoreHelpers["describeError / TaskId / ProtectedSelectors"]
             ProtyleAdapter["ProtyleAdapter (宿主数据标准提取器)"]
             SettingsMgr["SettingsManager (多文件配置协调器)"]
             JsonStore["JsonStore (单文件串行队列/指纹跳写/容灾)"]
@@ -82,7 +84,7 @@ flowchart TD
             FeatTitledLink["TitledLinkFeature"]
             TitledLinkController["TitledLinkController (业务编排门面)"]
             DualFetcher["dual-track-fetcher (桌面 fetch / 代理 forwardProxy)"]
-            StreamParser["stream-parser (64KB 流式截断 & 编码嗅探)"]
+            StreamParser["stream-parser (</head>/64KB 流式截断 & 编码嗅探)"]
             SafeWriterTL["safe-writer (写前核验与事务提交)"]
             TitleCache["TitleCache (短期内存 LRU 缓存)"]
             TitledLinkSettingsView["TitledLinkSettingsPanel.svelte (设置组件)"]
@@ -125,8 +127,10 @@ flowchart TD
     TitledLinkController --> TitleCache
     DualFetcher --> KernelClient
     SafeWriterTL --> KernelClient
+    SafeWriterTL --> BlockWriteLease
     
     SafeWriter --> KernelClient
+    SafeWriter --> BlockWriteLease
     AutoUpload --> KernelClient
     RemoteWatcher --> KernelClient
     KernelClient --> H_API
@@ -197,28 +201,39 @@ stateDiagram-v2
     - `scope.own(disposer)`：注册所有运行期副作用（Protyle 事件监听器、DOM 钩子、定时器）；统一由 `FeatureScope` 集中托管与自动注销；
     - `scope.signal`：向下传递的只读 `AbortSignal`；
     - `scope.guard(fn)`：包装异步回调，若 Scope 已销毁则直接短路，防止失效的幽灵回调执行；
-  - **任务正常中止与静默退出设计 (Normal Abort & Quiet Exit)**：
-    - 当用户按 Esc、切换编辑器标签页、功能停用或触发 `signal.abort` 时，异步处理链路与控制器判定为**正常中止并静默退出**，严禁向用户误报“无法定位引用”、“无效文档”或并发冲突；
-    - 底层改写执行者（`SafeBlockWriter`）在检测到任务取消或 Abort 信号时必须显式抛出 `AbortError` 或返回取消标识，严禁混淆为 `conflict`；
+  - **任务取消边界与静默退出设计**：
+    - 平台不设通用取消按钮、取消菜单或公开取消 API；文档标签页切换或编辑器关闭不中止已启动的后台异步任务（任务沿用启动时捕获的 `rootID` 与 `notebook`，写前通过内核 API 核验实时状态）；
+    - Feature 自有进度 Dialog 的用户关闭行为（含按 Esc）遵循对应特性 PRD 语义，控制器因完成、空结果或前置失败程序化关闭弹窗仅销毁 UI，不记为用户取消；
+    - 当 Feature 停用、插件卸载、宿主退出或特性允许的进度弹窗用户关闭触发 `signal.abort` 时，异步任务安全中止未开始步骤并静默退出，保留已确认产物与记录，不执行逆向回滚，重启不续跑；
+    - 底层写回层对发出写请求前的中止返回 `"aborted"` 或抛出 `AbortError`，对已发出 `/api/block/updateBlock` 后响应超时、断连或中止的结果归类为 `"unknown"`（严禁自动重试），严禁与真实基线不匹配导致的 `"conflict"` 混为一谈；
   - 当 Feature 停用或插件卸载时，`scope.dispose()` **首先广播 `abort` 信号**通知所有在途任务安全终止，再按后进先出（LIFO）顺序释放所有监听器。
 
 ### 3.4 `SettingsManager` 与 `JsonStore` (确定性存储体系)
 - **文件位置**：`src/core/store/SettingsManager.ts`、`src/core/store/JsonStore.ts`
 - **核心机制**：
-  - **精简存储模型与每文件独占 Promise 队列**：基于单文件 Promise 串行队列调度所有读写操作，配合思源原生 `Plugin.loadData` / `saveData` 实现持久化，杜绝写竞争；
+  - **精简存储模型与每文件独占 Promise 队列**：基于单文件 Promise 串行队列调度所有读写操作，配合 `/api/file/getFile` 读取与 `Plugin.saveData` 持久化，杜绝写竞争；
   - **内容指纹防抖**：内存维护序列化指纹（`fingerprint`），相同数据重复保存自动跳过实际磁盘 I/O；
-  - **读写双路径 30 秒超时保护与不重试契约**：对读路径（`/api/file/getFile` 及 `Plugin.loadData` 降级路径）与写路径（`saveConfirmed` 调用 `plugin.saveData`）均实施 30 秒超时保护；写入超时后直接抛出错误且不执行重试，防止宿主异步 API 永久挂起冻结单文件串行队列；
-  - **安全读取与只读状态契约**：调用思源内核 `/api/file/getFile`（并在特定宿主条件下降级至 `Plugin.loadData`）读取配置文件。明确状态契约：HTTP 状态码为 202 且思源 code 为 404 时确认为文件不存在，返回 `defaults()` 并安全初始化；若返回网络错误、服务不可用（如 code 500、503、403）、请求超时（30 秒超时时限）或读写锁异常，必须抛出错误并进入只读保护模式（Store 仅暴露 `needsRecovery` 只读状态标记与 `readOnlyReason`），严禁静默使用空对象或默认值覆盖用户的现有持久化文件；
-  - **并发加载与容错重载**：`SettingsManager.load()` 采用 `Promise.allSettled` 等待全部存储初始化完成后统一处理首个 I/O 失败，避免滞后任务覆盖状态；`reloadAfterExternalChange()` 采用 `Promise.allSettled` 并发重载各 Store，确保单个 Store 异常不阻塞其余 Store 与宿主 `onDataChanged`，并按固定顺序返回变更列表；
-  - **异常损坏隔离**：解析非空 JSON 失败时不使用默认值覆盖。将损坏文件隔离备份为 `.backup` 并提示用户显式确认修复。
+  - **读写双路径 30 秒超时保护与不重试契约**：对 `/api/file/getFile` 读路径与 `saveConfirmed` 调用 `plugin.saveData` 的写路径均实施 30 秒超时保护；写入超时后直接抛出错误且不执行重试，防止宿主异步 API 永久挂起冻结单文件串行队列；
+  - **安全读取、缺失边界与只读状态契约**：调用思源内核 `/api/file/getFile` 读取配置文件，且读取失败时严禁降级回退宿主 `Plugin.loadData()` 的空缓存：
+    - **唯一缺失判定**：仅当 `/api/file/getFile` 返回 HTTP `202` 且思源返回体 `code === 404` 时，确认为文件不存在，返回 `defaults()` 并允许初始化；
+    - **HTTP 200 空串与损坏只读保护**：当 HTTP `200` 返回空串、全空白内容或存在 JSON 语法损坏时，进入 `needsRecovery` 只读保护状态并保留真实 `rawToBackup`（含空串）；仅对非空损坏物理字节生成 `.backup` 容灾备份并提示用户显式恢复，严禁使用默认值覆盖；
+    - **网络/超时/非缺失 HTTP 错保护**：遭遇网络错误、30 秒超时、HTTP 403/404/500 或其他非 `202 + code: 404` 错误时，直接进入 `needsRecovery` 只读保护模式（暴露 `readOnlyReason` 并保留上一次内存有效数据），严禁回退 `loadData()` 空缓存或使用默认值覆盖持久化文件；
+  - **跨窗口写入语义**：`omnikit-core.json` 在多窗口并发修改场景下采用 last-writer-wins 持久化语义，并结合 `onDataChanged` 同步最新落盘配置；
+  - **并发加载与容错重载**：`SettingsManager.load()` 采用 `Promise.allSettled` 并发加载全部存储并记录所有读取失败，仅将失败 Store 保持为只读保护状态，不中断插件初始化，确保恢复入口可达；`reloadAfterExternalChange()` 采用 `Promise.allSettled` 并发重载各 Store，确保单个 Store 异常不阻塞其余 Store 与宿主 `onDataChanged`，并按固定顺序返回变更列表。
 
-### 3.5 `KernelClient` (安全内核 API 封装)
-- **文件位置**：`src/core/host/KernelClient.ts`
-- **主要职责**：
-  - 封装对思源内核 `/api/...` 的网络交互；
-  - 支持调用方传入 `AbortSignal` 与自定义超时；超时的定时器不仅拒绝当前 Promise，同时显式调用底层 `fetch` 的 `AbortController.abort()` 及时终止并释放网络套接字连接；
-  - 自动归一化处理思源错误码（`code !== 0`），统一包装为结构化 `KernelRequestError`；
-  - 避免对可能改变工作区状态的非幂等修改请求进行静默重试。
+### 3.5 `KernelClient` 与 Core 共享基础设施
+- **`KernelClient` (`src/core/host/KernelClient.ts`)**：
+  - 封装对思源内核 `/api/...` 的网络交互，支持调用方传入 `AbortSignal` 与自定义超时；超时定时器不仅拒绝当前 Promise，同时显式调用底层 `fetch` 的 `AbortController.abort()` 释放网络套接字连接；
+  - 自动归一化处理思源错误码（`code !== 0`），统一包装为结构化 `KernelRequestError`，避免对非幂等修改请求静默重试；
+- **共享块写租约 (`BlockWriteLease`)**：
+  - 由 Core 统一提供按 `notebook/blockID` 隔离的进程内串行写租约队列，供 `imageCompressor` 与 `titled-link` 共用，防止跨 Feature 同块并发写入交织；
+  - 支持排队期间响应 `AbortSignal` 立即退出并在进入临界区时二次校验中止；明确思源 `/api/block/updateBlock` 无内核原子 CAS，写前仍须执行块身份与完整 DOM 快照核验；
+- **统一结构化错误描述 (`describeError`)**：
+  - 提取 `Error.message` 或思源 `{ code, msg }` 错误响应对象（格式化输出 `msg` 与错误码），防止界面或日志出现 `[object Object]`；
+- **公共受保护 DOM 容器选择器常量**：
+  - 由 Core 统一导出受保护容器选择器常量（如 `[data-type="NodeBlockQueryEmbed"]`、`.protyle-wysiwyg__embed`、`pre`、`code`、`script`、`style`、`[data-type="NodeCodeBlock"]`），供各 Feature 统一复用；
+- **`Platform` 单一权威来源与五端清单**：
+  - 插件 `plugin.json` 的 `frontends` 覆盖全部五端（`desktop`、`desktop-window`、`mobile`、`browser-desktop`、`browser-mobile`），宿主清单元数据闸门优先；Core `Platform` 作为插件内前端探测与 `isFrontendSupported` 判定的唯一权威来源。
 
 ### 3.6 统一 UI 扩展系统
 - **统一 Dock 容器** (`src/ui/dock/`)：
@@ -233,10 +248,11 @@ stateDiagram-v2
     - **静默刷新防覆盖铁律 (Anti-Overwriting Guard)**：Dock 在改写操作后执行的后续静默刷新（`post_action`）若遇异常或返回空结果，绝对禁止冲刷或覆盖本次操作产生的成功统计文案；当待处理项降为 0 时必须干净收起抽屉并保留成功统计，杜绝悬挂假性“未找到引用”；
   - 依托 Svelte 5 `mount` / `unmount` 精准控制各 Feature 视图的装载与卸载。
 - **局域网 HTTP 环境与无 WebCrypto 兼容规范**：
-  - 在局域网非 HTTPS（`window.isSecureContext === false`）环境下，剪贴板 API 与 `crypto.subtle` 受限；
-  - 统一交互层在调用 `navigator.clipboard.writeText` 失败或未受支持时，安全回退为弹出包含可复制文本框的模态提示，确保全网络环境可用；唯一标识生成采用时间戳与安全随机字符组合。
+  - 在局域网非 HTTPS（`window.isSecureContext === false`）环境下，剪贴板 API 与 `crypto.randomUUID()` / `crypto.subtle` 受限；
+  - 统一交互层在调用 `navigator.clipboard.writeText` 失败或未受支持时，安全回退为弹出包含可复制文本框的模态提示，确保全网络环境可用；Core 提供进程内时间戳与单调自增序列构成的运行时任务 ID 生成器，不依赖 `crypto.randomUUID()`。
 - **统一设置面板 (`SettingsRoot.svelte`)** (`src/ui/settings/`)：
   - 采用 iPad 风格双栏联动布局（左侧导航分组 + 右侧单页平滑滚动卡片）；
+  - **`User-Agent` 草稿脏状态保护与重置边界**：`general.userAgent` 输入框维护 `uaDirty` 标志，外部同步通知不覆盖正在编辑或已脏草稿；各 Feature 设置卡片重置按钮文案为**“设为默认值（未保存）”**（`settings.resetDraft`），仅重置当前未保存草稿而不直接写入持久化文件；并发保存冲突判定使用稳定错误类型或错误码，不依赖本地化文案子串匹配；
   - **平台兼容性设防架构 (方案 A：卡片保持展示，总开关置灰禁用，专属设置可预先调整)**：
     - 针对 `runtime.status === "unsupported"` 的 Feature，设置卡片在右侧正常排布渲染，左侧导航正常提供平滑定位，维持全端 UI 结构与视觉一致性；
     - **总开关置灰禁用（Disabled Guard）**：卡片头部总开关设置 `disabled` 属性置灰禁用，不可点击切换，彻底阻止非法生命周期触发；
@@ -265,7 +281,7 @@ stateDiagram-v2
   - 注入 `FeatureContext.feedback`，为所有 Feature 提供平台统筹的用户交互与反馈服务；
   - **前缀自动补齐**：统一对外弹窗追加 `[OmniKit] ` 前缀，Feature 调用时仅传入纯语义内容；
   - **生命周期守卫**：检测 `scope.active`，当对应 Feature 处于停用状态或插件正在卸载时，静默丢弃未决的弹窗，杜绝幽灵通知；
-  - **`AbortError` / 取消信号自动吞咽**：捕获任务因用户 Esc、切页、关闭面板或 `signal.abort` 产生的中止信号与 `AbortError`，自动拦截并静默处理，严禁向用户弹报错气泡；
+  - **`AbortError` / 取消信号自动吞咽**：捕获任务因 Feature 停用、插件卸载、宿主退出或 Feature 专属进度弹窗用户主动关闭而触发 `signal.abort` 产生的中止信号与 `AbortError`，自动拦截并静默处理，严禁向用户弹报错气泡；
   - **防抖抑制**：在 300ms 时间窗口内抑制相同文本的高频重复弹出；
   - **通用能力**：提供标准的 `notify(message, type, options)` 及 `copyable(text: string, notice?: string)`（通过 `forScope(scope)` 绑定上下文作用域，不提供额外参数嗅探重载）。
 
@@ -301,13 +317,13 @@ SiYuan 工作区目录：data/storage/petal/siyuan-plugin-omnikit/
 
 | 存储分类 | 文件路径规则 | 包含内容 | 重置操作影响边界 |
 |---|---|---|---|
-| **Core 平台配置** | `omnikit-core.json` | `schemaVersion: 1`<br/>`general: { debugLog, userAgent }`<br/>`featureStates: { [id]: { enabled } }` | **全局重置时重置**（恢复 debugLog 为 false，userAgent 为空串） |
-| **Feature 设置** | `feature-{id}-settings.json` | 用户在各 Feature 设置页手动调整的业务参数（质量、白名单、截断长度等偏好） | **单功能重置**及**全局重置**时恢复默认值 |
-| **Feature 业务数据** | `feature-{id}-{dataname}.json` | Feature 核心业务数据（如原图/WebP映射） | **不受设置重置影响**，仅在对应 Feature 视图内由用户显式手动移除或管理 |
+| **Core 平台配置** | `omnikit-core.json` | `schemaVersion: 1`<br/>`general: { debugLog, userAgent }`<br/>`featureStates: { [id]: { enabled } }` | 跨窗口写入采用 last-writer-wins 语义；**全局重置时重置**（恢复 debugLog 为 false，userAgent 为空串） |
+| **Feature 设置** | `feature-{id}-settings.json` | 用户在各 Feature 设置页手动调整的业务参数（质量、白名单、截断长度等偏好） | 界面重置仅更新未保存草稿；**单功能重置**及**全局重置**时恢复默认值 |
+| **Feature 业务数据** | `feature-{id}-{dataname}.json` | Feature 核心业务数据（如原图/WebP映射） | **不受设置重置影响**，仅按对应 Feature PRD 规则由用户显式移除或按权威物理缺失证据清理单条失效配对 |
 
 ### 4.2 设置重置隔离机制
-1. **重置隔离规范**：`SettingsManager.resetFeature(id)` 与 `resetAll()` 仅针对 `omnikit-core.json` 与各 `feature-*-settings.json` 调用 `store.update(...)` 恢复默认值。底层存储注册表中数据文件（`feature-*-{dataname}.json`）使用独立的存储句柄（如 `ImageCompressionRecordStore`），设置重置逻辑不持有业务数据文件的写入权限。
-2. **业务数据手动管理**：业务记录的清理通过对应 Feature 视图（如 Unified Dock 中的记录卡片“移除记录”操作）显式触发，不随配置重置或批量清理流程隐式删除。
+1. **重置隔离规范**：界面草稿重置操作仅调整内存表单草稿；`SettingsManager.resetFeature(id)` 与 `resetAll()` 仅针对 `omnikit-core.json` 与各 `feature-*-settings.json` 调用 `store.update(...)` 恢复默认值。底层存储注册表中数据文件（`feature-*-{dataname}.json`）使用独立的存储句柄（如 `ImageCompressionRecordStore`），设置重置逻辑不持有业务数据文件的写入权限。
+2. **业务数据管理边界**：业务记录的常规管理遵循各自 Feature PRD 的安全契约（如 Unified Dock 中的单条“移除记录”或基于权威缺失证据的条件清理），不随配置重置隐式清空。
 
 ---
 
@@ -346,12 +362,12 @@ sequenceDiagram
     Host-->>Editor: 返回原生资源路径并插入新块
     
     rect rgb(240, 248, 255)
-    Note over Handler,Resolver: 步骤一：线索捕获与精确块定位
-    Editor-->>Handler: 捕获上传完成事件线索
-    Handler->>Resolver: 等待块落盘，锁定精确图片位置 (OccurrenceTarget)
+    Note over Handler,Resolver: 步骤一：新增 DOM 证据捕获与精确块定位
+    Editor-->>Handler: 捕获上传完成事件并仅采纳本次 MutationObserver 新增节点证据
+    Handler->>Resolver: 等待块落盘，锁定精确图片位置 (OccurrenceTarget + baselineBlockDOM)
     Resolver->>Host: POST /api/block/getBlockDOM (读取快照)
     Host-->>Resolver: 返回块 DOM 与元数据
-    Resolver-->>Handler: 定位成功 (rootID, notebook, blockID, ordinal, oldPath)
+    Resolver-->>Handler: 定位成功 (rootID, notebook, blockID, ordinal, oldPath, baselineBlockDOM)
     end
 
     rect rgb(255, 250, 240)
@@ -374,23 +390,22 @@ sequenceDiagram
     end
 
     rect rgb(255, 240, 245)
-    Note over Handler,SafeWriter: 步骤四：写租约排队与精确节点写回
+    Note over Handler,SafeWriter: 步骤四：共享写租约排队与精确节点写回
     Handler->>SafeWriter: 提交块引用改写请求 (OccurrenceTarget, newWebpPath)
-    SafeWriter->>SafeWriter: 获取进程内排队写租约 (withBlockWriteLease)
+    SafeWriter->>SafeWriter: 获取 Core 共享块写租约 (notebook/blockID)
     SafeWriter->>Host: POST /api/block/getBlockInfo (写前身份校验)
     Host-->>SafeWriter: 核验 rootID 与 box 归属一致
     SafeWriter->>Host: POST /api/block/getBlockDOM (写前重新读回)
     Host-->>SafeWriter: 返回当前最新 currentBlockDOM
-    SafeWriter->>SafeWriter: 精确核验: 单块无嵌套、序号节点存在且引用仍为 oldPath
+    SafeWriter->>SafeWriter: 精确核验: 单块无嵌套、baselineBlockDOM 一致且目标引用仍为 oldPath
     
     alt 核验一致 (无并发编辑冲突)
-        SafeWriter->>Host: POST /api/block/updateBlock (更新指定单处图片节点引用)
-        Host-->>SafeWriter: 内核返回 code: 0 (落盘确认)
-        SafeWriter->>SafeWriter: 信任内核写入确认，完成改写
-    else 发生冲突 (图片已被用户删除或修改)
-        SafeWriter-->>Handler: 安全放弃写回 (Conflict Skipped)
+        SafeWriter->>Host: POST /api/block/updateBlock (更新指定单处节点引用)
+        Host-->>SafeWriter: 内核返回 code: 0 (replaced) / 响应缺失 (unknown, 不重试)
+    else 发生冲突 (块内容或目标节点已变更)
+        SafeWriter-->>Handler: 安全放弃写回 (conflict)
     end
-    SafeWriter->>SafeWriter: 释放写租约
+    SafeWriter->>SafeWriter: 释放共享写租约
     end
 
     rect rgb(245, 255, 250)
@@ -422,7 +437,7 @@ sequenceDiagram
 │ - 负责生命周期与状态调度 (TaskPanel 进度模态框装配与销毁、Abort 信号传递)│
 │ - 唯一负责领域结果解释：将 Action 返回的结构化纯数据解释为语义文案与通知 │
 │ - 对接 Core UiFeedback 派发结果提示，对接 Core PluginStatusBar 刷新状态 │
-│ - 严格识别正常中止 (Esc / 切页 / abort)，杜绝下游假性报错冒泡          │
+│ - 区分用户主动关闭进度弹窗与程序化 close()，编辑器切换/关闭不断任务     │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │ 调度纯领域执行 (无 UI 副作用)
                                     ▼
@@ -445,21 +460,21 @@ sequenceDiagram
 
 | 子模块文件 | 核心类 / 单元 | 职责与技术边界 |
 |---|---|---|
-| `ImageCompressorFeature.ts` | `ImageCompressorFeature` | Feature 入口（ID: `imageCompressor`）；注册菜单、事件监听；使用 `/api/block/getBlockInfo` + `isDocumentRootIdentity` 校验文档；提取 Protyle 与 blockID 上下文委托 `ImageController`；所有监听句柄由 `FeatureScope` 集中托管与注销 |
-| `ImageController.ts` | `ImageController` | 业务编排唯一门面；负责全局开关与白名单准入校验；调度 Action（含文档树单选 `compress-document`）与 `ImageTaskPanel` 进度模态框；接入 Core `UiFeedback` 发送统一通知，接入 Core `PluginStatusBar` 维护底栏轻量任务文本；统筹当前文件进度与正常中止静默；区分 `cancelled`、`total === 0 && scanComplete`（`image.batch.noImages`）与 `!scanComplete`（`image.batch.scanFailed`） |
-| `ImageCandidateClassifier.ts` | `classifyImageCandidate` | 纯路径与扩展名前置准入分类器；统一过滤常见视频扩展名、动态图（GIF/APNG）、矢量图（SVG）与 Excalidraw 及绘图专用目录（精确限定为 `drawings/` 与 `drawing/` 目录路径，保护 `drawing-xxx.png` 等普通文件名）；在扫描、上传前置、外链与读取前统一设防 |
-| `AutoUploadHandler.ts` | `AutoUploadHandler` | 监听 Protyle 编辑器上传事件；**上传前纯同步鉴权与候选预筛选**：`shouldCompress: (rootID: string) => boolean` 为纯同步鉴权谓词，在 `before-upload-assets` 中纯同步判断授权和候选图片预筛选，未授权或无图片时不创建 MutationObserver，零开销退出；`before-upload-assets` 整段回调置于 `try/catch` 隔离中，任何前置异常仅清理观察器并记录警告后静默返回，绝不向思源原生上传管道抛错；授权且存在候选图片时挂载观察器并同步注册 `onComplete`；捕获上传完成事件后等待块落盘锁定图片位置，仅返回纯数据结构 `AutoUploadNotice` |
-| `RemoteImageWatcher.ts` | `RemoteImageWatcher` | 监听新插入 HTTP/HTTPS 外链图片；**未授权低开销设防**：在入口及 `sweep()` 扫描入口设防，未授权文档中不发起 `blockDOM` 请求与 DOM 解析；屏蔽嵌入块与代码块 `MutationObserver` 变更，使用单一定时器在非 `rebasing` 且首轮 `sweep()` 无新增候选时触发至多 1 次延迟确认补扫；上传本地化后同步 `resolveImageOccurrence` 并传入经 `inspectImage` 校准后缀/MIME 的 `providedFile`；外链读取桌面端由 `services/desktop.ts` 通过 Node `http`/`https` 模块直连请求（携带全局 `User-Agent`、最多 3 次重定向、32 MiB 上限），浏览器与移动端由 `SourceReader` 调用 `fetch` |
-| `ImageOccurrenceResolver.ts` | `ImageOccurrenceResolver` | 在块 DOM 中建立 `OccurrenceTarget` 精确定位（`rootID` + `notebook` + `blockID` + `imageOrdinal` + `oldPath` + `baselineBlockDOM`） |
-| `src/features/image-compressor/similarity/` | 智能压缩独立子模块 | 划分独立的相似度算法域：包含 `AdaptiveImageCompressor`、`computeMSSSIM`、`adaptiveQualitySearch`、`SimilarityWorkerSession`、`getSimilarityPolicy` 与内联 Worker；负责动图前置 `inspectImage` 预检、多尺度相似度评估与质量搜索 |
-| `services/image.ts` | `BicEncoder` | 封装基于 WebP 编码器的物理生成引擎；严格执行保尺寸校验、EXIF 探测、整数网格对齐、`inspectImage` 与 `verifyBitmap` 输出字节完整性核验 |
-| `ImageProcessingServices.ts` | `ImageProcessingServices` | 聚合读取、本地化、编码、上传与写回步骤的编排服务层；统一归一化 `originalPath`、执行分类器与持久化前置闸门；以思源内核 `/api/asset/upload` 响应（`succFiles[0].index === 0` 且 `failedFiles.length === 0`）为落盘确认依据；持久化写入失败时暴露可复制新资源路径并抛出 `RecordPersistenceError` |
-| `ImageCompressionRecordStore.ts` | `ImageCompressionRecordStore` | 专职管理 `feature-image-compressor-records.json` 磁盘持久化（`upsert` 新增时设 `MAX_RECORDS = 10_000` 轻量条数容错上限，满载时保留既有全量记录并由持久化前置闸门统一兜底），实现持久化前置闸门与增量 `reload` |
-| `SafeBlockWriter.ts` | `SafeBlockWriter` | 进程内单写租约控制器（`withBlockWriteLease`），写前执行 `/api/block/getBlockInfo`（`readIdentity`）与 `/api/block/getBlockDOM`（`readDOM`）双重校验，调用 `/api/block/updateBlock` 并以内核返回 `code === 0` 作为落盘确认依据；中止时显式抛出 `AbortError` 或返回专用取消结果，严禁混淆为 `conflict` |
-| `ImageRecordsDock.svelte` | Svelte 5 组件 | 嵌入 Core 统一 Dock 的 Tab 视图，提供顶部 Hero 品牌卡片区（52px~56px，避开右上角 32px 浮动 Snackbar）、记录浏览、挂载异步 `/api/asset/statAsset` 核验（`code === 1` 映射为 `"missing"`，其它异常映射为 `"unknown"`）、状态 Badge 原生主题 CSS 变量渲染、对称双向引用管理（对 `?box=` 加密路径提示不支持反查，普通路径按笔记本分批 `/api/block/getBlockDOMs` 失败降级逐块 `getBlockDOM`；替换/恢复后更新 `store.markOperation`；静默刷新防覆盖并自动收起抽屉）、零自动淘汰与组件专属 `AbortController` |
-| `SingleImageAction.ts` | `SingleImageAction` | 纯领域单图处理，在 DOM 捕获层排除嵌入块与代码块（`NodeBlockQueryEmbed` / `.protyle-wysiwyg__embed` / `pre` / `code` / `NodeCodeBlock`），作用域严格限定为仅替换当前选中的单处引用；对话框生命周期内持有原图 Blob 缓存并在卸载时标记 `destroyed` 防止泄漏 `ObjectURL`；`replace: false` 模式下零文档写回；不直接调用 `ui.notify`，统一向 Controller 返回 `ImageActionOutcome` |
-| `DocumentBatchAction.ts` | `DocumentBatchAction` | 纯领域文档批量处理；通过 `activeDocuments: Set<string>` 防止并发重复拉起；调用 **1 次 `/api/block/getBlockDOM({ id: rootID, notebook })`** 并按最内层 `[data-node-id]` 切片存入 `blockDOMs`（跳过仍含嵌套 `[data-node-id]` 的容器块）；同源图片合并编码，执行桌面端 2 / 移动端 1 有界并发准备；进度划分 `preparing` 与 `applying`；逐位置执行 `OccurrenceTarget` 核验与改写；向 Controller 返回 `CompressionBatchSummary` |
-| `ImageSettingsPanel.svelte` | Svelte 5 组件 | 设置卡片组件，通过非响应式 `pathLookupsStarted: Set<string>`、卸载 `AbortController` 与有限并发调用 `/api/filetree/getFullHPathByID`（回退 `getHPathByID`）展示白名单完整层级路径；支持智能压缩总开关与目标相似度配置 |
+| `ImageCompressorFeature.ts` | `ImageCompressorFeature` | Feature 入口（ID: `imageCompressor`）；注册菜单、事件监听；使用 `/api/block/getBlockInfo` + `isDocumentRootIdentity` 区分无效 ID 与 API 错误（标题查询全部失败时回退 `rootID`）；提取 Protyle 与 blockID 上下文委托 `ImageController`；所有监听句柄由 `FeatureScope` 集中托管与注销 |
+| `ImageController.ts` | `ImageController` | 业务编排唯一门面；负责全局开关与白名单准入校验；调度 Action（含文档树单选 `compress-document`）与 `ImageTaskUI` / `ImageTaskPanel` 进度模态框（`closingByController` 区分程序关闭与用户主动关闭，不监听 `switch-protyle` / `destroy-protyle` 中止任务）；接入 Core `UiFeedback` 发送统一通知，接入 Core `PluginStatusBar` 维护底栏轻量任务文本；区分 `cancelled`、`total === 0 && scanComplete`（`image.batch.noImages`）与 `!scanComplete`（`image.batch.scanFailed`） |
+| `ImageCandidateClassifier.ts` | `classifyImageCandidate` | 纯路径与扩展名前置准入分类器；统一过滤常见视频扩展名、动态图（GIF/APNG）、矢量图（SVG）与 Excalidraw 及绘图专用目录（正则 `/(?:^|[\\/])drawings?[\\/]/i`，精确保护 `drawing/` 与 `drawings/` 目录，放行 `drawings_v2.png` 等普通文件名）；静态 WebP 在 `auto` 与 `document` 跳过、在 `manual-dialog` 与 `manual-quick` 放行 |
+| `AutoUploadHandler.ts` | `AutoUploadHandler` | 监听 Protyle 编辑器上传事件；`shouldCompress: (rootID: string) => boolean` 纯同步鉴权与候选筛选，未授权或无候选时零开销退出；`before-upload-assets` 置于 `try/catch` 隔离中；`onComplete` 仅采纳本次 `MutationObserver` 观测到的新增 DOM 节点证据（无全编辑器回退扫描，隔离既有 `<img>` 属性修改），等待块落盘定位后返回 `AutoUploadNotice` |
+| `RemoteImageWatcher.ts` | `RemoteImageWatcher` | 监听新插入 HTTP/HTTPS 外链图片；未授权文档中不发起 `blockDOM` 请求与 DOM 解析；引用 Core 公共受保护 DOM 选择器过滤变更，首轮 `sweep()` 无新增候选时至多 1 次延迟确认补扫；外链读取参照宿主原生重定向语义跟随合法跳转（无 3 跳拦截及私网/DNS 拦截，30 秒总超时，32 MiB 上限，无凭据/Cookie，保留 SSRF 边界说明），桌面端 `services/desktop.ts` 复用 Core `general.userAgent`，浏览器与移动端由 `services/download.ts` 调用 `fetch` |
+| `ImageOccurrenceResolver.ts` & `policy/source.ts` | `AssetAddress` / `ImageOccurrenceResolver` | `AssetAddress` 分离 `raw`、`kernelPath`、`key`（大小写敏感 + `box`）、`fetchURL` 与 `box`，保留 `?width=`/`#fragment` 与 `?box=` 并保护 `%25` 字面路径；在块 DOM 中建立 `OccurrenceTarget`（`rootID` + `notebook` + `blockID` + `kind` + `attribute` + `imageOrdinal` + `oldPath` + `baselineBlockDOM`） |
+| `src/features/image-compressor/similarity/` | 智能压缩独立子模块 | 划分独立的相似度算法域：包含 `AdaptiveImageCompressor`（`smartEnabled === false` 委托固定质量，`true` 执行 MS-SSIM 搜索；与分类器/编码器一致放行 `manual-dialog` / `manual-quick` 静态 WebP）、`computeMSSSIM`、`adaptiveQualitySearch`、`SimilarityWorkerSession`、`getSimilarityPolicy` 与内联 Worker；动图前置 `inspectImage` 预检全模式生效 |
+| `services/image.ts` | `BicEncoder` | 封装 WebP 编码生成引擎；在 `manual-dialog` / `manual-quick` 放行静态 WebP；执行保尺寸校验、EXIF 方向校正、整数网格对齐、`inspectImage` 容器头解析与 `verifyBitmap`（支持紧缩尺寸 `maxEdge = 64` 像素级可解码核验，避免输出大图全分辨率解码）校验；保留 `metadata.preserveExif: false` 不支持校验 |
+| `ImageProcessingServices.ts` | `ImageProcessingServices` | 聚合读取、本地化、编码、上传与写回步骤的编排服务层；采用内核 `/api/asset/upload` 返回路径（含 `?box=`）与持久化前置闸门；历史 JSON 迁移前执行只读 dry-run 核验，有歧义时保留原记录 |
+| `ImageCompressionRecordStore.ts` | `ImageCompressionRecordStore` | 专职管理 `feature-image-compressor-records.json`（`upsert` 与 `markOperation` 按最新 `updatedAt` 置顶，`MAX_RECORDS = 10_000` 容错上限）；提供 `compareAndRemove` 在 `JsonStore.update` 串行队列内二次比对当前配对后安全移除单条确认缺失记录 |
+| `SafeBlockWriter.ts` | `SafeBlockWriter` | 接入 Core 共享块写租约（`notebook/blockID`）；写前调用 `/api/block/getBlockInfo` 与 `/api/block/getBlockDOM` 核验块归属、完整 `baselineBlockDOM` 与目标节点（读取失败向上传播为读取错误，不包装为冲突）；返回四态 `CommitResult`（`replaced` / `conflict` / `aborted` / `unknown`），写请求已发但响应缺失归 `unknown` 且不重试 |
+| `ImageRecordsDock.svelte` & `services/references.ts` | Dock 视图与引用服务 | 嵌入 Core 统一 Dock；实现 `AssetAvailability` 三态核验（`statAsset` `code === 0` 为 `present`，含混 `code === 1` 映射为 `unknown`，仅权威可信缺失证据为 `missing-confirmed` 并触发单条 `compareAndRemove`）；引用查找覆盖 `image` / `resource-link` / `unsupported`（AV/数据库只读展示），单处改写配对窄 patch 函数；`?box=` 加密路径走已解锁笔记本范围 API 扫描（不剥离 `?box=` 调全局接口）；`post_action` 静默刷新异常不覆盖成功统计 |
+| `SingleImageAction.ts` | `SingleImageAction` | 纯领域单图处理，使用 Core 受保护 DOM 容器选择器常量；远程图片确认保存时先执行单处本地化（`replace = true`，不调用文档级 `/api/format/netImg2LocalAssets`），再经块读取 API 重建包含本地原图的新快照后才执行 WebP 上传、持久化与条件替换；`replace: false` 对本地 `assets/` 图片零文档写回，对远程图片保持本地原图引用；弹窗隐藏 EXIF 控件 |
+| `DocumentBatchAction.ts` | `DocumentBatchAction` | 纯领域文档批量处理；`activeDocuments.add(rootID)` 后全部初始化纳入 `try/finally` 防锁泄漏；调用 1 次 `/api/block/getBlockDOM({ id: rootID, notebook })` 并按最内层 `[data-node-id]` 切片；执行 `preparing` → `applying` 两阶段汇报；`CompressionBatchSummary` 独立统计 `unknown` 计数（不含无产出死分支） |
+| `ImageSettingsPanel.svelte` | Svelte 5 组件 | 设置卡片组件，通过非响应式 `pathLookupsStarted`、卸载 `AbortController` 与有限并发解析白名单层级路径；支持固定/智能模式切换与目标相似度配置；隐藏 EXIF 控件 |
 
 #### 3. 智能压缩质量计算模块解耦与性能契约
 
@@ -509,64 +524,46 @@ sequenceDiagram
 2. **有界并发调度 (Bounded Concurrency)**：
    - 依据平台前端类型实施严格的并发控制：桌面端最大并发度为 2，移动端最大并发度为 1；
    - **阶段隔离并发原则**：并发仅应用于耗时的资源准备阶段（原图读取、智能质量搜索、WebP 上传与 Dock 记录持久化）；
-   - **写回串行保障**：笔记引用的最终替换必须严格按确定顺序逐项提交给 `SafeBlockWriter`，继续受进程内块级写租约与写前节点读回比对保护，杜绝多任务并发改写破坏块结构。
+   - **写回串行保障**：笔记引用的最终替换必须严格按确定顺序逐项提交给 `SafeBlockWriter`，继续受 Core 共享块写租约与写前节点读回比对保护，杜绝多任务并发改写破坏块结构。
 3. **批量当前进度与底栏轻量反馈**：
    - `DocumentBatchAction` 在每处理完成一个引用位置后，通过 `onProgress` 回调广播当前进度（`completed` / `total`）以及当前处理的文件名 `currentFile`；
    - `ImageController` 将 `currentFile` 传入 `ImageTaskState`，驱动居中的 `ImageTaskPanel` 模态框实时展示当前正在处理的图片文件名与完成数；
    - 同时，Controller 联动调用 Core `PluginStatusBar`，在支持的桌面客户端主窗口呈现单行轻量文本（如 `图片压缩 5/18 · photo.png`）；
    - 移动端自动短路不操作状态栏；
-   - 当任务正常完成、被用户中止（按 Esc / 切换标签页）或所属 Feature 停用时，Controller 统筹销毁模态框并彻底清除状态栏任务，不残留失效进度。
+   - 当任务正常完成、由用户主动关闭进度弹窗（含 Esc）、或因 Feature 停用/插件卸载/宿主退出中止时，Controller 统筹销毁模态框并彻底清除状态栏任务，不残留失效进度；文档切换或编辑器关闭不影响后台任务继续运行，程序化关闭完成/失败面板不触发取消。
 4. **文档批量扫描与并发去重契约 (Single-DOM Scan & Concurrency Deduplication)**：
-   - **单次 `getBlockDOM(rootID)` + 内存切片与统一安全写回**：`DocumentBatchAction` 先调用 `/api/block/getBlockInfo` 校验 `rootID` 身份与所属笔记本，随后调用 **1 次 `/api/block/getBlockDOM({ id: rootID, notebook })`**（严格校验 `response.data?.id === rootID` 且 `dom` 非空后置 `scanComplete = true`）；通过 `scanDocumentImages`（排除 `.protyle-wysiwyg__embed`）扫描后，利用 `image.closest("[data-node-id]")` 定位最内层归属块并按 `blockEl.outerHTML` 切片存入 `blockDOMs`（若最内层块仍含嵌套 `[data-node-id]` 容器则安全跳过而不误计入 `failed`）；单图、文档批处理、自动上传与远端监听的引用写回均通过 `SafeBlockWriter.commitOneImage`（或 `ReferenceService.commitOccurrence` 透传）完成写前块身份与 DOM 比对后写入；
-   - 批处理控制器维护 `activeDocuments: Set<string>` 注册集合，防止针对同一文档重复并发拉起批处理任务；
-   - 任务进度状态机明确区分两个执行阶段：准备与上传阶段（`phase: "preparing"`，展示 `uploaded` 进度）与节点替换阶段（`phase: "applying"`，展示 `completed / total` 进度）；
-   - 当 `result.cancelled` 时静默关闭面板；当 `result.total === 0 && result.scanComplete` 时联动销毁模态框并由 Controller 提示 `image.batch.noImages`；当 `!result.scanComplete` 时提示 `image.batch.scanFailed`。
+   - **单次 `getBlockDOM(rootID)` + 内存切片与统一安全写回**：`DocumentBatchAction` 先调用 `/api/block/getBlockInfo` 校验 `rootID` 身份与所属笔记本，随后调用 **1 次 `/api/block/getBlockDOM({ id: rootID, notebook })`**（严格校验 `response.data?.id === rootID` 且 `dom` 非空后置 `scanComplete = true`）；通过 `scanDocumentImages`（排除受保护容器选择器）扫描后，利用 `image.closest("[data-node-id]")` 定位最内层归属块并按 `blockEl.outerHTML` 切片存入 `blockDOMs`（若最内层块仍含嵌套 `[data-node-id]` 容器则安全跳过而不误计入 `failed`）；单图、文档批处理、自动上传与远端监听的引用写回均通过 `SafeBlockWriter`（或 `ReferenceService` 透传）在 Core 共享块写租约下完成写前块身份与 DOM 比对后写入；
+   - 批处理控制器维护 `activeDocuments: Set<string>` 注册集合，并将 `add(rootID)` 后的初始化全流程纳入 `try/finally` 防止异常锁死；
+   - 任务进度状态机明确区分两个执行阶段：准备与上传阶段（`phase: "preparing"`，展示 `uploaded` 进度）与节点替换阶段（`phase: "applying"`，展示 `completed / total` 进度），并独立统计 `unknown` 计数（不将中止或 `unknown` 计入 `failed`）；
+   - 当 `result.cancelled` 时静默关闭面板；当 `result.total === 0 && result.scanComplete` 时由控制器置 `closingByController = true` 关闭模态框并提示 `image.batch.noImages`；当 `!result.scanComplete` 时关闭面板并提示 `image.batch.scanFailed`（均不误报为用户取消）。
 
 ### 5.3 核心技术安全机制
 
-#### 1. 进程内单写租约 (`withBlockWriteLease`) 与正常中止状态判定
-思源内核块更新 API 不提供原子乐观锁或事务版本号（Revision/CAS）机制。为避免并发任务同时改写同一块导致数据冲突，系统在内存中维护按块隔离的全局写租约队列：
-```typescript
-const blockTails = new Map<string, Promise<void>>();
-
-/** 针对持久化块的单写租约控制器，避免并发写冲突且不残留空闲键 */
-export function withBlockWriteLease<T>(key: string, operation: () => Promise<T>): Promise<T> {
-  const previous = blockTails.get(key) ?? Promise.resolve();
-  let release!: () => void;
-  const hold = new Promise<void>(resolve => { release = resolve; });
-  const tail = previous.catch(() => undefined).then(() => hold);
-  blockTails.set(key, tail);
-  return previous.catch(() => undefined).then(operation).finally(() => {
-    release();
-    if (blockTails.get(key) === tail) blockTails.delete(key);
-  });
-}
-```
-- **中止状态边界原则与契约 (SafeBlockWriter Abort & Cancellation Contract)**：
-  - 在 `SafeBlockWriter` 获取租约排队期间或执行写入过程中，若检测到任务取消、超时或 `signal?.aborted`，或者思源内核请求因取消抛出 `AbortError`；
-  - **必须显式抛出标准 `AbortError` 或返回专用的取消状态（如 `"aborted"`）**；
-  - **绝对严禁将其归类、隐式吞咽或混淆为内容修改引发的并发编辑冲突（`"conflict"`）**；
-  - 混淆为 `"conflict"` 会导致上层调用者向用户误报“目标图片已被修改或移动，已放弃替换当前引用”并错误计入冲突数。上层调用者捕获中止信号后静默退出，不计入冲突统计，不派发误报提示。
+#### 1. 跨 Feature 共享块写租约 (`BlockWriteLease`) 与四态写回契约
+思源内核块更新 API（`/api/block/updateBlock`）不提供原子乐观锁或事务版本号（Revision/CAS）机制。为避免同插件内跨 Feature 或同 Feature 并发任务同时改写同一块导致覆盖，Core 在内存中维护按 `notebook/blockID` 隔离的统一写租约队列，供 `imageCompressor` 与 `titled-link` 共用：
+- **排队中止感知**：等待租约期间感知 `signal?.aborted` 并立即退出，进入临界区后执行读写前再次复核中止状态；
+- **四态写回边界 (`CommitResult`: `replaced` / `conflict` / `aborted` / `unknown`)**：
+  - `getBlockInfo` / `getBlockDOM` 读取失败向上传播为明确读取错误，严禁包装为 `"conflict"`；
+  - 写请求发出前检测到 `signal?.aborted` 返回 `"aborted"`（或抛出 `AbortError`），严禁混淆为 `"conflict"`；
+  - 仅在真实块归属、`baselineBlockDOM` 快照或目标节点属性不匹配时返回 `"conflict"`；
+  - `/api/block/updateBlock` 请求已发出后遭遇超时、断连或中止，归类为 `"unknown"`，严禁自动重试，并保留已确认资产及记录状态为 `"incomplete"`。
 
 #### 2. Occurrence 精确匹配与放弃原则
-在获得写租约后，改写流程遵循以下严谨步骤：
+在获得 Core 共享写租约后，改写流程遵循以下严谨步骤：
 1. 调用 `/api/block/getBlockInfo`（`readIdentity`）校验 `data.rootID === target.rootID && data.box === target.notebook`，随后调用 `/api/block/getBlockDOM`（`readDOM`）获取内核当前落盘的真实 DOM；
-2. 解析 DOM，校验为单块且不含嵌套 `[data-node-id]`，定位索引为 `target.imageOrdinal` 的图片节点；
-3. **基于 OccurrenceTarget 的精确节点核验**：
-   - 采用块内目标 Occurrence 节点及其上下文精确比对，而非整块 HTML 字符串硬等比对，杜绝因用户并发编辑块内非目标文字导致的误报冲突，同时消除 Protyle 运行时自动刷新 `updated` 时间戳或光标属性对改写比对的干扰；
-   - **大小写敏感与加密资产路径规范**：资产路径唯一标识在底层严格保持大小写敏感（区分 Linux 及大小写敏感文件系统），并完整解析与支持携带 `?box=` 参数的加密笔记本资产 URL 规范；
-   - 严格核验节点三要素：
-     1. 块归属未变（`blockID` 归属于目标 `rootID` 且 `box` 等于 `notebook`）；
-     2. 块内第 `imageOrdinal` 个图片节点依然存在；
-     3. 该图片节点的当前资源引用路径仍精确等于 `target.oldPath`；
-4. 若核验通过，仅改写该目标图片节点的引用属性并提交 `/api/block/updateBlock`；根据思源 Go 内核契约，内核返回 `code: 0` 即意味着事务落盘并广播了 WebSocket，直接信任返回值完成写入确认；
-5. 若后台处理期间目标图片被删除、替换或序号改变，任一要素核验失败时系统安全放弃本次单处写回操作；提示文案客观反馈：`[OmniKit] 目标图片已被修改或移动，已放弃替换当前引用，WebP 已保存至记录`。
+2. 解析 DOM，校验为单块且不含嵌套 `[data-node-id]`，核验 `liveDOM === target.baselineBlockDOM` 并按类型定位目标节点（`img[data-src|src]`、`span[data-type~=a][data-href]` 或 `a[href]`）；
+3. **基于 `AssetAddress` 与 `OccurrenceTarget` 的精确节点核验**：
+   - **大小写敏感与加密资产路径规范**：`AssetAddress` 保持物理身份大小写敏感与 `?box=` 笔记本边界，不盲目对字面路径解码 `%25` 或合并 `NFC.toLowerCase()`；写前校验仍与当前 DOM 原文 `target.oldPath`（即 `AssetAddress.raw`）严格比对；
+   - 严格核验三要素：块归属未变（`rootID` 与 `box`）、整块基线与序号节点存在、目标节点属性原文仍精确等于 `target.oldPath`；
+4. 若核验通过，仅通过对应的图片或普通链接窄 patch 函数改写该目标属性并提交 `/api/block/updateBlock`；内核返回 `code: 0` 即意味着事务落盘，完成写入确认；
+5. 若后台处理期间目标块或节点被修改、删除或移动，核验失败时安全返回 `"conflict"` 并放弃写回（保留已上传与持久化记录）。
 
-#### 3. 单图右键压缩最小副作用与零写回预览原则
-- 编辑器图片右键触发的单图压缩动作（快捷压缩或弹窗微调），作用域严格限定为“仅替换当前选中的单处引用”；
-- 即使同一文档中存在多处相同原图的引用，单图操作亦不触碰其他引用位置，确保操作行为完全可预期；
-- 在单图微调对话框的 `replace: false` 预览/仅保存模式下，仅生成衍生 WebP 资产并写入持久化业务记录供用户复制引用路径，严格执行零文档写回（`updateBlock` 调用次数为 0）；
-- 对话框在前端内存中持有原图 Blob 缓存，用户重新切换压缩参数时复用已下载原图，不重复向内核发起网络下载。
+#### 3. 单图右键压缩最小副作用与远程本地化边界
+- 编辑器图片右键触发的单图压缩动作（快捷压缩或弹窗微调），作用域严格限定为“仅改写当前选中的单处引用”，不触碰同块或同文档其他位置；
+- 在单图微调对话框的 `replace: false` 模式下：
+  - 若源图片为已有本地 `assets/` 资源，仅生成 WebP 资产并写入持久化业务记录供用户复制路径，严格执行零文档写回（`updateBlock` 调用次数为 0）；
+  - 若源图片为远程 URL，预览阶段保持只读，确认保存时先完成该单处远程原图上传与精确块本地化（将远程 URL 替换为本地原图），随后上传 WebP 并持久化 Dock 记录，保持当前引用为本地原图（`replace: true` 时在本地化成功后经块读取 API 重建新快照，再独立提交 WebP 替换）；
+- 对话框在前端内存中持有原图 Blob 缓存，用户切换压缩参数时复用已下载原图，不重复向外部发起网络下载。
 
 #### 4. 持久化前置闸门 (Persistence-First Gate)
 在 `ImageProcessingServices` 的 `persistEncodedImage` 中，上传与写回之间设置前置闸门：
@@ -574,7 +571,7 @@ export function withBlockWriteLease<T>(key: string, operation: () => Promise<T>)
 // 1. 归一化 originalPath 并确认内核上传 WebP 成功 (code === 0 且 succFiles[0].index === 0 且 failedFiles.length === 0)
 const uploadedPath = await services.assets.upload(encodedFile, rootID, signal);
 
-// 2. 闸门：先持久化 Dock 记录至磁盘（新增设 MAX_RECORDS = 10_000 轻量容错上限，保留既有全部映射记录）
+// 2. 闸门：先持久化 Dock 记录至磁盘（设 MAX_RECORDS = 10_000 轻量容错上限，保留既有全部映射记录）
 try {
   await services.recordsReady;
   await services.records.upsert(originalPath, uploadedPath);
@@ -596,20 +593,22 @@ await services.references.commitOccurrence(target, uploadedPath, signal);
 - **容灾回退**：若内核返回为空或文档被删除，主标题回退展示 `rootID`。
 
 #### 6. Dock 双向引用管理与状态机制 (Bidirectional Reference Management & Lifecycle)
-- **初始状态策略与挂载核验**：
-  - 新建或刚压缩生成的记录，初始状态直接标记为 `present`（存在）；
-  - 当外部数据加载挂载（插件启动、切换激活 Dock Tab 面板或用户点击“手动刷新”）时，系统自动执行后台异步核验，通过思源内核 `/api/asset/statAsset` 探测原图与压缩图的物理存在性，无需用户初次手动触发刷新；
+- **三态资产存在性核验与触发时机**：
+  - 新建或刚压缩生成的记录，初始状态标记为 `present`（存在）；
+  - 当 Dock 打开/激活、用户点击“手动刷新”以及压缩写入记录时，系统执行后台异步核验，通过思源内核 `/api/asset/statAsset`（保留 `?box=`）探测原图与**最新**压缩图的物理存在性（不设后台定时巡检或独立状态缓存）；
+  - `AssetAvailability` 严格区分 `"present"`（`code === 0`，含按需同步逻辑文件 `downloaded: false`）、`"missing-confirmed"`（仅来自可证明物理缺失的权威内核契约）与 `"unknown"`（网络/超时/权限/未解锁及当前思源 `/api/asset/statAsset` 返回含混 `code === 1` 错误码的情形）；
 - **状态 Badge 原生主题变量呈现与深浅模式自适应 (Theme-Aware Badges)**：
-  - 原图与压缩图状态 Badge（`present`、`missing`、`checking`、`unknown`）样式严格采用思源原生主题 CSS 变量（`var(--b3-theme-primary)` / `var(--b3-theme-error)` / `var(--b3-theme-secondary)` / `var(--b3-theme-on-surface)`）与半透明派生背景（使用 `color-mix(in srgb, var(...) 15%, transparent)` 或标准透明度）；
+  - 原图与压缩图状态 Badge（`present`、`missing-confirmed`、`checking`、`unknown`）样式严格采用思源原生主题 CSS 变量（`var(--b3-theme-primary)` / `var(--b3-theme-error)` / `var(--b3-theme-secondary)` / `var(--b3-theme-on-surface)`）与半透明派生背景（使用 `color-mix(in srgb, var(...) 15%, transparent)` 或标准透明度）；
   - 严禁硬编码 Hex 颜色或非自适应 RGBA 颜色，确保在深色模式与浅色模式下均具备对比度与可读性；
-- **记录持久化纯手动管理与零自动淘汰 (Manual Record Management & Zero Auto-Pruning)**：
-  - 业务记录（`feature-image-compressor-records.json`）在 `upsert` 新增条目时设 `MAX_RECORDS = 10_000` 轻量容错上限（触达上限时完整保留既有全量记录并拒绝新增，走常规持久化失败闸门；读取与原地更新不阻断），生命周期由用户在 Dock 面板通过“移除记录”显式单条手动管理（后续总设置面板也将按规划增加数据管理专区以支持集中查看与二次确认清空）；
-  - 因思源内核 `/api/asset/statAsset`（`kernel/api/asset.go`）在文件物理不存在时以及部分路径解析、延迟同步读取或 `stat` 失败时均返回 `code === 1`（而无独立 404 错误码），系统将 `code === 1` 映射为 `"missing"`（未定位到可用资产，禁用“恢复原图”），将其余网络、超时或非 1 错误码映射为 `"unknown"`；系统严禁根据任何状态自动调用 `removeRecord` 删除或修剪任何业务记录；
+- **记录持久化、置顶排序与失效配对条件移除**：
+  - 业务记录（`feature-image-compressor-records.json`）按最新 `updatedAt` 倒序置顶（`upsert` 与 `markOperation` 均维护最新记录置于首位，不建独立持久化排序缓存），新增条目设 `MAX_RECORDS = 10_000` 轻量容错上限（满载保留既有全量记录并拒绝新增，走常规持久化失败闸门；读取与原地更新不阻断）；
+  - 仅当某条记录的原图或最新压缩图明确返回 `"missing-confirmed"` 时，调用 `compareAndRemove(originalPath, compressedPath)` 在 `JsonStore.update` 串行队列内二次核对当前配对后自动移除该单条业务记录；对于含混 `statAsset` `code === 1` 及其他异常均标为 `"unknown"` 并完整保留记录，严禁自动删除物理文件或跨记录级联删除；
 - **组件生命周期 Abort 机制**：
   - Dock 视图组件实例化专属的 `AbortController`；当组件卸载、Dock 折叠或 Tab 切换销毁时，立即触发中断信号，安全取消正在执行的后台引用检索与状态核验；
-- **对称的双向引用管理交互**：
-  - **【查找原图引用】**：展开展示引用原图（`originalPath`）的位置列表。区域标题为“当前原图引用”，辅助描述为“点击可跳转对应位置，替换后使用压缩 WebP”。支持点击文本调用 `openTab` 跳转定位并高亮对应块。单项提供“替换此处”按钮，列表底部提供“替换所有处”按钮。直接执行，无需弹窗二次确认；对 `?box=` 加密路径提前提示不支持引用反查；普通路径按笔记本分批调用 `/api/block/getBlockDOMs`，若因已关闭或缺失块（`code: -1`）整批失败则降级为逐块 `getBlockDOM` 容错，并追踪查询完整性标记（`skippedNotebooks`、`unavailableAttributeViews`、元数据缺损、块 DOM 读取失败或嵌套跳过均标记为不完整）；替换后仅当定位完整、剩余引用为 0 且无冲突时调用 `store.markOperation` 写入 `"replaced"`，否则写入 `"incomplete"`；
-  - **【恢复原图引用】**：仅在原图状态为 `present` 时可用。展开展示引用压缩图（`compressedPath`）的位置列表。区域标题为“当前压缩图引用”，辅助描述为“点击可跳转对应位置，恢复后将改回原图”。支持点击文本调用 `openTab` 跳转定位并高亮对应块。单项提供“恢复此处”按钮，列表底部提供“恢复所有处”按钮。直接执行，无需弹窗二次确认；恢复操作不删除压缩图附件；恢复后仅当定位完整、剩余引用为 0 且无冲突时调用 `store.markOperation` 写入 `"saved-only"`，否则写入 `"incomplete"`；
+- **对称的双向引用管理与普通资源链接查找改写**：
+  - **【查找原图引用】 / 【恢复原图引用】**：同时覆盖图片（`img[data-src|src]`）与普通资源链接（`span[data-type~=a][data-href]`、`a[href]`），按 `image`、`resource-link`、`unsupported` 分组展示并支持跳转定位；选定单处或批量改写时通过 `SafeBlockWriter` 配对图片/链接两种窄 patch 函数精确改写目标属性（不调用全局 `relinkAsset`）；属性视图/数据库等无法映射为单块可编辑节点的引用仅作只读展示；
+  - **`?box=` 加密笔记本范围扫描**：不剥离 `?box=` 调用 `/api/asset/findAssetReferences`；在已解锁且获授权的目标笔记本范围内通过思源文档/块读取 API 扫描匹配节点（只读 SQL 仅作为可见已索引普通文档的可选候选预筛选），笔记本锁定或无权限时返回 `unavailable`/`unknown`；
+  - **状态更新**：替换后仅当定位完整、剩余引用为 0 且无冲突时调用 `store.markOperation` 写入 `"replaced"`（恢复则写入 `"saved-only"`），否则写入 `"incomplete"`；恢复操作不删除压缩图附件；
 - **路径直接复制交互**：点击原图或压缩图路径文本直接复制至剪贴板，弹出轻量 Toast 提示“已复制路径”；局域网 HTTP 部署且不支持原生剪贴板时，安全回退展示带可复制文本框的模态提示。
 - **场景区分与反馈状态机 (Decoupled Lookup & Feedback State Machine)**：
   系统严格隔离“主动查找意图”与“执行写回后的静默刷新”：
@@ -620,7 +619,7 @@ await services.references.commitOccurrence(target, uploadedPath, signal);
   2. **执行替换/恢复后的静默刷新与防覆盖机制 (Post-Operation Silent Refresh & Anti-Overwriting Guard)**：
      - 用户点击“替换此处”、“恢复此处”、“替换所有处”或“恢复所有处”执行改写；
      - 写回完成后，首先生成操作统计文案（如 `已替换 ${replaced} 处为压缩图；跳过或冲突 ${conflicts} 处` 或 `已恢复 ${restored} 处为原图；跳过或冲突 ${conflicts} 处`），并写入顶部 Banner 与全局轻量提示（`showMessage`）；
-     - 随后调用的重新定位属于后续静默刷新，**严禁使用静默刷新的空结果冲刷或覆盖已展示的成功统计文案**；
+     - 随后调用的重新定位属于后续静默刷新，**仅当 `source === "user_click"` 时展示查找失败文案，严禁使用静默刷新的空结果或异常冲刷覆盖已展示的成功统计文案**；
   3. **全部处理完成后的自动收起机制 (Auto-Collapse on Completion)**：
      - 若静默刷新返回剩余列表长度为 0（即全部引用均已处理完毕），系统自动重置展开状态（`expanded = null`，`occurrences = []`），抽屉自动折叠收起，界面恢复整洁的记录卡片列表；
      - 收起的同时，顶部 Banner 与轻量通知持续驻留展示本次操作的成功统计结果，形成明确无歧义的闭环反馈。
@@ -638,8 +637,8 @@ sequenceDiagram
     Note over User,Dock: 场景 1：用户主动查找/恢复引用 (主动意图)
     User->>Dock: 点击【查找原图引用】或【恢复原图引用】
     Dock->>Ref: locateOccurrences(record, mode)
-    Ref->>Host: POST /api/asset/findAssetReferences
-    Host-->>Ref: 返回匹配块与引用列表
+    Ref->>Host: 普通路径: findAssetReferences + getBlockDOMs<br/>?box= 加密路径: 已解锁笔记本范围 API 扫描
+    Host-->>Ref: 返回按 image / resource-link / unsupported 分组的命中列表
     alt 检索到引用位置 (count > 0)
         Dock->>Dock: expanded = { path, mode }, 展开显示引用列表
     else 无匹配引用 (count == 0)
@@ -707,27 +706,28 @@ sequenceDiagram
         Controller->>Parser: 发起双轨网络请求 (携带 Core 统一 UA)
         alt 桌面客户端 (desktop / desktop-window)
             Parser->>Host: 原生 fetch 流式分块读取 (Chunk Stream)
-            Parser->>Parser: 64 字符重叠窗口检测 </head> 或 </title> 闭合标签
-            Parser->>Parser: 触发 64KB 熔断或闭合截断，主动取消底层网络流
+            Parser->>Parser: 64 字符重叠窗口检测 </head> 闭合标签
+            Parser->>Parser: 触发 64KB 熔断或 </head> 截断，主动取消底层网络流
         else 浏览器与移动端
             Parser->>Host: POST /api/network/forwardProxy (代理转发)
             Host-->>Parser: 返回 Base64 数据
             Parser->>Parser: 按 maxBytes 上限单遍扫描解码前 64KB 并嗅探字符集
         end
-        Parser->>Controller: 返回净化与截断后的标准标题
+        Parser->>Controller: 返回净化与截断后的标准标题 (含 http/timeout/network 失败分类)
     end
     end
 
     rect rgb(240, 255, 240)
-    Note over Controller,SafeWriter: 步骤三：内存真理核验与原生受控事务提交
+    Note over Controller,SafeWriter: 步骤三：内存真理核验、共享写租约与事务提交
     Controller->>SafeWriter: 提交标题写回请求
     alt 当前为活动 Protyle 编辑器 (isActiveEditor 优先)
-        SafeWriter->>SafeWriter: 核验 isLiveOccurrenceValid (在树且未篡改)
+        SafeWriter->>SafeWriter: 核验 isLiveOccurrenceValid 与目标编辑器级 IME 状态
         SafeWriter->>Protyle: 调用 applyLinkTitle 更新内存 DOM 并仅在链接内折叠光标时恢复末尾位置
         SafeWriter->>Protyle: 调用 protyle.updateTransactionElement(blockElement, oldHTML)
         Note over Protyle: 原生受控事务: 支持 Ctrl+Z 撤销/重做并自动落盘
     else 非活动编辑器或后台更新 (!isActiveEditor)
-        SafeWriter->>Host: POST /api/block/getBlockDOM & 严格按 ordinal 校验
+        SafeWriter->>SafeWriter: 获取 Core 共享块写租约 (notebook/blockID)
+        SafeWriter->>Host: POST /api/block/getBlockInfo & getBlockDOM 严格按 ordinal 校验
         SafeWriter->>Host: POST /api/block/updateBlock (dataType: "dom")
         Host-->>SafeWriter: 内核返回 code: 0 (落盘确认)
         SafeWriter->>SafeWriter: 信任内核写入确认，完成改写
@@ -739,19 +739,19 @@ sequenceDiagram
 
 | 模块文件 | 核心职责 | 技术契约与边界 |
 |---|---|---|
-| `TitledLinkFeature.ts` | Feature 入口 | 集中注册上下文菜单（`open-menu-link` 过滤 `isHttpUrl` / `click-blockicon` 块级批量）、`paste` 与 `destroy-protyle` 监听；统一管理输入法状态（`attachCompositionTracking`）；由 `FeatureScope` 集中托管与注销 |
-| `TitledLinkController.ts` | 业务编排门面 | 负责前置准入校验、剪贴板修整、延迟防抖、非网页文件免抓取、`runBatch` 启动并发前同步完成全部快照与 Token 占位、受控并发调度（上限 3）与用户交互反馈收口 |
-| `dual-track-fetcher.ts` | 双轨网络驱动 | 桌面客户端原生 `fetch` 直连分块读取；浏览器与移动端通过 `/api/network/forwardProxy` 代理转发，并在 `decodeBase64` 中绑定 `maxBytes` 上限执行单遍 $O(\text{maxChars})$ 扫描与校验；复用 Core `general.userAgent` |
-| `stream-parser.ts` | 流式解析与保护 | 单实例 `LATIN1_DECODER` 增量分块解码、尾部 64 字符重叠窗口检测 `</head>` / `</title>` 截断与 64KB 硬熔断；GBK/Big5/Shift-JIS/UTF-8 字符集嗅探与解码；`window.Lute.UnEscapeHTMLStr` 实体还原；标题归一化与截断 |
-| `safe-writer.ts` | 原生受控事务写回 | 分离 `isActiveEditor` 与 `isLiveOccurrenceValid`；`applyLinkTitle` 保护链接内折叠光标；活动编辑器调用 `updateTransactionElement`（不回退 `updateBlock`）；非活动更新严格按 `ordinal` 校验后调用 `/api/block/updateBlock`；块级批量同块聚合写回 |
+| `TitledLinkFeature.ts` | Feature 入口 | 集中注册上下文菜单（`open-menu-link` 过滤 `isHttpUrl` / `click-blockicon` 块级批量）、`paste` 与 `destroy-protyle` 监听；在目标编辑器上以捕获阶段管理输入法状态（`attachCompositionTracking`）；由 `FeatureScope` 集中托管与注销 |
+| `TitledLinkController.ts` | 业务编排门面 | 负责前置准入校验、剪贴板修整、延迟防抖、非网页文件免抓取、手动批量块级 `in-flight` 去重门闩、`runBatch` 启动并发前同步完成全部快照与 Token 占位、受控并发调度（上限 3）与用户交互反馈收口 |
+| `dual-track-fetcher.ts` | 双轨网络驱动 | 桌面客户端原生 `fetch` 直连分块读取；浏览器与移动端通过 `/api/network/forwardProxy` 代理转发，并在 `decodeBase64` 中绑定 `maxBytes` 上限执行单遍 $O(\text{maxChars})$ 扫描与校验；复用 Core `general.userAgent`；精确输出 `http` / `timeout` / `network` / `aborted` 失败分类 |
+| `stream-parser.ts` | 流式解析与保护 | 单实例 `LATIN1_DECODER` 增量分块解码、尾部 64 字符重叠窗口检测 `</head\s*>` 闭合标签与 64KB 硬熔断（不提前在 `</title>` 截断）；GBK/Big5/Shift-JIS/UTF-8 字符集嗅探与解码；`window.Lute.UnEscapeHTMLStr` 实体还原；标题归一化与截断 |
+| `safe-writer.ts` | 原生受控事务写回 | 分离 `isActiveEditor` 与 `isLiveOccurrenceValid`；`applyLinkTitle` 保护链接内折叠光标；活动编辑器调用 `updateTransactionElement`（不回退 `updateBlock`）；非活动更新通过 Core 共享块写租约严格按 `ordinal` 校验后调用 `/api/block/updateBlock`；块级批量同块聚合写回 |
 | `title-cache.ts` | 短期内存缓存 | 100 条 / 5 分钟 TTL 内存 LRU 结构；Generation Ticket 代际保护；不缓存 `fallback: true` 降级域名；零磁盘持久化 |
 
 #### 1. 大网页截断与流式保护机制 (`stream-parser.ts` & `dual-track-fetcher.ts`)
 为限制超大网页的内存与网络开销并正确解析多语言字符集，系统实施两级流式截断防护：
 1. **桌面客户端流式分块截断与网络流取消**：
    - 桌面客户端（`desktop` / `desktop-window`）直接发起 `window.fetch` 流式请求，以 Chunk Stream 模式读取前置数据；
-   - `stream-parser.ts` 使用单实例 `LATIN1_DECODER`，在流式循环中仅增量解码新增 `chunk`，并利用含尾部 **64 字符**的重叠窗口检测 `</head>` 或 `</title>` 闭合标签（覆盖标签跨分片与空白符场景），结束时仅执行 1 次 `concatenate` 合并；
-   - 匹配闭合标签或达到 **64KB** 上限时，立即调用 `ReadableStreamDefaultReader.cancel()` 主动取消底层网络流，控制主线程内存占用；
+   - `stream-parser.ts` 使用单实例 `LATIN1_DECODER`，在流式循环中仅增量解码新增 `chunk`，并利用含尾部 **64 字符**的重叠窗口检测 `</head\s*>` 闭合标签（不因 `</title>` 提前停止，覆盖标签跨分片与空白符场景，保留 `<title></title>` 后的 `og:title` / `twitter:title` 候选），结束时仅执行 1 次 `concatenate` 合并；
+   - 匹配 `</head>` 闭合标签或达到 **64KB** 上限时，立即调用 `ReadableStreamDefaultReader.cancel()` 主动取消底层网络流，控制主线程内存占用；
 2. **浏览器与移动端 64KB 二进制截取**：
    - 浏览器端与移动端通过思源内核 `/api/network/forwardProxy` 获取网络响应 Base64 字节流；
    - `decodeBase64` 将字符解码上限绑定至 `maxBytes`（`maxChars = Math.ceil((maxBytes + 1) / 3) * 4`，默认 `65_536` 字节对应 `87_384` 字符），通过单遍 $O(\text{maxChars})$ 扫描跳过 ASCII 空白字符、校验 `[A-Za-z0-9+/=]` 与尾部填充态后再调用 `globalThis.atob(cleaned)` 解码，丢弃后续正文数据；
@@ -774,10 +774,11 @@ sequenceDiagram
      ```
    - **原生撤销与历史版本**：该事务调用使思源编辑器将本次标题修改纳入原生撤销栈，支持用户使用 `Ctrl+Z` 撤销与 `Ctrl+Y` 重做，并由思源编辑器自动同步触发块落盘与 Doc History 记录，避免输入期间因异步落盘延迟导致的假性冲突；
 2. **非活动编辑器或后台更新**：
-   - 当 `!isActiveEditor(target)` 时（例如用户已关闭页签或切换文档），系统调用 `/api/block/getBlockDOM` 并严格按 `links[target.ordinal]` 精确校验（不执行模糊回退），随后调用思源内核 REST API `/api/block/updateBlock`（`dataType: "dom"`），单条与批量写回统一委托 `commitLinkTitles` 执行；
+   - 当 `!isActiveEditor(target)` 时（例如用户已关闭页签或切换文档），系统在 Core 共享块写租约内调用 `/api/block/getBlockInfo` 与 `/api/block/getBlockDOM` 并严格按 `links[target.ordinal]` 精确校验（不执行模糊回退），随后调用思源内核 REST API `/api/block/updateBlock`（`dataType: "dom"`），单条与批量写回统一委托 `commitLinkTitles` 执行；
    - 根据思源 Go 内核契约，内核返回 `code: 0` 即意味着落盘并广播了 WebSocket 事务，系统信任该返回值完成写回确认；
-3. **块级批量并发快照与同块聚合写回**：
-   - `TitledLinkController.runBatch` 在启动并发池（上限 `3`）前，同步一次性完成全部目标链接的 `captureLinkTarget` 快照与 `tokens.set(link, token)` 占位，防止并发排队期间打字引发假冲突或 `token` 竞争；
+3. **块级批量并发快照、在途去重与目标编辑器 IME 保护**：
+   - `TitledLinkController.runBatch` 对同一块实施在途批量门闩去重，并在启动并发池（上限 `3`）前，同步一次性完成全部目标链接的 `captureLinkTarget` 快照与 `tokens.set(link, token)` 占位，防止并发排队期间打字引发假冲突或 `token` 竞争；
+   - `attachCompositionTracking` 在目标 Protyle 编辑器实例以捕获阶段追踪 IME 状态，确保分屏场景下其他编辑器的 IME 组合不阻塞目标编辑器写回；
    - 同块内所有链接拉取完成后，在单次 `updateTransactionElement` 事务中将该块内所有已完成的链接一并提交，消除撤销历史碎片。
 
 ### 6.4 短期内存 LRU 缓存与任务代际保护
@@ -815,7 +816,7 @@ sequenceDiagram
 - [ ] 是否按需声明了平台兼容性列表 `frontends`（5+1 取值集合，缺失或空数组时默认为全端支持）？在不受支持的环境下是否平稳保持在 `unsupported` 状态，不挂载任何资源与菜单，且不破坏跨端云同步中的启用偏好？
 - [ ] 设置文件命名是否严格为 `feature-${id}-settings.json`？
 - [ ] 业务数据文件命名是否严格为 `feature-${id}-{dataname}.json`？
-- [ ] 业务数据记录是否遵循纯手动管理与零自动淘汰原则，严禁在 `statAsset` 失败时自动删除记录？
+- [ ] 业务数据记录是否严格遵循仅在权威可信缺失证据（`"missing-confirmed"`）时移除单条配对条目，严禁在含混 `statAsset` 错误或 `"unknown"` 状态下自动删除记录？
 - [ ] 长时间异步任务是否传递并感知了 `context.scope.signal`？
 - [ ] 菜单动作是否由 `MenuRegistry` 权威收口分流（顶栏自有菜单无前缀，外部宿主上下文菜单自动补齐 `[OmniKit] ` 前缀，禁止 Feature 层硬编码）？
 - [ ] 顶栏下拉菜单中 Core 平台项（「OmniKit 设置」）与下方 Feature 选项之间是否使用了 `menu.addSeparator({ id: "separator_settings" })` 原生分隔线？
@@ -823,14 +824,14 @@ sequenceDiagram
 - [ ] Dock 顶部是否具备 52px~56px 品牌 Hero 卡片区，操作区下移 50px 以上避开思源右上角 32px 浮动 Snackbar？
 - [ ] Dock 状态 Badge 是否严格采用思源原生主题 CSS 变量（无硬编码 Hex 颜色），保证深浅模式对比度？
 - [ ] 新图插入在未授权文档中是否彻底静默退出（不弹气泡、不挂载无意义 MutationObserver、不向内核发起 blockDOM 请求）？
-- [ ] 用户按 Esc、切换标签页或 `signal.abort` 是否判定为正常中止并静默退出，未误报为无法定位或并发冲突？
-- [ ] `SafeBlockWriter` 中止是否显式抛出 `AbortError` 或专用取消状态，严禁混淆为 `conflict`？
-- [ ] 批量处理 0 张图片时是否联动销毁了 `ImageTaskPanel` 模态框？
+- [ ] 文档切换或编辑器关闭是否保持后台任务继续运行，仅在 Feature 停用/卸载/宿主退出或 Feature 专属进度弹窗用户主动关闭时判定为正常中止并静默退出？
+- [ ] 块写回层是否接入 Core 共享块写租约，且严格区分 `replaced` / `conflict` / `aborted` / `unknown`，严禁将中止或读取失败混淆为 `conflict`、严禁对 `unknown` 自动重试？
+- [ ] 批量处理 0 张图片或扫描失败时是否由控制器程序化关闭 `ImageTaskPanel` 模态框而不误报为用户取消？
 - [ ] Dock 静默刷新是否遵循防覆盖铁律，未冲刷覆盖操作成功统计？
 - [ ] 是否遵循 Feature（上下文分发）、Controller（参数校验与统一用户提示）、Action（纯领域执行）的单向职责划分？
 - [ ] 是否避免向思源工作区写入任何临时调试或排队文件？
 - [ ] 是否未调用任何主动删除原图或压缩图资产的 API？
-- [ ] 块改写是否基于 `OccurrenceTarget` 精确节点核验而非整块字符串比对？
+- [ ] 块改写是否基于 `OccurrenceTarget`（含 `baselineBlockDOM`、序号与节点属性原文）精确核验而非整块盲改？
 - [ ] 单图操作作用域是否严格限定为选中的单处引用？
 
 ---
@@ -890,14 +891,15 @@ scripts/
 
 #### 1. 多端与市场高精图标渲染规范 (`scripts/build/render-icons.mjs`)
 - **渲染引擎与入参**：基于 `@resvg/resvg-js` 高性能 Rust 原生 SVG 渲染引擎，输入源文件为 `assets/omnikit-plugin.svg`；
-- **输出隔离**：渲染结果输出至 `.generated/icon.png` 临时构建目录，仓库根目录下不留存或追踪静态 `icon.png`；
+- **输出隔离**：渲染结果输出至 `.generated/icon.png` 与 `.generated/preview.png` 临时构建目录，仓库根目录下不留存或追踪静态 `icon.png` / `preview.png`；
 - **渲染配置**：
-  - `fitTo: { mode: "width", value: 160 }`：生成符合思源笔记集市标准规范的 $160 \times 160$ 像素 PNG 图标；
+  - `icon.png`（`fitTo: { mode: "width", value: 160 }`）：生成符合思源笔记集市标准规范的 $160 \times 160$ 像素 PNG 图标；
+  - `preview.png`（`fitTo: { mode: "width", value: 512 }`）：基于同一 `assets/omnikit-plugin.svg` 渲染生成 $512 \times 512$ 像素集市预览图（视觉与插件图标严格一致）；
   - `font: { loadSystemFonts: false }`：禁用系统字体探测，确保在不同 OS 构建环境（Linux CI、macOS、Windows）下的渲染结果具备二进制级别的幂等稳定性；
 - **双重断言门禁**：
-  - 几何尺寸核验：渲染宽度与高度必须精确等于 160 像素，否则直接抛出异常；
-  - 体积门禁：产物大小必须严格 $\le 64\text{ KiB}$，杜绝超大图标阻塞思源集市加载；
-- **打包集成**：由 Vite 构建配置通过 `vite-plugin-static-copy` 将 `.generated/icon.png` 复制归档为 `dist/icon.png`。
+  - 几何尺寸核验：`icon.png` 宽高精确等于 $160 \times 160$ 像素、`preview.png` 宽高精确等于 $512 \times 512$ 像素，否则直接抛出异常；
+  - 体积门禁：`icon.png` 严格 $\le 64\text{ KiB}$、`preview.png` 严格 $\le 256\text{ KiB}$，杜绝超大资源阻塞思源集市加载；
+- **打包集成**：由 Vite 构建配置通过 `vite-plugin-static-copy` 将 `.generated/icon.png` 与 `.generated/preview.png` 复制归档为 `dist/icon.png` 与 `dist/preview.png`。
 
 #### 2. 开发态工作区安全安装与原子备份回滚 (`scripts/dev/install-workspace.mjs`)
 - **真实物理路径与防逃逸核验**：
@@ -906,10 +908,10 @@ scripts/
   - 递归核验内部关键子目录：`conf/`、`data/`、`data/.siyuan/` 与 `data/plugins/` 必须真实存在；
   - 解析工作区规范化路径（`realpath`），严格检查相对路径，杜绝向上逃逸出工作区根目录；
 - **目标插件目录所有权防御**：
-  - 若目标目录 `data/plugins/siyuan-plugin-omnikit` 已存在，必须读取其内部的 `plugin.json`；
+  - 若目标目录 `data/plugins/siyuan-plugin-omnikit` 已存在，必须读取其内部的 `plugin.json`（仅 `ENOENT` 视作清单缺失，JSON 解析错误或权限错误直接显式报错退出）；
   - 严格校验其 `name` 属性必须精确等于 `"siyuan-plugin-omnikit"`；若不匹配，坚决拒绝覆盖并报错退出，防止因路径误配损坏其他第三方插件；
 - **待部署构建产物完整性前置核验**：
-  - 在执行任何写入前，校验 `dist/` 下必须完整包含：`plugin.json`、`index.js`、`index.css`、`icon.png`、`README.md`、`README.zh-CN.md`、`browser-image-compression.js`、`assets/`、`i18n/`；
+  - 在执行任何写入前，校验 `dist/` 下必须完整包含：`plugin.json`、`index.js`、`index.css`、`icon.png`、`preview.png`、`README.md`、`README.zh-CN.md`、`browser-image-compression.js`、`assets/`、`i18n/`；
 - **两阶段暂存部署与原子备份恢复**：
   1. 生成包含高精度时间戳与 UUID 的专属暂存目录 `.${pluginName}.install-${Date.now()}-${uuid}`；
   2. 将产物文件及资源目录完整写入暂存目录；
@@ -929,18 +931,18 @@ scripts/
 - **双清单版本强一致校验**：`package.json.version === dist/plugin.json.version`；
 - **思源内核最低版本约束**：`dist/plugin.json.minAppVersion === "3.8.4"`；
 - **物理产物存在性与非空校验**：
-  - 核验必须文件：`dist/index.js`、`dist/index.css`、`dist/plugin.json`、`dist/README.md`、`dist/README.zh-CN.md`、`dist/i18n/en.json`、`dist/i18n/zh-CN.json`、`dist/browser-image-compression.js`、`dist/icon.png`、`dist/assets/omnikit-menu.svg`、`dist/assets/omnikit-plugin.svg` 及 `package.zip` 全部存在且大小 $> 0$；
-  - 仓库根目录防御：断言根目录下严禁散落未管理的 `icon.png`；
+  - 核验必须文件：`dist/index.js`、`dist/index.css`、`dist/plugin.json`、`dist/README.md`、`dist/README.zh-CN.md`、`dist/i18n/en.json`、`dist/i18n/zh-CN.json`、`dist/browser-image-compression.js`、`dist/icon.png`、`dist/preview.png`、`dist/assets/omnikit-menu.svg`、`dist/assets/omnikit-plugin.svg` 及 `package.zip` 全部存在且大小 $> 0$；
+  - 仓库根目录防御：断言根目录下严禁散落未管理的 `icon.png` 与 `preview.png`；
 - **PNG 标头与集市规格深度核验**：
-  - 读取 `dist/icon.png` 二进制数据，比对前 8 字节 PNG 魔数标头 `[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]`；
-  - 读取 IHDR 块第 16~23 字节，核验宽度与高度均为 160 像素；
-  - 核验字节大小 $\le 64\text{ KiB}$；
+  - 读取 `dist/icon.png` 与 `dist/preview.png` 二进制数据，比对前 8 字节 PNG 魔数标头 `[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]`；
+  - 读取 IHDR 块第 16~23 字节，核验 `dist/icon.png` 宽高为 $160 \times 160$ 像素（$\le 64\text{ KiB}$）、`dist/preview.png` 宽高为 $512 \times 512$ 像素（$\le 256\text{ KiB}$）；
+  - 核验 `dist/plugin.json` 明确声明 `"icon": "icon.png"` 与 `"preview": "preview.png"`；
 - **文档静态资源链接完整性**：校验 `README.md` 与 `README.zh-CN.md` 正文中明确引用 `assets/omnikit-plugin.svg`；
 - **国际化语法解析校验**：校验 `dist/i18n/en.json` 与 `dist/i18n/zh-CN.json` 能够被合法解析为标准 JSON 对象；
 - **零依赖原生 ZIP Central Directory 静态审查**：
   - 避免引入外部依赖，直接从 `package.zip` 尾部定位 End of Central Directory (EOCD) 标头 `0x06054b50`；
   - 解析 Central Directory 偏移与条目总数，逐条遍历 Central Directory Header `0x02014b50` 提取所有分发文件条目路径；
-  - 必须包含所有必要分发文件条目：`index.js`、`index.css`、`plugin.json`、`i18n/en.json`、`i18n/zh-CN.json`、`browser-image-compression.js`、`icon.png`、`assets/omnikit-menu.svg`、`assets/omnikit-plugin.svg`；
+  - 必须包含所有必要分发文件条目：`index.js`、`index.css`、`plugin.json`、`i18n/en.json`、`i18n/zh-CN.json`、`browser-image-compression.js`、`icon.png`、`preview.png`、`assets/omnikit-menu.svg`、`assets/omnikit-plugin.svg`；
   - **安全排除红线**：断言 ZIP 包内**绝对严禁包含 `kernel.js`**，**绝对严禁包含 `node_modules/` 下的任何文件**。
 
 #### 5. 本地发版闭环工作流 (`scripts/release/release.mjs`) 与产物清理 (`scripts/clean.mjs`)
@@ -1177,7 +1179,7 @@ updates:
 在执行代码提交、特性上线或正式发版前，开发人员与 AI Agent 必须逐项对照以下清单执行全量核查：
 
 ### 11.1 Feature 业务与平台契约核验
-- [ ] 是否已逐项完成第 7.2 节《Feature 扩展技术契约自查清单》全部检查项（含解耦、平台兼容性、存储命名、零自动淘汰、菜单前缀、Dock 规范、安全中止与精确节点写回）？
+- [ ] 是否已逐项完成第 7.2 节《Feature 扩展技术契约自查清单》全部检查项（含解耦、平台兼容性、存储命名、记录条件清理与状态边界、菜单前缀、Dock 规范、安全中止与精确节点写回）？
 
 ### 11.2 工程脚本与工具链核验
 - [ ] 所有工程脚本是否收敛于 `scripts/` 目录体系，根目录下无非标准的 `tools/` 目录？

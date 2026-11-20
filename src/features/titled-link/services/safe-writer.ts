@@ -1,5 +1,12 @@
 import type { LinkOccurrenceTarget, TitledLinkProtyle } from "../policy/types.ts";
-import { resolveProtyleRunner, resolveEditorRootID, resolveNotebookID } from "../../../core/host/ProtyleAdapter.ts";
+import { withBlockWriteLease } from "../../../core/host/BlockWriteLease.ts";
+import { isInsideProtectedContainer } from "../../../core/host/dom.ts";
+import {
+  resolveProtyleRunner,
+  resolveEditorRootID,
+  resolveNotebookID,
+  resolveProtyleElement,
+} from "../../../core/host/ProtyleAdapter.ts";
 
 export type LinkWriteResult = "updated" | "unchanged" | "conflict" | "aborted" | "superseded";
 
@@ -11,7 +18,7 @@ export interface CommitLinkTitleOptions {
   replaceTitle: boolean;
   signal?: AbortSignal;
   kernel?: LinkWriterKernel;
-  isComposing?: () => boolean;
+  isComposing?: (protyle?: unknown) => boolean;
   imeTimeoutMs?: number;
   imePollMs?: number;
   isCurrent?: () => boolean;
@@ -27,21 +34,6 @@ export interface GroupedLinkTitleUpdate {
 interface BlockDOM { id?: string; dom?: string }
 interface BlockInfo { rootID?: string; box?: string }
 
-const blockTails = new Map<string, Promise<void>>();
-
-/** Serialize this plugin's writes to a block; SiYuan's update API is not an atomic CAS. */
-export function withLinkBlockLease<T>(key: string, operation: () => Promise<T>): Promise<T> {
-  const previous = blockTails.get(key) ?? Promise.resolve();
-  let release!: () => void;
-  const hold = new Promise<void>(resolve => { release = resolve; });
-  const tail = previous.catch(() => undefined).then(() => hold);
-  blockTails.set(key, tail);
-  return previous.catch(() => undefined).then(operation).finally(() => {
-    release();
-    if (blockTails.get(key) === tail) blockTails.delete(key);
-  });
-}
-
 function linkElements(block: HTMLElement): HTMLElement[] {
   return [...block.querySelectorAll<HTMLElement>('span[data-type~="a"]')];
 }
@@ -55,7 +47,12 @@ export function resolveTitledLinkProtyle(protyle: any): TitledLinkProtyle | null
 }
 
 /** Capture one occurrence before asynchronous title fetching begins. */
-export function captureLinkTarget(link: HTMLElement, protyle: any): LinkOccurrenceTarget | null {
+export function captureLinkTarget(
+  link: HTMLElement,
+  protyle: any,
+  blockHTMLCache?: Map<HTMLElement, string>,
+): LinkOccurrenceTarget | null {
+  if (isInsideProtectedContainer(link)) return null;
   const runner = resolveTitledLinkProtyle(protyle);
   const block = link.closest<HTMLElement>("[data-node-id]");
   const blockID = block?.getAttribute("data-node-id") ?? "";
@@ -67,6 +64,11 @@ export function captureLinkTarget(link: HTMLElement, protyle: any): LinkOccurren
   const ordinal = linkElements(block).indexOf(link);
   if (ordinal < 0) return null;
   const text = link.textContent ?? "";
+  let originalBlockHTML = blockHTMLCache?.get(block);
+  if (originalBlockHTML === undefined) {
+    originalBlockHTML = block.outerHTML;
+    blockHTMLCache?.set(block, originalBlockHTML);
+  }
   return {
     protyle: runner ?? undefined,
     notebook,
@@ -78,7 +80,7 @@ export function captureLinkTarget(link: HTMLElement, protyle: any): LinkOccurren
     originalHref: href,
     originalText: text,
     originalTitle: link.getAttribute("data-title"),
-    originalBlockHTML: block.outerHTML,
+    originalBlockHTML,
     oldPath: href,
     oldValue: text,
   };
@@ -160,6 +162,14 @@ function parseBlockFromDOM(html: string, blockID: string): HTMLElement | null {
   return block;
 }
 
+/** Remove kernel render-only attributes (e.g. parent-heading) before persisting block DOM via updateBlock. */
+function stripRenderOnlyAttributes(root: HTMLElement): void {
+  root.removeAttribute("parent-heading");
+  for (const element of root.querySelectorAll<HTMLElement>("[parent-heading]")) {
+    element.removeAttribute("parent-heading");
+  }
+}
+
 function abortAwareDelay(ms: number, signal?: AbortSignal): Promise<boolean> {
   if (signal?.aborted) return Promise.resolve(false);
   return new Promise(resolve => {
@@ -170,12 +180,14 @@ function abortAwareDelay(ms: number, signal?: AbortSignal): Promise<boolean> {
   });
 }
 
-async function awaitCompositionEnd(options: CommitLinkTitleOptions): Promise<boolean> {
+async function awaitCompositionEnd(options: CommitLinkTitleOptions, protyle?: unknown): Promise<boolean> {
   if (!options.isComposing) return true;
+  const editor = resolveProtyleElement(protyle);
   const timeout = options.imeTimeoutMs ?? 3_000;
   const poll = Math.max(1, options.imePollMs ?? 50);
   const deadline = Date.now() + timeout;
-  while (options.isComposing()) {
+  while (options.isComposing(protyle)) {
+    if (editor && editor.isConnected === false) return true;
     const remaining = deadline - Date.now();
     if (remaining <= 0) return false;
     if (!await abortAwareDelay(Math.min(poll, remaining), options.signal)) return false;
@@ -262,6 +274,7 @@ async function commitInactiveTitles(
     }
     const block = parseBlockFromDOM(response.data.dom, first.blockID);
     if (!block) return conflict();
+    stripRenderOnlyAttributes(block);
 
     const links = linkElements(block);
     const activeFlags = updates.map(u => isUpdateCurrent(u, options));
@@ -275,6 +288,7 @@ async function commitInactiveTitles(
       const { target } = updates[i];
       const link = links[target.ordinal];
       if (!link ||
+          isInsideProtectedContainer(link) ||
           link.getAttribute("data-href") !== target.originalHref ||
           (link.textContent ?? "") !== target.originalText ||
           link.getAttribute("data-title") !== target.originalTitle) {
@@ -358,102 +372,105 @@ export async function commitLinkTitles(
   if (options.signal?.aborted) return aborted();
 
   const first = updates[0].target;
-  const leaseKey = `${first.notebook}/${first.blockID}`;
-  return withLinkBlockLease(leaseKey, async () => {
-    if (options.signal?.aborted) return aborted();
-    if (updates.every(u => !isUpdateCurrent(u, options))) {
-      return updates.map(() => "superseded");
-    }
-    if (!await awaitCompositionEnd(options)) return options.signal?.aborted ? aborted() : conflict();
-    if (updates.every(u => !isUpdateCurrent(u, options))) {
-      return updates.map(() => "superseded");
-    }
+  try {
+    return await withBlockWriteLease(first.notebook, first.blockID, options.signal, async () => {
+      if (options.signal?.aborted) return aborted();
+      if (updates.every(u => !isUpdateCurrent(u, options))) {
+        return updates.map(() => "superseded");
+      }
+      if (!await awaitCompositionEnd(options, first.protyle)) return options.signal?.aborted ? aborted() : conflict();
+      if (updates.every(u => !isUpdateCurrent(u, options))) {
+        return updates.map(() => "superseded");
+      }
 
-    if (updates.some(({ target }) =>
-      target.notebook !== first.notebook ||
-      target.blockID !== first.blockID ||
-      target.rootID !== first.rootID ||
-      (target.originalBlockHTML !== undefined && first.originalBlockHTML !== undefined && target.originalBlockHTML !== first.originalBlockHTML)
-    )) {
-      return conflict();
-    }
-
-    const duplicateTitles = new Map<string, string>();
-    for (const u of updates) {
-      if (!isUpdateCurrent(u, options)) continue;
-      const { target, title } = u;
-      const key = `${target.ordinal}/${target.originalHref}/${target.originalText}`;
-      const previous = duplicateTitles.get(key);
-      if (previous !== undefined && previous !== title) return conflict();
-      duplicateTitles.set(key, title);
-    }
-
-    // Inactive or background update path
-    if (!isActiveEditor(first)) {
-      if (updates.some(({ target }) => isActiveEditor(target))) {
+      if (updates.some(({ target }) =>
+        target.notebook !== first.notebook ||
+        target.blockID !== first.blockID ||
+        target.rootID !== first.rootID ||
+        (target.originalBlockHTML !== undefined && first.originalBlockHTML !== undefined && target.originalBlockHTML !== first.originalBlockHTML)
+      )) {
         return conflict();
       }
-      return commitInactiveTitles(updates, options);
-    }
 
-    // Active Protyle editor path: non-superseded targets must belong to the same live block
-    const activeFlags = updates.map(u => isUpdateCurrent(u, options));
-    if (!activeFlags.some(Boolean)) return updates.map(() => "superseded");
-    if (updates.some(({ target }, index) =>
-      activeFlags[index] && (
-        !isActiveEditor(target) ||
-        target.blockElement !== first.blockElement ||
-        target.protyle !== first.protyle ||
-        !isLiveOccurrenceValid(target)
-      )
-    )) {
-      return conflict();
-    }
+      const ordinals = new Set<number>();
+      for (const u of updates) {
+        if (!isUpdateCurrent(u, options)) continue;
+        if (ordinals.has(u.target.ordinal)) return conflict();
+        ordinals.add(u.target.ordinal);
+      }
 
-    const results: LinkWriteResult[] = updates.map(({ target, title }, index) => {
-      if (!activeFlags[index]) return "superseded";
-      const link = target.linkElement!;
-      return (link.textContent ?? "") === title &&
-        (!options.replaceTitle || link.getAttribute("data-title") === title)
-        ? "unchanged"
-        : "updated";
-    });
-    if (!results.some(result => result === "updated")) return results;
+      // Inactive or background update path
+      if (!isActiveEditor(first)) {
+        if (updates.some(({ target }) => isActiveEditor(target))) {
+          return conflict();
+        }
+        return commitInactiveTitles(updates, options);
+      }
 
-    const oldHTML = first.blockElement!.outerHTML;
-    const previousValues = updates.map(({ target }) => ({
-      text: target.linkElement!.textContent,
-      title: target.linkElement!.getAttribute("data-title"),
-    }));
-    const capturedCaret = updates
-      .map(({ target }, index) => results[index] === "updated" ? captureCollapsedCaretInLink(target.linkElement!) : undefined)
-      .find(item => item !== undefined);
+      // Active Protyle editor path: non-superseded targets must belong to the same live block
+      const activeFlags = updates.map(u => isUpdateCurrent(u, options));
+      if (!activeFlags.some(Boolean)) return updates.map(() => "superseded");
+      if (updates.some(({ target }, index) =>
+        activeFlags[index] && (
+          !isActiveEditor(target) ||
+          target.blockElement !== first.blockElement ||
+          target.protyle !== first.protyle ||
+          !isLiveOccurrenceValid(target)
+        )
+      )) {
+        return conflict();
+      }
 
-    for (let index = 0; index < updates.length; index += 1) {
-      if (results[index] !== "updated") continue;
-      const { target, title } = updates[index];
-      applyLinkTitle(target.linkElement!, title, options.replaceTitle);
-    }
+      const results: LinkWriteResult[] = updates.map(({ target, title }, index) => {
+        if (!activeFlags[index]) return "superseded";
+        const link = target.linkElement!;
+        return (link.textContent ?? "") === title &&
+          (!options.replaceTitle || link.getAttribute("data-title") === title)
+          ? "unchanged"
+          : "updated";
+      });
+      if (!results.some(result => result === "updated")) return results;
 
-    try {
-      await first.protyle!.updateTransactionElement(first.blockElement!, oldHTML);
-      return results;
-    } catch {
+      const oldHTML = first.blockElement!.outerHTML;
+      const previousValues = updates.map(({ target }) => ({
+        text: target.linkElement!.textContent,
+        title: target.linkElement!.getAttribute("data-title"),
+      }));
+      const capturedCaret = updates
+        .map(({ target }, index) => results[index] === "updated" ? captureCollapsedCaretInLink(target.linkElement!) : undefined)
+        .find(item => item !== undefined);
+
       for (let index = 0; index < updates.length; index += 1) {
         if (results[index] !== "updated") continue;
-        const { target } = updates[index];
-        target.linkElement!.textContent = previousValues[index].text;
-        const oldTitle = previousValues[index].title;
-        if (oldTitle === null) {
-          target.linkElement!.removeAttribute("data-title");
-        } else {
-          target.linkElement!.setAttribute("data-title", oldTitle);
-        }
-        if (capturedCaret && capturedCaret.link === target.linkElement) {
-          restoreCollapsedCaretOffset(target.linkElement!, capturedCaret.offset);
-        }
+        const { target, title } = updates[index];
+        applyLinkTitle(target.linkElement!, title, options.replaceTitle);
       }
-      return updates.map((u) => options.signal?.aborted ? "aborted" : isUpdateCurrent(u, options) ? "conflict" : "superseded");
+
+      try {
+        await first.protyle!.updateTransactionElement(first.blockElement!, oldHTML);
+        return results;
+      } catch {
+        for (let index = 0; index < updates.length; index += 1) {
+          if (results[index] !== "updated") continue;
+          const { target } = updates[index];
+          target.linkElement!.textContent = previousValues[index].text;
+          const oldTitle = previousValues[index].title;
+          if (oldTitle === null) {
+            target.linkElement!.removeAttribute("data-title");
+          } else {
+            target.linkElement!.setAttribute("data-title", oldTitle);
+          }
+          if (capturedCaret && capturedCaret.link === target.linkElement) {
+            restoreCollapsedCaretOffset(target.linkElement!, capturedCaret.offset);
+          }
+        }
+        return updates.map((u) => options.signal?.aborted ? "aborted" : isUpdateCurrent(u, options) ? "conflict" : "superseded");
+      }
+    });
+  } catch (error) {
+    if (options.signal?.aborted || (error as { name?: string })?.name === "AbortError") {
+      return aborted();
     }
-  });
+    throw error;
+  }
 }
