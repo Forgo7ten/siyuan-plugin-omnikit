@@ -37,6 +37,13 @@ export function isWebpAllowed(extension: string, mode: CompressionMode, smartEna
   return mode === "manual-dialog" || mode === "manual-quick" || smartEnabled === true;
 }
 
+export function extractImageExtension(rawPath: string): string {
+  const clean = rawPath.replaceAll("\\", "/").split(/[?#]/, 1)[0];
+  const basename = clean.slice(clean.lastIndexOf("/") + 1);
+  const match = /\.([a-z0-9]{1,10})$/i.exec(basename);
+  return match?.[1].toLowerCase() ?? "";
+}
+
 function normalizedPath(raw: string): string {
   let path = raw;
   try {
@@ -49,12 +56,6 @@ function normalizedPath(raw: string): string {
   return path.replaceAll("\\", "/").split(/[?#]/, 1)[0].toLowerCase();
 }
 
-function extensionOf(path: string): string {
-  const basename = path.slice(path.lastIndexOf("/") + 1);
-  const match = /\.([a-z0-9]{1,10})$/.exec(basename);
-  return match?.[1] ?? "";
-}
-
 /**
  * Pure classifier evaluating image candidates before disk read or download.
  * Excludes videos, excalidraw/drawings directories, vector formats (SVG), animated formats (GIF, APNG),
@@ -63,7 +64,7 @@ function extensionOf(path: string): string {
  */
 export function classifyImageCandidate(input: ImageCandidateInput): ImageCandidateDecision {
   const path = normalizedPath(input.path);
-  const extension = extensionOf(path);
+  const extension = extractImageExtension(path);
 
   if (isProtectedDrawingPath(path)) {
     return { eligible: false, reason: "excalidraw", extension };
@@ -77,6 +78,8 @@ export function classifyImageCandidate(input: ImageCandidateInput): ImageCandida
   if (extension === "svg") {
     return { eligible: false, reason: "vector-format", extension };
   }
+  // 此处仅做基于路径扩展名的前置过滤：无扩展名的远程图床链接（extension === ""）予以放行，
+  // 真实格式与动图/矢量图拦截延后至下载后的魔数检测（assertImagePayload / inspectImage）处理。
   if (extension !== "" && !SUPPORTED_STATIC.has(extension)) {
     return { eligible: false, reason: "unsupported-format", extension };
   }

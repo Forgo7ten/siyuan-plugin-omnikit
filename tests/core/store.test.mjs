@@ -6,18 +6,45 @@ import { SettingsManager } from "../../src/core/store/SettingsManager.ts";
 function createPlugin(storage = new Map()) {
   const writes = [];
   let saveResult;
-  return {
+  const plugin = {
     writes,
     storage,
+    loadDataCalls: 0,
     setSaveResult(value) { saveResult = value; },
-    async loadData(path) { return storage.has(path) ? storage.get(path) : ""; },
+    async loadData(path) {
+      plugin.loadDataCalls += 1;
+      return storage.has(path) ? storage.get(path) : "";
+    },
     async saveData(path, data) {
       writes.push(path);
       if (saveResult !== undefined) return saveResult;
       storage.set(path, structuredClone(data));
     },
   };
+  return plugin;
 }
+
+function createFileGetFetch(storage, pluginName = "siyuan-plugin-omnikit") {
+  const prefix = `/data/storage/petal/${pluginName}/`;
+  return async (url, request) => {
+    assert.equal(url, "/api/file/getFile");
+    assert.equal(request.method, "POST");
+    const { path } = JSON.parse(request.body);
+    assert.ok(path.startsWith(prefix), `Unexpected storage path: ${path}`);
+    const name = path.slice(prefix.length);
+    assert.equal(path, `/data/storage/petal/${pluginName}/${name}`);
+    assert.ok(!name.includes("/"));
+    if (!storage.has(name)) {
+      return new Response(JSON.stringify({ code: 404, msg: "not found" }), { status: 202 });
+    }
+    const raw = storage.get(name);
+    return new Response(typeof raw === "string" ? raw : JSON.stringify(raw), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+}
+
 const codec = {
   defaults: () => ({ schemaVersion: 1, value: 0 }),
   parse(input) {
@@ -28,40 +55,43 @@ const codec = {
 
 test("missing settings: load/open/snapshot writes nothing", async () => {
   const plugin = createPlugin();
-  const store = new JsonStore(plugin, "feature-unit-test.json", codec);
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, createFileGetFetch(plugin.storage));
   await store.load();
   store.snapshot();
   await store.update(() => undefined);
   assert.deepEqual(plugin.writes, []);
+  assert.equal(plugin.loadDataCalls, 0);
 });
 
 test("per-file updates are serialized, and no-op writes are skipped", async () => {
   const plugin = createPlugin();
-  const store = new JsonStore(plugin, "feature-unit-test.json", codec);
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, createFileGetFetch(plugin.storage));
   await store.load();
   await Promise.all(Array.from({ length: 5 }, () => store.update(v => { v.value += 1; })));
   assert.equal(store.snapshot().value, 5);
   assert.equal(plugin.writes.length, 5);
   await store.update(v => { v.value = 5; });
   assert.equal(plugin.writes.length, 5);
+  assert.equal(plugin.loadDataCalls, 0);
 });
 
 test("bad settings do not overwrite the raw file", async () => {
   const storage = new Map([["feature-unit-test.json", {schemaVersion: 999, value: 4}]]);
   const plugin = createPlugin(storage);
-  const store = new JsonStore(plugin, "feature-unit-test.json", codec);
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, createFileGetFetch(plugin.storage));
   await store.load();
   assert.equal(store.needsRecovery, true);
   assert.deepEqual(plugin.writes, []);
   await assert.rejects(store.update(v => { v.value += 1; }));
   assert.deepEqual(plugin.writes, []);
+  assert.equal(plugin.loadDataCalls, 0);
 });
 
 test("failed backup response leaves corrupt settings untouched", async () => {
   const raw = {schemaVersion: 999, value: 4};
   const storage = new Map([["feature-unit-test.json", raw]]);
   const plugin = createPlugin(storage);
-  const store = new JsonStore(plugin, "feature-unit-test.json", codec);
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, createFileGetFetch(plugin.storage));
   await store.load();
   plugin.setSaveResult({code: -1});
   await assert.rejects(store.recoverWithBackup(), /failed to back up/);
@@ -69,13 +99,14 @@ test("failed backup response leaves corrupt settings untouched", async () => {
   assert.match(plugin.writes[0], /^feature-unit-test\.backup-\d+\.json$/);
   assert.deepEqual(storage.get("feature-unit-test.json"), raw);
   assert.equal(store.needsRecovery, true);
+  assert.equal(plugin.loadDataCalls, 0);
 });
 
 test("failed main save after backup keeps the complete recovery state", async () => {
   const raw = {schemaVersion: 999, value: 4};
   const storage = new Map([["feature-unit-test.json", raw]]);
   const plugin = createPlugin(storage);
-  const store = new JsonStore(plugin, "feature-unit-test.json", codec);
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, createFileGetFetch(plugin.storage));
   await store.load();
   const before = store.snapshot();
   let saves = 0;
@@ -93,13 +124,14 @@ test("failed main save after backup keeps the complete recovery state", async ()
   assert.deepEqual(plugin.writes.map(path => path.replace(/\.backup-\d+\.json$/, ".backup.json")), [
     "feature-unit-test.backup.json", "feature-unit-test.json",
   ]);
+  assert.equal(plugin.loadDataCalls, 0);
 });
 
 test("concurrent recovery calls share one attempt and do not auto-retry a failed write", async () => {
   const raw = {schemaVersion: 999, value: 4};
   const storage = new Map([["feature-unit-test.json", raw]]);
   const plugin = createPlugin(storage);
-  const store = new JsonStore(plugin, "feature-unit-test.json", codec);
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, createFileGetFetch(plugin.storage));
   await store.load();
   let releaseBackup;
   const backupBlocked = new Promise(resolve => { releaseBackup = resolve; });
@@ -123,13 +155,14 @@ test("concurrent recovery calls share one attempt and do not auto-retry a failed
   await assert.rejects(duplicate, /failed to back up/);
   assert.equal(plugin.writes.length, 1);
   assert.equal(store.needsRecovery, true);
+  assert.equal(plugin.loadDataCalls, 0);
 });
 
 test("recovery is serialized with update and reload", async () => {
   const raw = {schemaVersion: 999, value: 4};
   const storage = new Map([["feature-unit-test.json", raw]]);
   const plugin = createPlugin(storage);
-  const store = new JsonStore(plugin, "feature-unit-test.json", codec);
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, createFileGetFetch(plugin.storage));
   await store.load();
   let releaseBackup;
   const backupBlocked = new Promise(resolve => { releaseBackup = resolve; });
@@ -158,11 +191,12 @@ test("recovery is serialized with update and reload", async () => {
   assert.deepEqual(plugin.writes.map(path => path === "feature-unit-test.json" ? "main" : "backup"), [
     "backup", "main", "main",
   ]);
+  assert.equal(plugin.loadDataCalls, 0);
 });
 
 test("failed update preserves memory state and does not deadlock subsequent writes", async () => {
   const plugin = createPlugin();
-  const store = new JsonStore(plugin, "feature-unit-test.json", codec);
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, createFileGetFetch(plugin.storage));
   await store.load();
 
   plugin.setSaveResult({ code: -1 });
@@ -175,6 +209,7 @@ test("failed update preserves memory state and does not deadlock subsequent writ
   assert.equal(updated, true);
   assert.equal(store.snapshot().value, 2);
   assert.deepEqual(plugin.writes, ["feature-unit-test.json", "feature-unit-test.json"]);
+  assert.equal(plugin.loadDataCalls, 0);
 });
 
 test("missing file via HTTP 202 code 404 initializes defaults without entering read-only", async () => {
@@ -287,7 +322,7 @@ test("corrupt file content enters recovery mode and can recover with backup", as
 test("saveConfirmed timeout rejects without auto-retry and leaves queue unblocked", async t => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const plugin = createPlugin();
-  const store = new JsonStore(plugin, "feature-unit-test.json", codec);
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, createFileGetFetch(plugin.storage));
   await store.load();
 
   let enteredSave;
@@ -317,41 +352,29 @@ test("saveConfirmed timeout rejects without auto-retry and leaves queue unblocke
   const ok = await store.update(v => { v.value = 7; });
   assert.equal(ok, true);
   assert.equal(store.snapshot().value, 7);
-});
-
-test("legacy loadData fallback timeout triggers read-only protection and unblocks queue", async t => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
-  const plugin = createPlugin();
-  let enteredLoad;
-  const loadEntered = new Promise(resolve => { enteredLoad = resolve; });
-  plugin.loadData = () => {
-    enteredLoad();
-    return new Promise(() => {});
-  };
-
-  const store = new JsonStore(plugin, "feature-unit-test.json", codec);
-  const pending = store.load();
-  await loadEntered;
-  t.mock.timers.tick(30_000);
-
-  await assert.rejects(pending, /Storage read timed out/);
-  assert.equal(store.needsRecovery, true);
-  await assert.rejects(store.update(() => {}), /read-only/);
+  assert.equal(plugin.loadDataCalls, 0);
 });
 
 test("SettingsManager.reloadAfterExternalChange settles all stores when one store reload fails", async () => {
   const storage = new Map();
   let failFeatureA = false;
+  let loadDataCalls = 0;
   const plugin = {
-    async loadData(path) {
-      if (failFeatureA && path === "feature-a-settings.json") {
-        throw new Error("disk read failed");
-      }
-      return storage.has(path) ? storage.get(path) : "";
+    async loadData() {
+      loadDataCalls += 1;
+      throw new Error("plugin.loadData must never be called");
     },
     async saveData(path, data) {
       storage.set(path, structuredClone(data));
     },
+  };
+  const baseFetch = createFileGetFetch(storage);
+  const fetchFn = async (url, request) => {
+    const { path } = JSON.parse(request.body);
+    if (failFeatureA && path === "/data/storage/petal/siyuan-plugin-omnikit/feature-a-settings.json") {
+      throw new Error("disk read failed");
+    }
+    return baseFetch(url, request);
   };
   const registrations = [
     {
@@ -368,7 +391,7 @@ test("SettingsManager.reloadAfterExternalChange settles all stores when one stor
     },
   ];
 
-  const settings = new SettingsManager(plugin, registrations);
+  const settings = new SettingsManager(plugin, registrations, fetchFn);
   await settings.load();
 
   await plugin.saveData("omnikit-core.json", {
@@ -389,12 +412,13 @@ test("SettingsManager.reloadAfterExternalChange settles all stores when one stor
     assert.equal(settings.getFeature("featureB").label, "updated");
     assert.equal(warnings.length, 1);
     assert.match(warnings[0], /featureA/);
+    assert.equal(loadDataCalls, 0);
   } finally {
     console.warn = origWarn;
   }
 });
 
-test("transport failure never falls back to loadData when window and fetch exist", async () => {
+test("transport failure never falls back to loadData in Node or when window and fetch exist", async () => {
   const storage = new Map([["feature-unit-test.json", { schemaVersion: 1, value: 9 }]]);
   let loadDataCalls = 0;
   const plugin = {
@@ -405,6 +429,16 @@ test("transport failure never falls back to loadData when window and fetch exist
     async saveData() {},
   };
 
+  // Node environment (no globalThis.window): injected failing fetch never falls back to loadData
+  const nodeStore = new JsonStore(plugin, "feature-unit-test.json", codec, async () => {
+    throw new TypeError("Failed to fetch");
+  });
+  await assert.rejects(nodeStore.load(), TypeError);
+  assert.equal(loadDataCalls, 0);
+  assert.equal(nodeStore.needsRecovery, true);
+  await assert.rejects(nodeStore.update(v => { v.value = 1; }), /read-only/);
+
+  // Browser-like environment (globalThis.window + globalThis.fetch): never falls back to loadData
   const origWindow = globalThis.window;
   const origFetch = globalThis.fetch;
   globalThis.window = {};
@@ -525,7 +559,7 @@ test("reload() reports true when only read-only state flips", async () => {
 
 test("emit() computes one snapshot per round and prevents external mutation of store state", async () => {
   const plugin = createPlugin();
-  const store = new JsonStore(plugin, "feature-unit-test.json", codec);
+  const store = new JsonStore(plugin, "feature-unit-test.json", codec, createFileGetFetch(plugin.storage));
   await store.load();
 
   const seen = [];
@@ -538,4 +572,5 @@ test("emit() computes one snapshot per round and prevents external mutation of s
   assert.strictEqual(seen[0], seen[1]);
   seen[0].value = 999;
   assert.equal(store.snapshot().value, 42);
+  assert.equal(plugin.loadDataCalls, 0);
 });

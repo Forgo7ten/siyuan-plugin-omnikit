@@ -2,8 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { FeatureScope } from "../../../src/core/framework/FeatureScope.ts";
 import { TitleCache } from "../../../src/features/titled-link/services/title-cache.ts";
+import { countBatchResults } from "../../../src/features/titled-link/policy/batchSummary.ts";
 import {
-  AUTO_PASTE_DELAY_MS,
   TitledLinkController,
   isAutomaticLinkCandidate,
   isHttpUrl,
@@ -469,42 +469,17 @@ test("fallback hostname results are never written to TitleCache in manual or aut
 
     // 2. Auto fallback does not write to cache, allowing subsequent paste to fetch real title
     {
-      class MockElement {}
-      globalThis.Element = MockElement;
-      globalThis.siyuan = { config: { editor: { pasteURLAutoConvert: true } } };
-
       const url = "https://example.com/auto-fallback";
-      const anchor = new MockElement();
-      const links = [];
-      const block = {
-        isConnected: true,
-        outerHTML: '<div data-node-id="b1"></div>',
-        getAttribute: name => (name === "data-node-id" ? "b1" : null),
-        querySelectorAll: selector => (selector === 'span[data-type~="a"]' ? links : []),
-      };
-      anchor.closest = selector => (selector === "[data-node-id]" ? block : null);
-      globalThis.getSelection = () => ({ isCollapsed: true, anchorNode: anchor });
-
-      const link = {
-        isConnected: true,
-        textContent: url,
-        getAttribute: name => ({ "data-type": "a", "data-href": url }[name] ?? null),
-        closest: selector => (selector === "[data-node-id]" ? block : null),
-      };
+      const link = new BatchLink(url, url);
+      const block = new BatchBlock("b1", [link]);
       const protyle = {
         block: { rootID: "root", box: "notebook" },
         notebookId: "notebook",
-        wysiwyg: {
-          element: {
-            isConnected: true,
-            contains: el => el === block,
-            querySelector: selector => (selector === '[data-node-id="b1"]' ? block : null),
-          },
-        },
         updateTransactionElement() {},
       };
 
       const cache = new TitleCache();
+      const notices = [];
       let shouldFail = true;
       const scope = new FeatureScope();
       const controller = new TitledLinkController({
@@ -515,7 +490,7 @@ test("fallback hostname results are never written to TitleCache in manual or aut
         logger: { warn() {}, debug() {} },
       }, scope, {
         frontend: () => "desktop",
-        notify: () => {},
+        notify: msg => notices.push(msg),
         translate: key => key,
         cache,
         fetchImpl: async () => {
@@ -525,26 +500,21 @@ test("fallback hostname results are never written to TitleCache in manual or aut
         kernel: { post: async () => ({ data: {} }) },
       });
 
-      controller.scheduleAutoPaste({ textPlain: url, protyle });
-      links.push(link);
-      await new Promise(resolve => setTimeout(resolve, 230));
+      await controller.runAutoPaste([link], protyle);
       assert.equal(link.textContent, "example.com");
       assert.equal(cache.get(url), undefined);
       assert.equal(cache.size, 0);
+      assert.deepEqual(notices, ["titledLink.fallbackUsed"]);
 
-      // Reset link text and paste again when network recovers
+      // Paste again when network recovers
       shouldFail = false;
-      const secondLink = {
-        isConnected: true,
-        textContent: url,
-        getAttribute: name => ({ "data-type": "a", "data-href": url }[name] ?? null),
-        closest: selector => (selector === "[data-node-id]" ? block : null),
-      };
-      controller.scheduleAutoPaste({ textPlain: url, protyle });
-      links.push(secondLink);
-      await new Promise(resolve => setTimeout(resolve, 230));
+      const secondLink = new BatchLink(url, url);
+      secondLink.block = block;
+      block.links.push(secondLink);
+      await controller.runAutoPaste([secondLink], protyle);
       assert.equal(secondLink.textContent, "Recovered Real Title");
       assert.equal(cache.get(url), "Recovered Real Title");
+      assert.deepEqual(notices, ["titledLink.fallbackUsed", "titledLink.updated"]);
       scope.dispose();
     }
   } finally {
@@ -624,7 +594,7 @@ test("manual request during IME wait supersedes queued batch write inside write 
     assert.equal(link.textContent, "Fresh Manual Title");
     assert.equal(transactions.length, 1);
     assert.equal(transactions[0].text, "Fresh Manual Title");
-    assert.ok(notices.includes('titledLink.batchSummary:{"total":1,"updated":0,"conflict":0,"failed":0,"unknown":0}'));
+    assert.ok(notices.includes('titledLink.batchSummary:{"total":1,"succeeded":0,"updated":0,"unchanged":0,"conflict":0,"failed":0,"imeTimeout":0,"unknown":0,"skipped":1,"superseded":1,"aborted":0}'));
     assert.ok(notices.includes("titledLink.updated"));
     scope.dispose();
   } finally {
@@ -635,7 +605,6 @@ test("manual request during IME wait supersedes queued batch write inside write 
 
 test("truncates static file names and hostname fallback at fixed limit 80, skips cache for both, and strips control chars", async () => {
   assert.equal(DEFAULT_MAX_TITLE_LENGTH, 80);
-  assert.equal(AUTO_PASTE_DELAY_MS, 200);
 
   // 1. Static file name > 80 graphemes with replaceTitle: true and manual cache skip
   {
@@ -726,228 +695,252 @@ test("truncates static file names and hostname fallback at fixed limit 80, skips
   }
 });
 
-test("auto paste handles skip branches and synchronous fake timer without TDZ errors", async () => {
-  const prevSiyuan = globalThis.siyuan;
-  const prevGetSelection = globalThis.getSelection;
-  const prevElement = globalThis.Element;
-  try {
-    class MockElement {}
-    globalThis.Element = MockElement;
-    globalThis.siyuan = { config: { editor: { pasteURLAutoConvert: true } } };
-
-    const makePasteContext = (url) => {
-      const anchor = new MockElement();
-      const links = [];
-      let currentBlock;
-      const block = {
-        isConnected: true,
-        getAttribute: name => (name === "data-node-id" ? "b1" : null),
-        querySelectorAll: selector => (selector === 'span[data-type~="a"]' ? links : []),
-      };
-      currentBlock = block;
-      anchor.closest = selector => (selector === "[data-node-id]" ? block : null);
-      globalThis.getSelection = () => ({ isCollapsed: true, anchorNode: anchor });
-      const editorElement = {
-        isConnected: true,
-        contains: el => el === block,
-        querySelector: selector => (selector === '[data-node-id="b1"]' ? currentBlock : null),
-      };
-      const protyle = {
-        block: { rootID: "root", box: "notebook" },
-        notebookId: "notebook",
-        wysiwyg: { element: editorElement },
-        updateTransactionElement() {},
-      };
-      return {
-        block,
-        links,
-        editorElement,
-        protyle,
-        setCurrentBlock(next) { currentBlock = next; },
-        makeLink(text = url) {
-          const l = new BatchLink(url, text);
-          l.block = block;
-          return l;
-        },
-      };
-    };
-
-    // 1. Skips when block was re-rendered with an already-existing identical URL
-    {
-      const url = "https://example.com/rerender";
-      const ctx = makePasteContext(url);
-      const existing = ctx.makeLink(url);
-      ctx.links.push(existing);
-      let fetchCount = 0;
-      const notices = [];
-      let fired;
-      const scope = new FeatureScope();
-      const controller = new TitledLinkController({
-        settings: {
-          getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, maxTitleLength: 80, fallbackToHostname: true }),
-          getUserAgent: () => "UA",
-        },
-        logger: { warn() {}, debug() {} },
-      }, scope, {
-        frontend: () => "desktop",
-        notify: m => notices.push(m),
-        fetchImpl: async () => { fetchCount++; return htmlResponse("Title"); },
-        kernel: { post: async () => ({ data: {} }) },
-        setTimer: fn => { fired = fn; return 1; },
-        clearTimer: () => {},
-      });
-      controller.scheduleAutoPaste({ textPlain: url, protyle: ctx.protyle });
-      const newLink = ctx.makeLink(url);
-      const rerendered = {
-        isConnected: true,
-        getAttribute: name => (name === "data-node-id" ? "b1" : null),
-        querySelectorAll: selector => (selector === 'span[data-type~="a"]' ? [existing, newLink] : []),
-      };
-      ctx.setCurrentBlock(rerendered);
-      fired();
-      await Promise.resolve();
-      assert.equal(fetchCount, 0);
-      assert.deepEqual(notices, []);
-      scope.dispose();
-    }
-
-    // 2. Does not overwrite an anchor the user retyped within the debounce window
-    {
-      const url = "https://example.com/retyped";
-      const ctx = makePasteContext(url);
-      let fetchCount = 0;
-      let fired;
-      const scope = new FeatureScope();
-      const controller = new TitledLinkController({
-        settings: {
-          getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, maxTitleLength: 80, fallbackToHostname: true }),
-          getUserAgent: () => "UA",
-        },
-        logger: { warn() {}, debug() {} },
-      }, scope, {
-        frontend: () => "desktop",
-        fetchImpl: async () => { fetchCount++; return htmlResponse("Title"); },
-        kernel: { post: async () => ({ data: {} }) },
-        setTimer: fn => { fired = fn; return 1; },
-        clearTimer: () => {},
-      });
-      controller.scheduleAutoPaste({ textPlain: url, protyle: ctx.protyle });
-      ctx.links.push(ctx.makeLink("My Custom Title"));
-      fired();
-      await Promise.resolve();
-      assert.equal(fetchCount, 0);
-      scope.dispose();
-    }
-
-    // 3. Exits silently when the editor is detached + synchronous fake timer does not throw TypeError
-    {
-      const url = "https://example.com/detached";
-      const ctx = makePasteContext(url);
-      ctx.editorElement.isConnected = false;
-      let fetchCount = 0;
-      const scope = new FeatureScope();
-      const controller = new TitledLinkController({
-        settings: {
-          getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, maxTitleLength: 80, fallbackToHostname: true }),
-          getUserAgent: () => "UA",
-        },
-        logger: { warn() {}, debug() {} },
-      }, scope, {
-        frontend: () => "desktop",
-        fetchImpl: async () => { fetchCount++; return htmlResponse("Title"); },
-        kernel: { post: async () => ({ data: {} }) },
-        setTimer: fn => { fn(); return 1; },
-        clearTimer: () => {},
-      });
-      controller.scheduleAutoPaste({ textPlain: url, protyle: ctx.protyle });
-      await Promise.resolve();
-      assert.equal(fetchCount, 0);
-      scope.dispose();
-    }
-  } finally {
-    globalThis.siyuan = prevSiyuan;
-    globalThis.getSelection = prevGetSelection;
-    globalThis.Element = prevElement;
-  }
-});
-
-test("double paste of the same url still titles at least the last link", async () => {
-  const prevSiyuan = globalThis.siyuan;
-  const prevGetSelection = globalThis.getSelection;
-  const prevElement = globalThis.Element;
-  try {
-    class MockElement {}
-    globalThis.Element = MockElement;
-    globalThis.siyuan = { config: { editor: { pasteURLAutoConvert: true } } };
-
-    const url = "https://example.com/double";
-    const anchor = new MockElement();
-    const links = [];
-    const block = {
-      isConnected: true,
-      getAttribute: name => (name === "data-node-id" ? "b1" : null),
-      querySelectorAll: selector => (selector === 'span[data-type~="a"]' ? links : []),
-    };
-    anchor.closest = selector => (selector === "[data-node-id]" ? block : null);
-    globalThis.getSelection = () => ({ isCollapsed: true, anchorNode: anchor });
-    const protyle = {
-      block: { rootID: "root", box: "notebook" },
-      notebookId: "notebook",
-      wysiwyg: {
-        element: {
-          isConnected: true,
-          contains: el => el === block,
-          querySelector: selector => (selector === '[data-node-id="b1"]' ? block : null),
-        },
-      },
-      updateTransactionElement() {},
-    };
-
-    const timers = [];
-    let fetchCount = 0;
+test("runAutoPaste handles single-link notices, multi-link batch summary, silent disabled/skipped rules, and consecutive pastes", async () => withBatchDOMParser(async () => {
+  // 1. Single-link auto paste uses single-link notification keys (updated, unchanged, conflict, unknown, imeTimeout, failed)
+  {
+    const url = "https://example.com/single-auto";
+    const link = new BatchLink(url, url);
+    new BatchBlock("b-single", [link]);
+    const protyle = { block: { rootID: "root", box: "notebook" }, notebookId: "notebook", updateTransactionElement() {} };
     const notices = [];
     const scope = new FeatureScope();
     const controller = new TitledLinkController({
       settings: {
-        getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, maxTitleLength: 80, fallbackToHostname: true }),
+        getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, fallbackToHostname: false }),
         getUserAgent: () => "UA",
       },
       logger: { warn() {}, debug() {} },
     }, scope, {
       frontend: () => "desktop",
       notify: m => notices.push(m),
-      fetchImpl: async () => {
-        fetchCount++;
-        return htmlResponse("T");
-      },
+      translate: (key, values) => values ? `${key}:${JSON.stringify(values)}` : key,
+      fetchImpl: async () => htmlResponse("Single Auto Title"),
       kernel: { post: async () => ({ data: {} }) },
-      setTimer: fn => { timers.push(fn); return timers.length; },
-      clearTimer: () => {},
     });
 
-    controller.scheduleAutoPaste({ textPlain: url, protyle });
-    controller.scheduleAutoPaste({ textPlain: url, protyle });
-    const first = new BatchLink(url, url);
-    const second = new BatchLink(url, url);
-    first.block = block;
-    second.block = block;
-    links.push(first, second);
-
-    for (const fn of timers) fn();
-    for (let i = 0; i < 20 && second.textContent === url; i++) {
-      await new Promise(resolve => setTimeout(resolve, 2));
-    }
-    assert.equal(second.textContent, "T");
-    assert.equal(first.textContent, url);
-    assert.equal(fetchCount, 1);
-    assert.deepEqual(notices, []);
+    await controller.runAutoPaste([link], protyle);
+    assert.equal(link.textContent, "Single Auto Title");
+    assert.deepEqual(notices, ["titledLink.updated"]);
     scope.dispose();
-  } finally {
-    globalThis.siyuan = prevSiyuan;
-    globalThis.getSelection = prevGetSelection;
-    globalThis.Element = prevElement;
   }
-});
+
+  // 2. Single-link auto paste maps unchanged, conflict, unknown, ime-timeout, and failed accurately
+  {
+    const makeSingleCase = async (setup) => {
+      const link = new BatchLink("https://example.com/map", setup.initialText ?? "https://example.com/map");
+      const block = new BatchBlock("b-map", [link]);
+      const notices = [];
+      const scope = new FeatureScope();
+      const protyle = setup.protyle ?? {
+        block: { rootID: "root", box: "notebook" },
+        notebookId: "notebook",
+        updateTransactionElement: setup.updateTransactionElement ?? (() => {}),
+      };
+      const controller = new TitledLinkController({
+        settings: {
+          getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, fallbackToHostname: false }),
+          getUserAgent: () => "UA",
+        },
+        logger: { warn() {}, debug() {} },
+      }, scope, {
+        frontend: () => "desktop",
+        notify: m => notices.push(m),
+        translate: key => key,
+        isComposing: setup.isComposing,
+        imeTimeoutMs: 5,
+        imePollMs: 1,
+        fetchImpl: setup.fetchImpl ?? (async () => htmlResponse("Mapped Title")),
+        kernel: setup.kernel ?? { post: async () => ({ data: {} }) },
+      });
+      await controller.runAutoPaste([link], protyle);
+      scope.dispose();
+      return notices;
+    };
+
+    assert.deepEqual(await makeSingleCase({ initialText: "" , fetchImpl: async () => htmlResponse("Mapped Title") }), ["titledLink.updated"]);
+    assert.deepEqual(await makeSingleCase({
+      initialText: "",
+      fetchImpl: async () => { throw new Error("network"); },
+    }), ["titledLink.failed"]);
+    assert.deepEqual(await makeSingleCase({
+      isComposing: () => true,
+    }), ["titledLink.imeTimeout"]);
+    assert.deepEqual(await makeSingleCase({
+      fetchImpl: async (url) => htmlResponse(url), // unchanged: title === originalText
+    }), ["titledLink.unchanged"]);
+    assert.deepEqual(await makeSingleCase({
+      protyle: {
+        destroyed: true,
+        block: { rootID: "root", box: "notebook" },
+        notebookId: "notebook",
+        updateTransactionElement() {},
+      },
+      kernel: {
+        async post(path) {
+          if (path === "/api/block/getBlockInfo") return { data: { rootID: "root", box: "notebook" }, code: 0 };
+          if (path === "/api/block/getBlockDOM") {
+            return { data: { id: "b-map", dom: '<div data-node-id="b-map"><span data-type="a" data-href="https://example.com/map">Other</span></div>' }, code: 0 };
+          }
+          return { data: {}, code: 0 };
+        },
+      },
+    }), ["titledLink.conflict"]);
+    assert.deepEqual(await makeSingleCase({
+      protyle: {
+        destroyed: true,
+        block: { rootID: "root", box: "notebook" },
+        notebookId: "notebook",
+        updateTransactionElement() {},
+      },
+      kernel: {
+        async post(path) {
+          if (path === "/api/block/getBlockInfo") return { data: { rootID: "root", box: "notebook" }, code: 0 };
+          if (path === "/api/block/getBlockDOM") {
+            if (!this.called) {
+              this.called = true;
+              return { data: { id: "b-map", dom: '<div data-node-id="b-map"><span data-type="a" data-href="https://example.com/map">https://example.com/map</span></div>' }, code: 0 };
+            }
+            throw new Error("verify lost");
+          }
+          if (path === "/api/block/updateBlock") throw new Error("write timeout");
+          return { data: {}, code: 0 };
+        },
+      },
+    }), ["titledLink.unknown"]);
+  }
+
+  // 3. Multi-link auto paste groups per block, skips custom-text links, and emits one batchSummary
+  {
+    const first = new BatchLink("https://example.com/m1");
+    const second = new BatchLink("https://example.com/m2");
+    const custom = new BatchLink("https://example.com/custom", "Already Titled");
+    new BatchBlock("b-multi", [first, second, custom]);
+    const transactions = [];
+    const protyle = {
+      block: { rootID: "root", box: "notebook" },
+      notebookId: "notebook",
+      updateTransactionElement(el, oldHTML) { transactions.push({ el, oldHTML }); },
+    };
+    const notices = [];
+    const scope = new FeatureScope();
+    const controller = new TitledLinkController({
+      settings: {
+        getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, fallbackToHostname: false }),
+        getUserAgent: () => "UA",
+      },
+      logger: { warn() {}, debug() {} },
+    }, scope, {
+      frontend: () => "desktop",
+      notify: m => notices.push(m),
+      translate: (key, values) => values ? `${key}:${JSON.stringify(values)}` : key,
+      fetchImpl: async url => htmlResponse(url.endsWith("m1") ? "M1" : "M2"),
+      kernel: { post: async () => ({ data: {} }) },
+    });
+
+    await controller.runAutoPaste([first, second, custom], protyle);
+    assert.equal(transactions.length, 1);
+    assert.equal(first.textContent, "M1");
+    assert.equal(second.textContent, "M2");
+    assert.equal(custom.textContent, "Already Titled");
+    assert.deepEqual(notices, [
+      'titledLink.batchSummary:{"total":2,"succeeded":2,"updated":2,"unchanged":0,"conflict":0,"failed":0,"imeTimeout":0,"unknown":0,"skipped":0,"superseded":0,"aborted":0}',
+    ]);
+    scope.dispose();
+  }
+
+  // 4. Silent when auto.enabled === false (at entry or toggled mid-fetch) and when all items are skipped
+  {
+    let autoEnabled = false;
+    let fetchCount = 0;
+    const notices = [];
+    const scope = new FeatureScope();
+    const link1 = new BatchLink("https://example.com/off");
+    new BatchBlock("b-off", [link1]);
+    const protyle = { block: { rootID: "root", box: "notebook" }, notebookId: "notebook", updateTransactionElement() {} };
+    let release;
+    const controller = new TitledLinkController({
+      settings: {
+        getFeature: () => ({ auto: { enabled: autoEnabled }, replaceTitle: false, fallbackToHostname: false }),
+        getUserAgent: () => "UA",
+      },
+      logger: { warn() {}, debug() {} },
+    }, scope, {
+      frontend: () => "desktop",
+      notify: m => notices.push(m),
+      translate: key => key,
+      fetchImpl: () => {
+        fetchCount += 1;
+        return new Promise(resolve => { release = () => resolve(htmlResponse("Late")); });
+      },
+      kernel: { post: async () => ({ data: {} }) },
+    });
+
+    await controller.runAutoPaste([link1], protyle);
+    assert.equal(fetchCount, 0);
+    assert.deepEqual(notices, []);
+
+    // Enabled at entry, disabled mid-fetch before notification -> silent
+    autoEnabled = true;
+    const pending = controller.runAutoPaste([link1], protyle);
+    for (let i = 0; i < 20 && !release; i++) await new Promise(r => setTimeout(r, 2));
+    autoEnabled = false;
+    release();
+    await pending;
+    assert.deepEqual(notices, []);
+
+    // Aborted / superseded in auto-paste -> silent (never emits titledLink.skipped)
+    autoEnabled = true;
+    release = undefined;
+    const link2 = new BatchLink("https://example.com/abort");
+    new BatchBlock("b-abort", [link2]);
+    const abortRun = controller.runAutoPaste([link2], protyle);
+    for (let i = 0; i < 20 && !release; i++) await new Promise(r => setTimeout(r, 2));
+    scope.dispose();
+    release();
+    await abortRun;
+    assert.deepEqual(notices, []);
+  }
+
+  // 5. Consecutive auto-pastes in the same block are not blocked by inFlightBatches
+  {
+    const linkA = new BatchLink("https://example.com/p1");
+    const linkB = new BatchLink("https://example.com/p2");
+    const block = new BatchBlock("b-seq", [linkA, linkB]);
+    const protyle = { block: { rootID: "root", box: "notebook" }, notebookId: "notebook", updateTransactionElement() {} };
+    let releaseA;
+    const notices = [];
+    const scope = new FeatureScope();
+    const controller = new TitledLinkController({
+      settings: {
+        getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, fallbackToHostname: false }),
+        getUserAgent: () => "UA",
+      },
+      logger: { warn() {}, debug() {} },
+    }, scope, {
+      frontend: () => "desktop",
+      notify: m => notices.push(m),
+      translate: key => key,
+      fetchImpl: url => {
+        if (String(url).endsWith("/p1")) {
+          return new Promise(resolve => { releaseA = () => resolve(htmlResponse("Title A")); });
+        }
+        return Promise.resolve(htmlResponse("Title B"));
+      },
+      kernel: { post: async () => ({ data: {} }) },
+    });
+
+    const first = controller.runAutoPaste([linkA], protyle);
+    for (let i = 0; i < 20 && !releaseA; i++) await new Promise(r => setTimeout(r, 2));
+    const second = controller.runAutoPaste([linkB], protyle);
+    await second;
+    assert.equal(linkB.textContent, "Title B");
+    releaseA();
+    await first;
+    assert.equal(linkA.textContent, "Title A");
+    assert.deepEqual(notices, ["titledLink.updated", "titledLink.updated"]);
+    scope.dispose();
+  }
+}));
 
 test("a second manual run aborts the previous request for the same link", async () => {
   const { link, protyle } = fixture();
@@ -1384,11 +1377,117 @@ test("manual notifications distinguish imeTimeout and unknown, and batch summary
 
       await controller.runBatch([bUpdated, bConflict, bFailed, bUnknown], staleProtyle);
       assert.deepEqual(notices, [
-        'titledLink.batchSummary:{"total":4,"updated":1,"conflict":1,"failed":1,"unknown":1}',
+        'titledLink.batchSummary:{"total":4,"succeeded":1,"updated":1,"unchanged":0,"conflict":1,"failed":1,"imeTimeout":0,"unknown":1,"skipped":0,"superseded":0,"aborted":0}',
       ]);
       scope.dispose();
     } finally {
       globalThis.DOMParser = prevDOMParser;
     }
   }
+});
+
+test("I-06: closing original editor mid-fetch automatically switches write path to /api/block/updateBlock", async () => withBatchDOMParser(async () => {
+  const link = new BatchLink("https://example.com/i06");
+  const block = new BatchBlock("b-i06", [link]);
+  let transactionCount = 0;
+  const kernelCalls = [];
+  const protyle = {
+    destroyed: false,
+    element: { isConnected: true, classList: { contains: name => name === "protyle" } },
+    wysiwyg: { element: { isConnected: true } },
+    block: { rootID: "root", box: "notebook" },
+    notebookId: "notebook",
+    updateTransactionElement() { transactionCount += 1; },
+  };
+  let releaseFetch;
+  const scope = new FeatureScope();
+  const controller = new TitledLinkController({
+    settings: {
+      getFeature: () => ({ auto: { enabled: true }, replaceTitle: false, fallbackToHostname: false }),
+      getUserAgent: () => "UA",
+    },
+    logger: { warn() {}, debug() {} },
+  }, scope, {
+    frontend: () => "desktop",
+    notify: () => {},
+    translate: key => key,
+    fetchImpl: () => new Promise(resolve => { releaseFetch = () => resolve(htmlResponse("Background Title")); }),
+    kernel: {
+      async post(path, body) {
+        kernelCalls.push({ path, body });
+        if (path === "/api/block/getBlockInfo") return { data: { rootID: "root", box: "notebook" }, code: 0 };
+        if (path === "/api/block/getBlockDOM") return { data: { id: "b-i06", dom: block.outerHTML }, code: 0 };
+        if (path === "/api/block/updateBlock") return { code: 0, data: null };
+        return { data: {}, code: 0 };
+      },
+    },
+  });
+
+  const run = controller.runManual(link, protyle);
+  for (let i = 0; i < 20 && !releaseFetch; i++) await new Promise(r => setTimeout(r, 2));
+  assert.ok(releaseFetch);
+
+  // Close the original editor before fetch completes
+  protyle.destroyed = true;
+  protyle.element.isConnected = false;
+  protyle.wysiwyg.element.isConnected = false;
+  releaseFetch();
+
+  assert.equal(await run, "updated");
+  assert.equal(transactionCount, 0);
+  assert.deepEqual(kernelCalls.map(c => c.path), [
+    "/api/block/getBlockInfo",
+    "/api/block/getBlockDOM",
+    "/api/block/updateBlock",
+  ]);
+  assert.match(kernelCalls[2].body.data, />Background Title<\/span>/);
+  scope.dispose();
+}));
+
+test("countBatchResults conserves total across all terminal buckets", () => {
+  const empty = countBatchResults([]);
+  assert.deepEqual(empty, {
+    total: 0,
+    succeeded: 0,
+    updated: 0,
+    unchanged: 0,
+    conflict: 0,
+    failed: 0,
+    imeTimeout: 0,
+    unknown: 0,
+    skipped: 0,
+    superseded: 0,
+    aborted: 0,
+  });
+
+  const all = countBatchResults([
+    "updated",
+    "updated",
+    "unchanged",
+    "conflict",
+    "failed",
+    "ime-timeout",
+    "unknown",
+    "superseded",
+    "aborted",
+  ]);
+  assert.deepEqual(all, {
+    total: 9,
+    succeeded: 3,
+    updated: 2,
+    unchanged: 1,
+    conflict: 1,
+    failed: 1,
+    imeTimeout: 1,
+    unknown: 1,
+    skipped: 2,
+    superseded: 1,
+    aborted: 1,
+  });
+  assert.equal(all.succeeded, all.updated + all.unchanged);
+  assert.equal(all.skipped, all.superseded + all.aborted);
+  assert.equal(
+    all.succeeded + all.conflict + all.failed + all.imeTimeout + all.unknown + all.skipped,
+    all.total,
+  );
 });

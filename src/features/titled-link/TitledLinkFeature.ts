@@ -1,4 +1,4 @@
-import { showMessage } from "siyuan";
+import { getAllEditor, showMessage } from "siyuan";
 import { BaseFeature } from "../../core/framework/BaseFeature.ts";
 import type { FeatureContext } from "../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../core/framework/FeatureScope.ts";
@@ -9,6 +9,8 @@ import { getCurrentFrontend } from "../../core/host/Platform.ts";
 import { resolveProtyleElement } from "../../core/host/ProtyleAdapter.ts";
 import { isInsideProtectedContainer } from "../../core/host/dom.ts";
 import { translate } from "../../i18n/translate.ts";
+import type { TitledLinkConfig } from "./policy/types.ts";
+import { PasteLinkCapture } from "./services/PasteLinkCapture.ts";
 import { TitledLinkController, isHttpUrl } from "./TitledLinkController.ts";
 
 export interface TitledLinkFeatureOptions {
@@ -80,7 +82,15 @@ export class TitledLinkFeature extends BaseFeature {
       translate: t,
     });
     this.controller = controller;
+    const pasteCapture = new PasteLinkCapture({
+      plugin: context.plugin,
+      scope,
+      isEnabled: () => scope.active && context.settings.getFeature<TitledLinkConfig>(TitledLinkFeature.ID).auto.enabled,
+      onLinksCaptured: (links, protyle) => controller.runAutoPaste(links, protyle),
+      logger: context.logger,
+    });
     scope.own(() => {
+      pasteCapture.dispose();
       for (const editor of this.composingEditors.keys()) {
         editor.removeEventListener("compositionstart", this.onCompositionStart, { capture: true });
         editor.removeEventListener("compositionend", this.onCompositionEnd, { capture: true });
@@ -90,19 +100,22 @@ export class TitledLinkFeature extends BaseFeature {
       if (this.controller === controller) this.controller = undefined;
     });
 
-    const onPaste = (event: CustomEvent<any>) => {
-      const detail = event.detail;
-      this.attachCompositionTracking(resolveProtyleElement(detail?.protyle));
-      controller.scheduleAutoPaste(detail);
+    const registerEditor = (protyle: unknown) => {
+      this.attachCompositionTracking(resolveProtyleElement(protyle));
+      pasteCapture.attach(protyle);
     };
-    context.plugin.eventBus.on("paste", onPaste);
-    scope.own(() => context.plugin.eventBus.off("paste", onPaste));
+
+    if (typeof getAllEditor === "function") {
+      for (const editor of getAllEditor()) {
+        registerEditor(editor);
+      }
+    }
 
     const onLinkMenu = (menu: MenuContext) => {
       const detail = menu.detail;
       const link = detail?.element as HTMLElement | undefined;
       const protyle = detail?.protyle;
-      this.attachCompositionTracking(resolveProtyleElement(protyle));
+      registerEditor(protyle);
       const isLink = link?.getAttribute?.("data-type")?.split(" ").includes("a") === true;
       const href = link?.getAttribute?.("data-href");
       const isHttp = isHttpUrl(href ?? "");
@@ -135,7 +148,7 @@ export class TitledLinkFeature extends BaseFeature {
       const detail = menu.detail;
       const protyle = detail?.protyle;
       const blocks = Array.isArray(detail?.blockElements) ? detail.blockElements as HTMLElement[] : [];
-      this.attachCompositionTracking(resolveProtyleElement(protyle));
+      registerEditor(protyle);
       const count = new Set(blocks.flatMap(block =>
         [...block.querySelectorAll<HTMLElement>('span[data-type~="a"]')])
         .filter(link => isHttpUrl(link.getAttribute("data-href") ?? "") && !isInsideProtectedContainer(link))).size;
@@ -160,19 +173,21 @@ export class TitledLinkFeature extends BaseFeature {
     };
     context.menus.contribute(scope, this.meta.id, "blockicon", "extract-block-link-titles", onBlockMenu);
 
-    const onEditor = (event: CustomEvent<any>) => this.attachCompositionTracking(resolveProtyleElement(event.detail?.protyle));
+    const onEditor = (event: CustomEvent<any>) => registerEditor(event.detail?.protyle);
     for (const name of ["loaded-protyle-static", "switch-protyle"] as const) {
       context.plugin.eventBus.on(name, onEditor);
       scope.own(() => context.plugin.eventBus.off(name, onEditor));
     }
 
     const onDestroyProtyle = (event: CustomEvent<any>) => {
-      const editor = resolveProtyleElement(event.detail?.protyle);
+      const protyle = event.detail?.protyle;
+      const editor = resolveProtyleElement(protyle);
       if (editor && this.composingEditors.has(editor)) {
         editor.removeEventListener("compositionstart", this.onCompositionStart, { capture: true });
         editor.removeEventListener("compositionend", this.onCompositionEnd, { capture: true });
         this.composingEditors.delete(editor);
       }
+      pasteCapture.detach(protyle);
     };
     context.plugin.eventBus.on("destroy-protyle", onDestroyProtyle);
     scope.own(() => context.plugin.eventBus.off("destroy-protyle", onDestroyProtyle));

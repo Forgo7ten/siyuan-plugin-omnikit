@@ -28,9 +28,15 @@ test("ignores SVG title in body and extracts title from head or unclosed streame
   assert.deepEqual(extractNormalizedTitle(headlessWithSvg, "https://example.com", defaults), { title: "Real Headless Title", source: "title" });
 });
 
-test("supports metadata attribute order variations and fallback priority", () => {
+test("supports metadata attribute order variations, quoted '>' characters, and fallback priority", () => {
   const html = '<meta content="Open Graph" property="og:title"><meta content="Tweet" name="twitter:title">';
   assert.deepEqual(extractNormalizedTitle(html, "https://example.com", defaults), { title: "Open Graph", source: "og:title" });
+
+  const quotedGt = '<head><meta content="Docs > Guide" property="og:title"></head>';
+  assert.deepEqual(extractNormalizedTitle(quotedGt, "https://example.com", defaults), { title: "Docs > Guide", source: "og:title" });
+
+  const singleQuotedNameGt = "<head><meta name='a>b' content='Ignored'><meta name='twitter:title' content='Alpha > Beta'></head>";
+  assert.deepEqual(extractNormalizedTitle(singleQuotedNameGt, "https://example.com", defaults), { title: "Alpha > Beta", source: "twitter:title" });
 });
 
 test("challenge pages reject all metadata and fall back only when configured", () => {

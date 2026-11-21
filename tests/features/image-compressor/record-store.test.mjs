@@ -9,21 +9,48 @@ import {
 
 function createPlugin(storage = new Map()) {
   const writes = [];
-  return {
+  const plugin = {
     writes,
     storage,
-    async loadData(path) { return storage.has(path) ? structuredClone(storage.get(path)) : ""; },
+    loadDataCalls: 0,
+    async loadData(path) {
+      plugin.loadDataCalls += 1;
+      return storage.has(path) ? structuredClone(storage.get(path)) : "";
+    },
     async saveData(path, data) {
       writes.push(path);
       storage.set(path, structuredClone(data));
     },
   };
+  return plugin;
+}
+
+function createFileGetFetch(storage, pluginName = "siyuan-plugin-omnikit") {
+  const prefix = `/data/storage/petal/${pluginName}/`;
+  return async (url, request) => {
+    assert.equal(url, "/api/file/getFile");
+    assert.equal(request.method, "POST");
+    const { path } = JSON.parse(request.body);
+    assert.ok(path.startsWith(prefix), `Unexpected storage path: ${path}`);
+    const name = path.slice(prefix.length);
+    assert.equal(path, `/data/storage/petal/${pluginName}/${name}`);
+    assert.ok(!name.includes("/"));
+    if (!storage.has(name)) {
+      return new Response(JSON.stringify({ code: 404, msg: "not found" }), { status: 202 });
+    }
+    const raw = storage.get(name);
+    return new Response(typeof raw === "string" ? raw : JSON.stringify(raw), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
 }
 
 test("record store persists only validated asset mappings in its data file", async () => {
   const plugin = createPlugin();
-  const store = new ImageCompressionRecordStore(plugin);
+  const store = new ImageCompressionRecordStore(plugin, { fetchFn: createFileGetFetch(plugin.storage) });
   await store.init();
+  assert.equal(plugin.loadDataCalls, 0);
   await store.upsert("assets/original.png", "assets/compressed.webp");
 
   assert.deepEqual(plugin.writes, ["feature-image-compressor-records.json"]);
@@ -40,8 +67,9 @@ test("record store persists only validated asset mappings in its data file", asy
 
 test("concurrent upserts serialize, replace the latest mapping, and retain independent chains", async () => {
   const plugin = createPlugin();
-  const store = new ImageCompressionRecordStore(plugin);
+  const store = new ImageCompressionRecordStore(plugin, { fetchFn: createFileGetFetch(plugin.storage) });
   await store.init();
+  assert.equal(plugin.loadDataCalls, 0);
   await Promise.all([
     store.upsert("assets/a.png", "assets/b.webp"),
     store.upsert("assets/a.png", "assets/d.webp"),
@@ -65,8 +93,9 @@ test("keeps 100%.png vs 100%25.png and case variants distinct while rejecting ex
       { originalPath: "assets/photo.png", compressedPath: "assets/four.webp", updatedAt: 4, lastOperation: "replaced" },
     ] },
   ]]));
-  const distinctStore = new ImageCompressionRecordStore(distinctPlugin);
+  const distinctStore = new ImageCompressionRecordStore(distinctPlugin, { fetchFn: createFileGetFetch(distinctPlugin.storage) });
   await distinctStore.init();
+  assert.equal(distinctPlugin.loadDataCalls, 0);
   assert.equal(distinctStore.store.needsRecovery, false);
   assert.equal(distinctStore.snapshot().length, 4);
 
@@ -77,8 +106,9 @@ test("keeps 100%.png vs 100%25.png and case variants distinct while rejecting ex
       { originalPath: "assets/dup.png", compressedPath: "assets/two.webp", updatedAt: 2, lastOperation: "replaced" },
     ] },
   ]]));
-  const corruptStore = new ImageCompressionRecordStore(corruptPlugin);
+  const corruptStore = new ImageCompressionRecordStore(corruptPlugin, { fetchFn: createFileGetFetch(corruptPlugin.storage) });
   await corruptStore.init();
+  assert.equal(corruptPlugin.loadDataCalls, 0);
 
   assert.equal(corruptStore.store.needsRecovery, true);
   await assert.rejects(corruptStore.removeRecord("assets/dup.png"), /read-only/);
@@ -87,8 +117,9 @@ test("keeps 100%.png vs 100%25.png and case variants distinct while rejecting ex
 
 test("upsert and markOperation move updated records to the top of the list (I-19)", async () => {
   const plugin = createPlugin();
-  const store = new ImageCompressionRecordStore(plugin);
+  const store = new ImageCompressionRecordStore(plugin, { fetchFn: createFileGetFetch(plugin.storage) });
   await store.init();
+  assert.equal(plugin.loadDataCalls, 0);
 
   await store.upsert("assets/first.png", "assets/first.webp");
   await store.upsert("assets/second.png", "assets/second.webp");
@@ -104,8 +135,9 @@ test("upsert and markOperation move updated records to the top of the list (I-19
 
 test("compareAndRemove removes only when both originalPath and compressedPath still match (D01)", async () => {
   const plugin = createPlugin();
-  const store = new ImageCompressionRecordStore(plugin);
+  const store = new ImageCompressionRecordStore(plugin, { fetchFn: createFileGetFetch(plugin.storage) });
   await store.init();
+  assert.equal(plugin.loadDataCalls, 0);
   await store.upsert("assets/a.png", "assets/b.webp");
   await store.upsert("assets/b.webp", "assets/c.webp");
 
@@ -156,8 +188,9 @@ test("dryRunRecordMigration is read-only and preserves ambiguous or colliding le
 
 test("stale status updates cannot overwrite a newer compressed path", async () => {
   const plugin = createPlugin();
-  const store = new ImageCompressionRecordStore(plugin);
+  const store = new ImageCompressionRecordStore(plugin, { fetchFn: createFileGetFetch(plugin.storage) });
   await store.init();
+  assert.equal(plugin.loadDataCalls, 0);
   await store.upsert("assets/a.png", "assets/old.webp");
   await store.upsert("assets/a.png", "assets/new.webp");
   const writeCount = plugin.writes.length;
@@ -177,8 +210,9 @@ test("a failed save leaves memory unchanged and does not deadlock subsequent wri
     plugin.writes.push(path);
     if (fail) throw new Error("Save failed");
   };
-  const store = new ImageCompressionRecordStore(plugin);
+  const store = new ImageCompressionRecordStore(plugin, { fetchFn: createFileGetFetch(plugin.storage) });
   await store.init();
+  assert.equal(plugin.loadDataCalls, 0);
 
   await assert.rejects(store.upsert("assets/a.png", "assets/a.webp"), /Save failed/);
   assert.deepEqual(store.snapshot(), []);
@@ -203,8 +237,9 @@ test("record store enforces lightweight 10,000 record limit on new inserts witho
     "feature-image-compressor-records.json",
     { schemaVersion: 1, records: existingRecords },
   ]]));
-  const store = new ImageCompressionRecordStore(plugin);
+  const store = new ImageCompressionRecordStore(plugin, { fetchFn: createFileGetFetch(plugin.storage) });
   await store.init();
+  assert.equal(plugin.loadDataCalls, 0);
 
   assert.equal(store.store.needsRecovery, false);
   assert.equal(store.snapshot().length, count);
@@ -240,11 +275,17 @@ test("reloadLoadedImageRecords skips uninitialized plugin and reloads initialize
     { schemaVersion: 1, records: [{ originalPath: "assets/init.png", compressedPath: "assets/init.webp", updatedAt: 1, lastOperation: "saved-only" }] },
   ]]);
   const initializedPlugin = createPlugin(storage);
-  const origLoadData = initializedPlugin.loadData.bind(initializedPlugin);
-  initializedPlugin.loadData = async path => { loadCalls++; return origLoadData(path); };
+  const baseFetch = createFileGetFetch(initializedPlugin.storage);
+  let fetchCalls = 0;
+  const fetchFn = async (url, request) => {
+    fetchCalls += 1;
+    return baseFetch(url, request);
+  };
 
-  const { store, ready } = imageRecordsFor(initializedPlugin);
+  const { store, ready } = imageRecordsFor(initializedPlugin, { fetchFn });
   await ready;
+  assert.equal(initializedPlugin.loadDataCalls, 0);
+  assert.equal(fetchCalls, 1);
   assert.equal(store.snapshot().length, 1);
 
   storage.set("feature-image-compressor-records.json", {
@@ -252,6 +293,7 @@ test("reloadLoadedImageRecords skips uninitialized plugin and reloads initialize
     records: [{ originalPath: "assets/init.png", compressedPath: "assets/init-v2.webp", updatedAt: 2, lastOperation: "replaced" }],
   });
   await reloadLoadedImageRecords(initializedPlugin);
+  assert.equal(initializedPlugin.loadDataCalls, 0);
   assert.equal(store.snapshot()[0].compressedPath, "assets/init-v2.webp");
-  assert.ok(loadCalls >= 2);
+  assert.ok(fetchCalls >= 2);
 });

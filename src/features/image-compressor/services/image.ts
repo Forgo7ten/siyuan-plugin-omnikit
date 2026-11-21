@@ -1,6 +1,6 @@
 import { outputName } from "../policy/source.ts";
 import type { CompressionMode } from "../policy/contracts.ts";
-import { isProtectedDrawingPath, isWebpAllowed } from "../policy/ImageCandidateClassifier.ts";
+import { extractImageExtension, isProtectedDrawingPath, isWebpAllowed } from "../policy/ImageCandidateClassifier.ts";
 
 export interface CompressionOptions {
   initialQuality: number;
@@ -249,7 +249,7 @@ export class BicEncoder implements ImageCodec {
   ): Promise<EncodeResult> {
     if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
     const c = config.compression;
-    const ext = name.split(/[?#]/)[0].split(".").pop()?.toLowerCase() ?? "";
+    const ext = extractImageExtension(name);
     const webpAllowed = isWebpAllowed(ext, mode, c.smartEnabled === true);
     if (isProtectedDrawingPath(name) ||
         (c.excludedExtensions.includes(ext) && !webpAllowed)) {
@@ -268,6 +268,9 @@ export class BicEncoder implements ImageCodec {
 
     const expected: Record<string, string> = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp" };
     if (expected[ext] && expected[ext] !== info.mime) throw new Error("Image extension/signature mismatch");
+    if (info.mime === "image/webp" && !isWebpAllowed("webp", mode, c.smartEnabled === true)) {
+      return { kind: "skipped", reason: "protected-extension" };
+    }
     if (!Number.isSafeInteger(info.width * info.height) || info.width * info.height > c.maxPixels) {
       throw new Error("Decoded pixel limit exceeded");
     }

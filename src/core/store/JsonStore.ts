@@ -173,7 +173,7 @@ export class JsonStore<T> {
   }
 
   private async fetchStorageFile(path: string, timeoutMs: number): Promise<StorageResponse> {
-    const fetcher = this.fetchFn || globalThis.fetch;
+    const fetcher = this.fetchFn ?? globalThis.fetch;
     if (typeof fetcher !== "function") {
       throw new Error("No fetch implementation available");
     }
@@ -217,8 +217,7 @@ export class JsonStore<T> {
   }
 
   /**
-   * @safety A transport failure is NEVER "file missing": Plugin.loadData cannot separate
-   * them and may resolve a stale cache, which would let a later save overwrite the file.
+   * @safety Strictly reads via /api/file/getFile; a transport failure is NEVER "file missing".
    */
   private async readIntoMemory(): Promise<void> {
     let raw: unknown;
@@ -226,41 +225,30 @@ export class JsonStore<T> {
     let isMissing = false;
 
     try {
-      if (this.canUseHostReader()) {
-        // Capability channel: this host has no browser fetch context (Node test host / legacy shell).
-        const legacy = await withTimeout(
-          Promise.resolve(this.plugin.loadData(this.file)),
-          READ_TIMEOUT_MS,
-          "Storage read timed out",
-        );
-        if (legacy === "" || legacy == null) isMissing = true;
-        else raw = legacy;
-      } else {
-        const res = await this.fetchStorageFile(storagePath, READ_TIMEOUT_MS);
-        if (res.status === 202) {
-          const body = readKernelBody(res.body);
-          if (body?.code === 404) {
-            isMissing = true;
-          } else {
-            throw new Error(
-              `Kernel getFile failed: ${body?.code ?? 202} ${body?.msg ?? "getFile returned 202 error"}`,
-            );
-          }
-        } else if (!res.ok) {
-          // Only the kernel's documented 202 + code 404 means "missing".
-          // A bare HTTP 404 is a proxy/static-host fault, not an empty file.
-          throw new Error(`Server error reading ${this.file}: HTTP ${res.status}`);
-        } else if (!res.body.trim()) {
-          // HTTP 200 with empty/whitespace body is corrupt, never missing.
-          this.enterReadOnly(`Corrupt empty storage file in ${this.file}`, res.body);
-          return;
+      const res = await this.fetchStorageFile(storagePath, READ_TIMEOUT_MS);
+      if (res.status === 202) {
+        const body = readKernelBody(res.body);
+        if (body?.code === 404) {
+          isMissing = true;
         } else {
-          try {
-            raw = JSON.parse(res.body);
-          } catch (jsonErr) {
-            this.enterReadOnly(`Invalid JSON syntax in ${this.file}: ${String(jsonErr)}`, res.body);
-            return;
-          }
+          throw new Error(
+            `Kernel getFile failed: ${body?.code ?? 202} ${body?.msg ?? "getFile returned 202 error"}`,
+          );
+        }
+      } else if (!res.ok) {
+        // Only the kernel's documented 202 + code 404 means "missing".
+        // A bare HTTP 404 is a proxy/static-host fault, not an empty file.
+        throw new Error(`Server error reading ${this.file}: HTTP ${res.status}`);
+      } else if (!res.body.trim()) {
+        // HTTP 200 with empty/whitespace body is corrupt, never missing.
+        this.enterReadOnly(`Corrupt empty storage file in ${this.file}`, res.body);
+        return;
+      } else {
+        try {
+          raw = JSON.parse(res.body);
+        } catch (jsonErr) {
+          this.enterReadOnly(`Invalid JSON syntax in ${this.file}: ${String(jsonErr)}`, res.body);
+          return;
         }
       }
     } catch (ioError) {
@@ -280,13 +268,6 @@ export class JsonStore<T> {
     } catch (parseError) {
       this.enterReadOnly(`Unable to validate settings: ${String(parseError)}`, raw);
     }
-  }
-
-  /** The host reader substitutes a missing channel, never a failed request. */
-  private canUseHostReader(): boolean {
-    if (this.fetchFn) return false;
-    if (typeof (this.plugin as { loadData?: unknown }).loadData !== "function") return false;
-    return typeof globalThis.fetch !== "function" || typeof window === "undefined";
   }
 
   private enterReadOnly(reason: string, backup?: unknown): void {

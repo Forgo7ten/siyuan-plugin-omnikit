@@ -46,11 +46,27 @@ test('source resolver separates 100%.png vs 100%25.png, preserves case sensitivi
 
   assert.equal(
     buildReplacementPath('assets/a.png?width=200#top', 'assets/a.webp?box=20240101000000-abcdefg', 'https://kernel.example'),
-    'assets/a.webp?box=20240101000000-abcdefg&width=200#top',
+    'assets/a.webp?box=20240101000000-abcdefg#top',
   );
   assert.equal(
     buildReplacementPath('assets/a.png?box=20240101000000-abcdefg&width=200', 'assets/a.webp', 'https://kernel.example'),
-    'assets/a.webp?width=200',
+    'assets/a.webp',
+  );
+  assert.equal(
+    buildReplacementPath('assets/a.png?resize=1&width=200&height=100#fig', 'assets/a.webp?box=20240101000000-abcdefg', 'https://kernel.example'),
+    'assets/a.webp?box=20240101000000-abcdefg#fig',
+  );
+  assert.equal(
+    buildReplacementPath('https://cdn.example/photo.png?token=secret&width=100#section', 'assets/a.webp?box=20240101000000-abcdefg', 'https://kernel.example'),
+    'assets/a.webp?box=20240101000000-abcdefg',
+  );
+  assert.equal(
+    buildReplacementPath('file:///C:/images/cat.png#frag', 'assets/a.webp', 'https://kernel.example'),
+    'assets/a.webp',
+  );
+  assert.equal(
+    buildReplacementPath('assets/a.png?box=20240101000000-abcdefg&box=20240101000000-hijklmn&width=200#frag', 'assets/a.webp?box=20240101000000-abcdefg', 'https://kernel.example'),
+    'assets/a.webp?box=20240101000000-abcdefg',
   );
 });
 

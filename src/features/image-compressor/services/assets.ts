@@ -19,7 +19,15 @@ export class AssetStore {
     try {
       response = await this.kernel.post<any>("/api/asset/upload", form, { signal, timeout: 60_000 });
     } catch (error) {
-      if (signal?.aborted || (error as { name?: string })?.name === "AbortError") throw error;
+      const outcome = (error as { outcome?: string })?.outcome;
+      if (
+        signal?.aborted ||
+        (error as { name?: string })?.name === "AbortError" ||
+        outcome === "not-sent" ||
+        outcome === "rejected"
+      ) {
+        throw error;
+      }
       // A write transport failure can happen after the kernel accepted the file. Never retry it.
       throw new UploadOutcomeUnknown(error instanceof Error ? error.message : "Upload outcome is unknown");
     }

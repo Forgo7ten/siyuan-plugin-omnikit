@@ -510,6 +510,32 @@ test("AssetStore verifies upload persistence from kernel upload contract without
   await assert.rejects(storeFailed.upload(testFile, "20240101000000-abcdefg"), UploadOutcomeUnknown);
 });
 
+test("I-01: AssetStore.upload rethrows rejected and not-sent errors directly without wrapping in UploadOutcomeUnknown", async () => {
+  const { AssetStore, UploadOutcomeUnknown } = await import("../../../src/features/image-compressor/services/assets.ts");
+  const testFile = new File(["dummy"], "test.webp", { type: "image/webp" });
+
+  const rejectedErr = Object.assign(new Error("Payload too large"), { outcome: "rejected", code: -1 });
+  const rejectedStore = new AssetStore({ post: async () => { throw rejectedErr; } }, "https://siyuan.test");
+  await assert.rejects(
+    rejectedStore.upload(testFile, "20240101000000-abcdefg"),
+    err => err === rejectedErr && !(err instanceof UploadOutcomeUnknown),
+  );
+
+  const notSentErr = Object.assign(new Error("Operation cancelled"), { outcome: "not-sent", name: "AbortError" });
+  const notSentStore = new AssetStore({ post: async () => { throw notSentErr; } }, "https://siyuan.test");
+  await assert.rejects(
+    notSentStore.upload(testFile, "20240101000000-abcdefg"),
+    err => err === notSentErr && !(err instanceof UploadOutcomeUnknown),
+  );
+
+  const unknownErr = Object.assign(new Error("Connection reset"), { outcome: "unknown" });
+  const unknownStore = new AssetStore({ post: async () => { throw unknownErr; } }, "https://siyuan.test");
+  await assert.rejects(
+    unknownStore.upload(testFile, "20240101000000-abcdefg"),
+    UploadOutcomeUnknown,
+  );
+});
+
 test("H1: before-upload-assets listener swallows synchronous errors from services.config() without breaking native upload", () => {
   const listeners = new Map();
   const plugin = { eventBus: {

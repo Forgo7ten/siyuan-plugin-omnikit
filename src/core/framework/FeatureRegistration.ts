@@ -5,6 +5,7 @@ import type { FeatureContext } from "./FeatureContext.ts";
 import type { JsonStore, StoreCodec } from "../store/JsonStore.ts";
 import type { SettingsManager } from "../store/SettingsManager.ts";
 import type { SiyuanFrontend } from "../host/Platform.ts";
+import type { RegisterDraftParticipant } from "../../ui/settings/DraftParticipant.ts";
 
 /**
  * @design Metadata remains available even when the feature runtime is stopped.
@@ -23,6 +24,8 @@ export interface FeatureRegistration<T> {
     store: JsonStore<T>;
     runtimePhase: FeaturePhase | "configured";
     t: (key: string, values?: Record<string, string | number>) => string;
+    registerDraft?: RegisterDraftParticipant;
+    globalSaving?: boolean;
   }>;
   /** Optional feature-owned content for the shared OmniKit dock container. */
   readonly dockView?: Component<{ context: FeatureContext; t: (key: string, values?: Record<string, string | number>) => string }>;

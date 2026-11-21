@@ -11,6 +11,7 @@ import { NODE_ID } from "../policy/parseImageConfig.ts";
 import { buildReplacementPath, resolveSource } from "../policy/source.ts";
 import { assertImagePayload, calibrateRemoteImageFile } from "./RemoteImageWatcher.ts";
 import { classifyImageCandidate } from "../policy/ImageCandidateClassifier.ts";
+import type { CommitResult } from "../services/SafeBlockWriter.ts";
 import { translate } from "../../../i18n/translate.ts";
 
 export type ImageActionOutcome =
@@ -39,7 +40,7 @@ export interface ManualCompressionPreview {
 
 export class LocalizationOutcomeError extends Error {
   constructor(
-    readonly outcome: "unknown" | "conflict",
+    readonly outcome: "unknown" | "conflict" | "failed",
     readonly localPath?: string,
   ) {
     super(`Remote image localization ended with ${outcome}`);
@@ -119,6 +120,8 @@ export async function compressSelectedImageQuick(
       smartEnabled: services.config().compression.smartEnabled === true,
     });
     if (!candidateDecision.eligible) return { kind: "notify", key: "image.single.noBenefit" };
+    // 快捷压缩：无扩展名远程图床链接经分类器放行后，先本地化下载、魔数校验并上传原图，
+    // 再进入压缩流程；若实际为无扩展名动图或矢量图，将在压缩检查阶段跳过并保留本地原图。
     let providedFile: File | undefined;
     target = await localizeRemoteOccurrence(target, services, signal, true, undefined, file => {
       providedFile = file;
@@ -131,12 +134,15 @@ export async function compressSelectedImageQuick(
     });
     if (!scope.active || signal.aborted) return;
     if (result.status === "skipped") return { kind: "notify", key: "image.single.noBenefit" };
-    if (result.reference === "aborted") return { kind: "silent" };
-    const outcomeKey = result.reference === "replaced"
+    const ref = result.reference as CommitResult | "not-requested";
+    if (ref === "aborted") return { kind: "silent" };
+    const outcomeKey = ref === "replaced"
       ? "image.single.quickSuccess"
-      : result.reference === "unknown"
+      : ref === "unknown"
         ? "image.single.unknown"
-        : "image.single.conflict";
+        : ref === "failed"
+          ? "image.single.failed"
+          : "image.single.conflict";
     return { kind: "notify", key: outcomeKey };
   } catch (error) {
     if (error instanceof LocalizationOutcomeError) {
@@ -144,6 +150,9 @@ export async function compressSelectedImageQuick(
         return error.localPath
           ? { kind: "copyable-path", path: error.localPath, key: "image.single.unknown" }
           : { kind: "notify", key: "image.single.unknown" };
+      }
+      if (error.outcome === "failed") {
+        return { kind: "notify", key: "image.single.failed" };
       }
       return { kind: "notify", key: "image.single.conflict" };
     }
@@ -201,6 +210,8 @@ export async function compressSelectedImageCustom(
             ...config,
             compression: { ...config.compression, initialQuality: quality, manualMaxEdge },
           };
+          // 自定义压缩对话框在预览阶段先行下载远程图片并做魔数校验与编码测试，不上传或修改文档；
+          // 仅在用户点击保存后才执行本地化上传与文档引用更新（无扩展名动图/矢量图在此即被拦截）。
           const rawOriginal = previewOriginal ?? await services.reader.read(source, {
             maxBytes: source.kind === "remote" ? Math.min(config.compression.maxInputBytes, 32 * 1024 * 1024) : config.compression.maxInputBytes,
             timeoutMs: 30_000,
@@ -253,6 +264,10 @@ export async function compressSelectedImageCustom(
                 }
                 return;
               }
+              if (error.outcome === "failed") {
+                services.ui.notify(translate(context.plugin.i18n as Record<string, unknown>, "image.single.failed"));
+                return;
+              }
               services.ui.notify(translate(context.plugin.i18n as Record<string, unknown>, "image.single.conflict"));
               return;
             }
@@ -261,14 +276,17 @@ export async function compressSelectedImageCustom(
           if (!scope.active || signal.aborted) return;
           const result = await services.savePreview(localizedTarget, preview.file, signal, replace, metrics);
           if (!scope.active || signal.aborted || result.status !== "saved") return;
-          if (result.reference === "aborted") return;
-          if (result.reference === "unknown") {
+          const ref = result.reference as CommitResult | "not-requested";
+          if (ref === "aborted") return;
+          if (ref === "unknown") {
             services.ui.copyablePath(result.path, "image.single.unknown");
-          } else if (result.reference === "conflict") {
+          } else if (ref === "conflict") {
             services.ui.copyablePath(result.path, "image.single.conflict");
-          } else if (!replace || result.reference === "not-requested") {
+          } else if (ref === "failed") {
+            services.ui.copyablePath(result.path, "image.single.failed");
+          } else if (!replace || ref === "not-requested") {
             services.ui.copyablePath(result.path, "image.dialog.savedOnly");
-          } else if (result.reference === "replaced") {
+          } else if (ref === "replaced") {
             services.ui.notify(translate(context.plugin.i18n as Record<string, unknown>, "image.single.quickSuccess"));
           } else {
             services.ui.copyablePath(result.path, "image.single.conflict");
@@ -318,6 +336,9 @@ export async function localizeRemoteOccurrence(
   }
   if (committed === "unknown") {
     throw new LocalizationOutcomeError("unknown", localPath);
+  }
+  if (committed === "failed") {
+    throw new LocalizationOutcomeError("failed", localPath);
   }
   if (committed !== "replaced") {
     throw new LocalizationOutcomeError("conflict", localPath);

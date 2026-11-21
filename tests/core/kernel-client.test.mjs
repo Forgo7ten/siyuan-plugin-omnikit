@@ -21,24 +21,43 @@ test("settles success and supports JSON and FormData bodies", async () => {
   assert.deepEqual(bodies, [{ id: "x" }, form]);
 });
 
-test("settles rejected promise from fetchSyncPost", async () => {
+test("settles rejected promise from fetchSyncPost as unknown", async () => {
   const client = new KernelClient(async () => {
     throw new Error("offline");
   });
-  await assert.rejects(client.post("/write", {}), /offline/);
+  await assert.rejects(client.post("/write", {}), error => error.message === "offline" && error.outcome === "unknown");
 });
 
-test("preserves the HTTP-derived API code when an endpoint returns negative code", async () => {
+test("preserves the HTTP-derived API code and marks outcome rejected when an endpoint returns negative code", async () => {
   const client = new KernelClient(async () => ({ code: -404, data: null, msg: "Not Found" }));
-  await assert.rejects(client.post("/api/asset/findAssetReferences", {}), error => error.code === -404);
+  await assert.rejects(
+    client.post("/api/asset/findAssetReferences", {}),
+    error => error.code === -404 && error.outcome === "rejected",
+  );
 });
 
-test("immediately rejects when kernel returns negative business code without 30s timeout", async () => {
-  const client = new KernelClient(async () => ({ code: -1, data: null, msg: "block not found" }));
+test("immediately rejects with outcome rejected when kernel returns non-zero business code", async () => {
+  const negClient = new KernelClient(async () => ({ code: -1, data: null, msg: "block not found" }));
   await assert.rejects(
-    client.post("/api/block/getBlockInfo", { id: "none" }),
-    error => error.code === -1 && error.message === "block not found",
+    negClient.post("/api/block/getBlockInfo", { id: "none" }),
+    error => error.code === -1 && error.message === "block not found" && error.outcome === "rejected",
   );
+
+  const posClient = new KernelClient(async () => ({ code: 1, data: null, msg: "write failed" }));
+  await assert.rejects(
+    posClient.post("/api/block/updateBlock", {}),
+    error => error.code === 1 && error.message === "write failed" && error.outcome === "rejected",
+  );
+});
+
+test("marks empty, null, or non-object kernel responses as unknown", async () => {
+  for (const response of [null, undefined, "", "oops", {}]) {
+    const client = new KernelClient(async () => response);
+    await assert.rejects(
+      client.post("/api/block/updateBlock", {}),
+      error => error.outcome === "unknown",
+    );
+  }
 });
 
 test("settles cancellation even when SDK swallows AbortError", async () => {

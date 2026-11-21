@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { FeatureScope } from "../../src/core/framework/FeatureScope.ts";
 import { MenuRegistry } from "../../src/core/feedback/MenuRegistry.ts";
 import { installMenuRouter } from "../../src/core/feedback/MenuRouter.ts";
+import { imageMenuContributions } from "../../src/features/image-compressor/actions/menuContributions.ts";
 
 test("feature menu labels have one OmniKit prefix and stale clicks show an inactive notice", () => {
   const scope = new FeatureScope();
@@ -259,4 +260,117 @@ test("a throwing matcher skips only its own entry and continues rendering", () =
   assert.equal(reported.length, 1);
   assert.match(reported[0].message, /matcher failed/);
   assert.ok(debugLogs.at(-1)?.data?.跳过项?.some(entry => entry.includes("Matcher 抛错")));
+});
+
+function makeFakeElement() {
+  const classes = new Set();
+  const attrs = new Map();
+  const children = [];
+  return {
+    classes,
+    attrs,
+    children,
+    classList: { add: name => classes.add(name) },
+    setAttribute: (name, value) => attrs.set(name, value),
+    querySelector: sel => (sel === ".omnikit-menu-checkbox" ? children.find(c => c.className === "omnikit-menu-checkbox") ?? null : null),
+    appendChild: node => children.push(node),
+  };
+}
+
+test("MenuRegistry renders declarative checked items via bind without passing native checked or leaving bind on regular items", () => {
+  const prevDocument = globalThis.document;
+  globalThis.document = {
+    createElement: tag => ({
+      tagName: tag.toUpperCase(),
+      className: "",
+      attrs: new Map(),
+      setAttribute(name, value) { this.attrs.set(name, value); },
+    }),
+  };
+
+  try {
+    const scope = new FeatureScope();
+    const menu = new MenuRegistry(() => true, error => { throw error; });
+    menu.contribute(scope, "imageCompressor", "topbar", "mixed", () => [
+      { id: "regular", label: "Regular Action", run: () => {} },
+      { id: "checked-true", label: "Whitelist", checked: true, run: () => {} },
+      { id: "checked-false", label: "Whitelist", checked: false, run: () => {} },
+    ]);
+
+    const items = [];
+    menu.render("topbar", { addItem: item => items.push(item) }, { location: "topbar" });
+    assert.equal(items.length, 3);
+
+    // Regular item must not carry bind or checked own properties
+    assert.equal(Object.hasOwn(items[0], "bind"), false);
+    assert.equal(Object.hasOwn(items[0], "checked"), false);
+
+    // Checked items must carry bind and must never pass native checked
+    for (const [idx, expected] of [[1, "true"], [2, "false"]]) {
+      assert.equal(Object.hasOwn(items[idx], "checked"), false);
+      assert.equal(typeof items[idx].bind, "function");
+      const el = makeFakeElement();
+      items[idx].bind(el);
+      assert.equal(el.classes.has("omnikit-whitelist-menu-item"), true);
+      assert.equal(el.attrs.get("role"), "menuitemcheckbox");
+      assert.equal(el.attrs.get("aria-checked"), expected);
+      assert.equal(el.children.length, 1);
+      assert.equal(el.children[0].className, "omnikit-menu-checkbox");
+      assert.equal(el.children[0].attrs.get("aria-hidden"), "true");
+      // Idempotent if bind runs again on the same element
+      items[idx].bind(el);
+      assert.equal(el.children.length, 1);
+    }
+  } finally {
+    globalThis.document = prevDocument;
+  }
+});
+
+test("imageMenuContributions guards all 3 whitelist menus by rootID and binds independent checked state", () => {
+  const scope = new FeatureScope();
+  const allowlist = new Set(["doc-1"]);
+  const menu = new MenuRegistry(() => true, error => { throw error; });
+
+  for (const contribution of imageMenuContributions({
+    scope,
+    context: {},
+    t: key => ({
+      "menu.whitelistDocument": "当前文档自动压缩",
+      "menu.compressDocument": "压缩当前文档全部图片",
+      "menu.compressImageQuick": "压缩此图片",
+      "menu.compressImageCustom": "压缩…",
+    })[key] ?? key,
+    icon: "iconOmnikitMenu",
+    isAllowlisted: ctx => Boolean(ctx.rootID && allowlist.has(ctx.rootID)),
+    compressQuick: async () => {},
+    compressCustom: async () => {},
+    toggleDocument: async () => {},
+    runBatch: async () => {},
+  })) {
+    menu.contribute(scope, "imageCompressor", contribution.location, contribution.id, contribution.provider);
+  }
+
+  for (const location of ["doc-title", "doc-tree", "topbar"]) {
+    const withoutRoot = [];
+    menu.render(location, { addItem: item => withoutRoot.push(item) }, { location });
+    assert.equal(withoutRoot.some(item => item.id.endsWith("toggle-document")), false, `${location} without rootID`);
+
+    const withAllowedRoot = [];
+    menu.render(location, { addItem: item => withAllowedRoot.push(item) }, { location, rootID: "doc-1" });
+    const toggleAllowed = withAllowedRoot.find(item => item.id.endsWith("toggle-document"));
+    assert.ok(toggleAllowed, `${location} with allowlisted rootID`);
+    assert.equal(toggleAllowed.label, location === "topbar" ? "当前文档自动压缩" : "[OmniKit] 当前文档自动压缩");
+    assert.equal(Object.hasOwn(toggleAllowed, "checked"), false);
+    const elAllowed = makeFakeElement();
+    toggleAllowed.bind(elAllowed);
+    assert.equal(elAllowed.attrs.get("aria-checked"), "true");
+
+    const withOtherRoot = [];
+    menu.render(location, { addItem: item => withOtherRoot.push(item) }, { location, rootID: "doc-2" });
+    const toggleOther = withOtherRoot.find(item => item.id.endsWith("toggle-document"));
+    assert.ok(toggleOther, `${location} with non-allowlisted rootID`);
+    const elOther = makeFakeElement();
+    toggleOther.bind(elOther);
+    assert.equal(elOther.attrs.get("aria-checked"), "false");
+  }
 });

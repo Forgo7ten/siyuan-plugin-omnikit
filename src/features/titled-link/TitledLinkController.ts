@@ -15,31 +15,21 @@ import {
   resolveTitledLinkProtyle,
 } from "./services/safe-writer.ts";
 import type { GroupedLinkTitleUpdate } from "./services/safe-writer.ts";
+import { countBatchResults } from "./policy/batchSummary.ts";
+import { isAutomaticLinkCandidate, isHttpUrl } from "./policy/paste-range.ts";
 import {
   DEFAULT_MAX_TITLE_LENGTH,
+  type LinkActionResult,
   type LinkOccurrenceTarget,
   type TitleFetchFailureReason,
   type TitleFetchResult,
+  type TitleFetchSource,
   type TitledLinkConfig,
 } from "./policy/types.ts";
 
-/**
- * Delay after SiYuan's pre-insertion `paste` event before scanning the block for
- * the newly converted link node. SiYuan's `TEventBus` emits `paste` before DOM
- * insertion and provides no post-paste completion callback; adjust here if host
- * paste timing changes on slower devices or future SiYuan versions.
- */
-export const AUTO_PASTE_DELAY_MS = 200;
+export type { LinkActionResult } from "./policy/types.ts";
+export { isAutomaticLinkCandidate, isHttpUrl } from "./policy/paste-range.ts";
 
-export type LinkActionResult =
-  | "updated"
-  | "unchanged"
-  | "conflict"
-  | "failed"
-  | "unknown"
-  | "aborted"
-  | "superseded"
-  | "ime-timeout";
 export interface TitledLinkControllerOptions {
   notify?: (message: string) => void;
   frontend?: () => string;
@@ -50,13 +40,12 @@ export interface TitledLinkControllerOptions {
   imeTimeoutMs?: number;
   imePollMs?: number;
   translate?: (key: string, values?: Record<string, string | number>) => string;
-  /** Optional timer injection for deterministic tests; defaults to setTimeout/clearTimeout. */
-  setTimer?: (handler: () => void, ms: number) => number;
-  clearTimer?: (id: number) => void;
 }
 
 interface BatchCandidate extends GroupedLinkTitleUpdate {
   token: number;
+  fallback: boolean;
+  source: TitleFetchSource;
 }
 
 interface PreparedBatchItem {
@@ -68,15 +57,8 @@ interface PreparedBatchItem {
 interface BatchOutcome {
   result: LinkActionResult;
   candidate?: BatchCandidate;
-}
-
-export function isAutomaticLinkCandidate(text: string, href: string): boolean {
-  return text === "" || text === href;
-}
-
-export function isHttpUrl(value: string): boolean {
-  try { return /^(https?:)$/.test(new URL(value).protocol); }
-  catch { return false; }
+  fallback?: boolean;
+  source?: TitleFetchSource;
 }
 
 /** The worker count is an upper bound even when there are fewer links. */
@@ -123,46 +105,15 @@ export class TitledLinkController {
     });
   }
 
-  /** Called synchronously from SiYuan's pre-insertion paste event; never intercepts paste. */
-  scheduleAutoPaste(detail: any): void {
-    if (!this.scope.active || !this.config().auto.enabled || !nativePasteLinkEnabled()) return;
-    const pasted = detail?.textPlain;
-    if (typeof pasted !== "string") return;
-    const url = pasted.trim();
-    if (!url || /[\s\r\n]/.test(url) || !isHttpUrl(url)) return;
-    const protyle = detail?.protyle;
-    const selection = globalThis.getSelection?.();
-    if (!selection?.isCollapsed) return;
-    const parent = selection.anchorNode instanceof Element ? selection.anchorNode : selection.anchorNode?.parentElement;
-    const block = parent?.closest<HTMLElement>("[data-node-id]");
-    const blockID = block?.getAttribute("data-node-id");
-    if (!block || !blockID || !protyle?.wysiwyg?.element?.contains(block) || isInsideProtectedContainer(block)) return;
-    const previous = new Set(matchingLinks(block, url));
-    const setTimer = this.options.setTimer ?? ((handler, ms) => setTimeout(handler, ms) as unknown as number);
-    const clearTimer = this.options.clearTimer ?? ((id) => clearTimeout(id));
-    let settled = false;
-    let release: (() => void) | undefined;
-    const timer = setTimer(() => {
-      settled = true;
-      release?.();
-      if (!this.scope.active || !this.config().auto.enabled) return;
-      const editorElement = protyle?.wysiwyg?.element as HTMLElement | undefined;
-      if (!editorElement?.isConnected) return;
-      const current = editorElement.querySelector<HTMLElement>(`[data-node-id="${blockID}"]`);
-      if (!current) return;
-      const matches = matchingLinks(current, url);
-      const added = matches.filter(link => !previous.has(link));
-      // First paste: rapid consecutive pastes of the same URL produce multiple additions; pick the latest.
-      // Existing identical URL in block: require no re-render and exactly one added node to avoid ambiguity.
-      const candidate = previous.size === 0
-        ? added.at(-1)
-        : (current === block && added.length === 1 ? added[0] : undefined);
-      if (!candidate || !isAutomaticLinkCandidate(candidate.textContent ?? "", url)) return;
-      void this.runLink(candidate, protyle, "auto");
-    }, AUTO_PASTE_DELAY_MS);
-    if (!settled) {
-      release = this.scope.own(() => clearTimer(timer));
-    }
+  /** Process candidate links captured from a single paste operation without blocking consecutive pastes. */
+  async runAutoPaste(links: readonly HTMLElement[], protyle: any): Promise<void> {
+    if (!this.scope.active || !this.config().auto.enabled) return;
+    const candidates = [...new Set(links)].filter(link => {
+      const href = link?.getAttribute?.("data-href") ?? "";
+      return isHttpUrl(href) && !isInsideProtectedContainer(link) && isAutomaticLinkCandidate(link?.textContent ?? "", href);
+    });
+    if (candidates.length === 0) return;
+    await this.runBatchCandidates(candidates, protyle, "auto-paste");
   }
 
   /** Menu close/removeCB settles before the snapshot is taken. */
@@ -201,116 +152,124 @@ export class TitledLinkController {
         this.context.logger?.debug?.("批量提取链接标题：未找到有效 HTTP(S) 链接");
         return;
       }
-      this.context.logger?.debug?.("批量提取链接标题：找到候选链接", { count: links.length });
-      const outcomes: BatchOutcome[] = new Array(links.length);
-      const prepared: PreparedBatchItem[] = [];
-      const blockHTMLCache = new Map<HTMLElement, string>();
-      links.forEach((link, index) => {
-        const href = link?.getAttribute?.("data-href");
-        const text = link?.textContent;
-        this.context.logger?.debug?.("批量准备链接", { href, text });
-        const target = captureLinkTarget(link, protyle, blockHTMLCache);
-        if (!target) {
-          const runner = resolveTitledLinkProtyle(protyle);
-          const block = link?.closest<HTMLElement>("[data-node-id]");
-          this.context.logger?.warn?.("批量准备链接失败：无法捕获链接目标", {
-            href,
-            text,
-            hasBlock: Boolean(block),
-            blockID: block?.getAttribute?.("data-node-id") ?? undefined,
-            hasUpdateTransaction: typeof runner?.updateTransactionElement === "function",
-          });
-          outcomes[index] = { result: "failed" };
-          return;
-        }
-        const token = (this.tokens.get(link) ?? 0) + 1;
-        this.tokens.set(link, token);
-        prepared.push({ index, target, token });
-      });
-
-      const fetchedOutcomes = await mapWithConcurrency(prepared, 3, item => this.prepareBatch(item));
-      fetchedOutcomes.forEach((outcome, fetchedIndex) => {
-        outcomes[prepared[fetchedIndex].index] = outcome;
-      });
-      if (!this.scope.active) return;
-      const results = outcomes.map(outcome => outcome.result);
-      const groups = new Map<string, Array<{ index: number; candidate: BatchCandidate }>>();
-      outcomes.forEach((outcome, index) => {
-        const candidate = outcome.candidate;
-        if (!candidate) return;
-        if (!this.current(candidate.target, candidate.token)) {
-          results[index] = this.scope.active ? "superseded" : "aborted";
-          return;
-        }
-        const key = `${candidate.target.notebook}/${candidate.target.blockID}`;
-        const group = groups.get(key) ?? [];
-        group.push({ index, candidate });
-        groups.set(key, group);
-      });
-
-      for (const group of groups.values()) {
-        if (!this.scope.active) return;
-        const updates = group.map(({ candidate }) => ({
-          target: candidate.target,
-          title: candidate.title,
-          isCurrent: () => this.current(candidate.target, candidate.token),
-        }));
-        this.context.logger?.debug?.("开始批量提交块内链接标题写入", {
-          blockID: group[0]?.candidate?.target?.blockID,
-          count: updates.length,
-        });
-        let writes;
-        try {
-          writes = await commitLinkTitles(updates, {
-            replaceTitle: this.config().replaceTitle,
-            signal: this.scope.signal,
-            kernel: this.kernel,
-            isComposing: this.options.isComposing,
-            imeTimeoutMs: this.options.imeTimeoutMs,
-            imePollMs: this.options.imePollMs,
-          });
-          this.context.logger?.debug?.("批量提交块内链接标题写入完成", {
-            blockID: group[0]?.candidate?.target?.blockID,
-            writes,
-          });
-        } catch (error) {
-          this.context.logger?.warn?.("链接标题批量写入失败", error);
-          for (const { index } of group) results[index] = this.scope.active ? "failed" : "aborted";
-          continue;
-        }
-        group.forEach(({ index, candidate }, writeIndex) => {
-          if (!this.current(candidate.target, candidate.token)) {
-            results[index] = this.scope.active ? "superseded" : "aborted";
-            return;
-          }
-          results[index] = writes[writeIndex] ?? "conflict";
-        });
-      }
-
-      const updated = results.filter(result => result === "updated").length;
-      const conflict = results.filter(result => result === "conflict").length;
-      const failed = results.filter(result => result === "failed" || result === "ime-timeout").length;
-      const unknown = results.filter(result => result === "unknown").length;
-      this.context.logger?.debug?.("批量提取链接标题结束", {
-        total: links.length,
-        updated,
-        conflict,
-        failed,
-        unknown,
-      });
-      this.notify(this.t("titledLink.batchSummary", {
-        total: links.length,
-        updated,
-        conflict,
-        failed,
-        unknown,
-      }));
+      await this.runBatchCandidates(links, protyle, "manual-batch");
     } finally {
       for (const key of claimedKeys) this.inFlightBatches.delete(key);
     }
   }
 
   clear(): void { this.cache.clear(); this.pending.clear(); }
+
+  private async runBatchCandidates(
+    links: readonly HTMLElement[],
+    protyle: any,
+    mode: "auto-paste" | "manual-batch",
+  ): Promise<void> {
+    this.context.logger?.debug?.("开始处理链接候选集", { count: links.length, mode });
+    const outcomes: BatchOutcome[] = new Array(links.length);
+    const prepared: PreparedBatchItem[] = [];
+    const blockHTMLCache = new Map<HTMLElement, string>();
+    links.forEach((link, index) => {
+      const href = link?.getAttribute?.("data-href");
+      const text = link?.textContent;
+      this.context.logger?.debug?.("批量准备链接", { href, text, mode });
+      const target = captureLinkTarget(link, protyle, blockHTMLCache);
+      if (!target) {
+        const runner = resolveTitledLinkProtyle(protyle);
+        const block = link?.closest<HTMLElement>("[data-node-id]");
+        this.context.logger?.warn?.("批量准备链接失败：无法捕获链接目标", {
+          href,
+          text,
+          hasBlock: Boolean(block),
+          blockID: block?.getAttribute?.("data-node-id") ?? undefined,
+          hasUpdateTransaction: typeof runner?.updateTransactionElement === "function",
+        });
+        outcomes[index] = { result: "failed" };
+        return;
+      }
+      const token = (this.tokens.get(link) ?? 0) + 1;
+      this.tokens.set(link, token);
+      prepared.push({ index, target, token });
+    });
+
+    const fetchMode = mode === "auto-paste" ? "auto" : "batch";
+    const fetchedOutcomes = await mapWithConcurrency(prepared, 3, item => this.prepareBatch(item, fetchMode));
+    fetchedOutcomes.forEach((outcome, fetchedIndex) => {
+      outcomes[prepared[fetchedIndex].index] = outcome;
+    });
+    if (!this.scope.active) return;
+
+    const groups = new Map<string, Array<{ index: number; candidate: BatchCandidate }>>();
+    outcomes.forEach((outcome, index) => {
+      const candidate = outcome.candidate;
+      if (!candidate) return;
+      if (!this.current(candidate.target, candidate.token)) {
+        outcomes[index].result = this.scope.active ? "superseded" : "aborted";
+        return;
+      }
+      const key = `${candidate.target.notebook}/${candidate.target.blockID}`;
+      const group = groups.get(key) ?? [];
+      group.push({ index, candidate });
+      groups.set(key, group);
+    });
+
+    for (const group of groups.values()) {
+      if (!this.scope.active) return;
+      const updates = group.map(({ candidate }) => ({
+        target: candidate.target,
+        title: candidate.title,
+        isCurrent: () => this.current(candidate.target, candidate.token),
+      }));
+      this.context.logger?.debug?.("开始批量提交块内链接标题写入", {
+        blockID: group[0]?.candidate?.target?.blockID,
+        count: updates.length,
+      });
+      let writes: LinkActionResult[];
+      try {
+        writes = await commitLinkTitles(updates, {
+          replaceTitle: this.config().replaceTitle,
+          signal: this.scope.signal,
+          kernel: this.kernel,
+          isComposing: this.options.isComposing,
+          imeTimeoutMs: this.options.imeTimeoutMs,
+          imePollMs: this.options.imePollMs,
+        });
+        this.context.logger?.debug?.("批量提交块内链接标题写入完成", {
+          blockID: group[0]?.candidate?.target?.blockID,
+          writes,
+        });
+      } catch (error) {
+        this.context.logger?.warn?.("链接标题批量写入失败", error);
+        for (const { index } of group) {
+          outcomes[index].result = this.scope.active ? "failed" : "aborted";
+        }
+        continue;
+      }
+      group.forEach(({ index, candidate }, writeIndex) => {
+        if (!this.current(candidate.target, candidate.token)) {
+          outcomes[index].result = this.scope.active ? "superseded" : "aborted";
+          return;
+        }
+        outcomes[index].result = writes[writeIndex] ?? "conflict";
+      });
+    }
+
+    const results = outcomes.map(outcome => outcome.result);
+    const summary = countBatchResults(results);
+    this.context.logger?.debug?.("批量提取链接标题结束", summary);
+
+    if (!this.scope.active) return;
+    if (mode === "auto-paste") {
+      if (!this.config().auto.enabled) return;
+      if (summary.skipped === summary.total) return;
+      if (summary.total === 1) {
+        const outcome = outcomes[0];
+        this.notify(this.t(singleResultNoticeKey(outcome.result, outcome.fallback === true)));
+        return;
+      }
+    }
+    this.notify(this.t("titledLink.batchSummary", { ...summary }));
+  }
 
   private config(): TitledLinkConfig {
     return this.context.settings.getFeature<TitledLinkConfig>("titled-link");
@@ -387,7 +346,7 @@ export class TitledLinkController {
       if (!this.current(target, token)) return this.scope.active ? "superseded" : "aborted";
       if (fetched.status === "failure") {
         if (mode === "manual") this.notify(this.t("titledLink.failed"));
-        return "failed";
+        return fetched.reason === "aborted" ? "aborted" : "failed";
       }
       this.context.logger?.debug?.("开始提交链接标题写入", {
         href: target.originalHref,
@@ -416,18 +375,7 @@ export class TitledLinkController {
         this.cache.refresh(cacheKey(target.originalHref), fetched.title);
       }
       if (mode === "manual") {
-        const noticeKey = result === "updated"
-          ? (fetched.fallback ? "titledLink.fallbackUsed" : "titledLink.updated")
-          : result === "unchanged"
-            ? "titledLink.unchanged"
-            : result === "conflict"
-              ? "titledLink.conflict"
-              : result === "unknown"
-                ? "titledLink.unknown"
-                : result === "ime-timeout"
-                  ? "titledLink.imeTimeout"
-                  : "titledLink.failed";
-        this.notify(this.t(noticeKey));
+        this.notify(this.t(singleResultNoticeKey(result, fetched.fallback)));
       }
       return result;
     } catch (error) {
@@ -441,25 +389,36 @@ export class TitledLinkController {
     }
   }
 
-  private async prepareBatch(item: PreparedBatchItem): Promise<BatchOutcome> {
+  private async prepareBatch(item: PreparedBatchItem, mode: "auto" | "batch"): Promise<BatchOutcome> {
     const { target, token } = item;
     if (!this.current(target, token)) {
       return { result: this.scope.active ? "superseded" : "aborted" };
     }
     try {
-      this.context.logger?.debug?.("批量抓取链接标题", { href: target.originalHref, token });
-      const fetched = await this.titleFor(target, "batch");
+      this.context.logger?.debug?.("批量抓取链接标题", { href: target.originalHref, token, mode });
+      const fetched = await this.titleFor(target, mode, this.scope.signal);
       this.context.logger?.debug?.("批量抓取链接标题完成", {
         href: target.originalHref,
         status: fetched.status,
+        mode,
       });
       if (!this.current(target, token)) {
         return { result: this.scope.active ? "superseded" : "aborted" };
       }
-      if (fetched.status === "failure") return { result: "failed" };
+      if (fetched.status === "failure") {
+        return { result: fetched.reason === "aborted" ? "aborted" : "failed" };
+      }
       return {
         result: "failed",
-        candidate: { target, title: fetched.title, token },
+        fallback: fetched.fallback,
+        source: fetched.source,
+        candidate: {
+          target,
+          title: fetched.title,
+          token,
+          fallback: fetched.fallback,
+          source: fetched.source,
+        },
       };
     } catch (error) {
       if (!this.current(target, token)) return { result: this.scope.active ? "superseded" : "aborted" };
@@ -554,6 +513,23 @@ export class TitledLinkController {
   }
 }
 
+function singleResultNoticeKey(result: LinkActionResult, fallback: boolean): string {
+  switch (result) {
+    case "updated":
+      return fallback ? "titledLink.fallbackUsed" : "titledLink.updated";
+    case "unchanged":
+      return "titledLink.unchanged";
+    case "conflict":
+      return "titledLink.conflict";
+    case "unknown":
+      return "titledLink.unknown";
+    case "ime-timeout":
+      return "titledLink.imeTimeout";
+    default:
+      return "titledLink.failed";
+  }
+}
+
 function cacheKey(href: string): string {
   try { return new URL(href).href; } catch { return href; }
 }
@@ -572,16 +548,4 @@ function isTimeoutError(error: unknown): boolean {
     current = err.cause;
   }
   return false;
-}
-
-function matchingLinks(block: HTMLElement, href: string): HTMLElement[] {
-  return [...block.querySelectorAll<HTMLElement>('span[data-type~="a"]')]
-    .filter(link => link.getAttribute("data-href") === href);
-}
-
-function nativePasteLinkEnabled(): boolean {
-  const host = globalThis as typeof globalThis & {
-    siyuan?: { config?: { editor?: { pasteURLAutoConvert?: boolean } } };
-  };
-  return host.siyuan?.config?.editor?.pasteURLAutoConvert === true;
 }

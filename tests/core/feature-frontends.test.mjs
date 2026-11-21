@@ -10,11 +10,34 @@ import { filterSupportedDockViews } from "../../src/ui/dock/registerDock.ts";
 function createMockPlugin() {
   const writes = [];
   const storage = new Map();
-  return {
+  const plugin = {
     writes,
     storage,
-    async loadData(name) { return storage.get(name) ?? ""; },
+    loadDataCalls: 0,
+    async loadData(name) { plugin.loadDataCalls += 1; return storage.get(name) ?? ""; },
     async saveData(name, value) { writes.push(name); storage.set(name, structuredClone(value)); },
+  };
+  return plugin;
+}
+
+function createFileGetFetch(storage, pluginName = "siyuan-plugin-omnikit") {
+  const prefix = `/data/storage/petal/${pluginName}/`;
+  return async (url, request) => {
+    assert.equal(url, "/api/file/getFile");
+    assert.equal(request.method, "POST");
+    const { path } = JSON.parse(request.body);
+    assert.ok(path.startsWith(prefix), `Unexpected storage path: ${path}`);
+    const name = path.slice(prefix.length);
+    assert.equal(path, `/data/storage/petal/${pluginName}/${name}`);
+    assert.ok(!name.includes("/"));
+    if (!storage.has(name)) {
+      return new Response(JSON.stringify({ code: 404, msg: "not found" }), { status: 202 });
+    }
+    const raw = storage.get(name);
+    return new Response(typeof raw === "string" ? raw : JSON.stringify(raw), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
   };
 }
 
@@ -180,8 +203,9 @@ test("setEnabled on unsupported platform returns false and protects omnikit-core
     },
   ];
 
-  const settingsManager = new SettingsManager(p, registrations);
+  const settingsManager = new SettingsManager(p, registrations, createFileGetFetch(p.storage));
   await settingsManager.load();
+  assert.equal(p.loadDataCalls, 0);
 
   class DesktopFeature extends BaseFeature {
     constructor() {
@@ -245,8 +269,9 @@ test("preserves remote cloud-synced enabled:true preference on unsupported front
   // Current client is mobile
   setFrontendResolver(() => "mobile");
 
-  const settingsManager = new SettingsManager(p, registrations);
+  const settingsManager = new SettingsManager(p, registrations, createFileGetFetch(p.storage));
   await settingsManager.load();
+  assert.equal(p.loadDataCalls, 0);
 
   let activateAttempts = 0;
   class DesktopFeature extends BaseFeature {

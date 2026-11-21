@@ -3,7 +3,7 @@ import { adaptiveQualitySearch, type QualitySearchProgress } from "./adaptive-qu
 import { SimilarityWorkerSession, type WorkerFactory } from "./SimilarityWorkerSession.ts";
 import { getSimilarityPolicy } from "./similarity-policy.ts";
 import type { CompressionMode } from "../policy/contracts.ts";
-import { isProtectedDrawingPath, isWebpAllowed } from "../policy/ImageCandidateClassifier.ts";
+import { extractImageExtension, isProtectedDrawingPath, isWebpAllowed } from "../policy/ImageCandidateClassifier.ts";
 import { inspectImage, type EncodeOptions, type EncodeResult, type ImageCodec } from "../services/image.ts";
 import type { ImageConfig } from "../policy/parseImageConfig.ts";
 
@@ -88,7 +88,7 @@ export class AdaptiveImageCompressor implements ImageCodec {
     }
 
     const c = config.compression;
-    const ext = name.split(/[?#]/)[0].split(".").pop()?.toLowerCase() ?? "";
+    const ext = extractImageExtension(name);
     if (
       isProtectedDrawingPath(name) ||
       (c.excludedExtensions.includes(ext) && !isWebpAllowed(ext, mode, c.smartEnabled === true))
@@ -119,6 +119,9 @@ export class AdaptiveImageCompressor implements ImageCodec {
     const expected: Record<string, string> = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp" };
     if (expected[ext] && expected[ext] !== originalInfo.mime) {
       throw new Error("Image extension/signature mismatch");
+    }
+    if (originalInfo.mime === "image/webp" && !isWebpAllowed("webp", mode, c.smartEnabled === true)) {
+      return { kind: "skipped", reason: "protected-extension" };
     }
     if (!Number.isSafeInteger(originalInfo.width * originalInfo.height) || originalInfo.width * originalInfo.height > c.maxPixels) {
       throw new Error("Decoded pixel limit exceeded");

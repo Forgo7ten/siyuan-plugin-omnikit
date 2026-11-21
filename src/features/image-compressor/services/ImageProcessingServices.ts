@@ -46,7 +46,7 @@ export type OccurrenceCompressionResult =
   | {
       status: "saved";
       path: string;
-      reference: "not-requested" | "replaced" | "conflict" | "aborted" | "unknown";
+      reference: "not-requested" | "replaced" | "conflict" | "aborted" | "failed" | "unknown";
       originalBytes?: number;
       compressedBytes?: number;
       quality?: number;

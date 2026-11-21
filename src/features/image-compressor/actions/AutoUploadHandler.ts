@@ -306,6 +306,8 @@ async function processCompletedUpload(
         lastSkipReason = "unknown";
       } else if (outcome.reference === "aborted") {
         break;
+      } else if (outcome.reference === "failed") {
+        failed++;
       } else {
         skipped++;
         lastSkipReason = "conflict";

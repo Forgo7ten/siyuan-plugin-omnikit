@@ -4,7 +4,7 @@ import type { FeatureRegistration } from "../framework/FeatureRegistration.ts";
 
 export interface GeneralSettings {
   debugLog: boolean;
-  /** Empty means use DEFAULT_USER_AGENT at request time. */
+  /** Preset to DEFAULT_USER_AGENT on init/reset/save when blank; getUserAgent() retains fallback guard. */
   userAgent: string;
 }
 export interface CoreSettings {
@@ -14,11 +14,11 @@ export interface CoreSettings {
   featureStates: Record<string, { enabled: boolean }>;
 }
 
-export const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+export const DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36";
 
 const coreDefaults = (): CoreSettings => ({
   schemaVersion: 1,
-  general: { debugLog: false, userAgent: "" },
+  general: { debugLog: false, userAgent: DEFAULT_USER_AGENT },
   featureStates: {},
 });
 
@@ -71,8 +71,12 @@ export class SettingsManager {
   private readonly featureStores = new Map<string, JsonStore<any>>();
   private readonly definitions = new Map<string, FeatureRegistration<any>>();
 
-  constructor(plugin: Plugin, registrations: readonly FeatureRegistration<any>[]) {
-    this.core = new JsonStore(plugin, "omnikit-core.json", coreCodec);
+  constructor(
+    plugin: Plugin,
+    registrations: readonly FeatureRegistration<any>[],
+    fetchFn?: typeof fetch,
+  ) {
+    this.core = new JsonStore(plugin, "omnikit-core.json", coreCodec, fetchFn);
     for (const definition of registrations) {
       if (this.featureStores.has(definition.id)) {
         throw new Error(`Duplicate feature: ${definition.id}`);
@@ -81,7 +85,7 @@ export class SettingsManager {
         throw new Error(`Duplicate feature file: ${definition.file}`);
       }
       this.definitions.set(definition.id, definition);
-      this.featureStores.set(definition.id, new JsonStore(plugin, definition.file, definition.codec));
+      this.featureStores.set(definition.id, new JsonStore(plugin, definition.file, definition.codec, fetchFn));
     }
   }
 
@@ -95,6 +99,18 @@ export class SettingsManager {
         console.warn(`[OmniKit][warn] 配置读取失败，已进入只读保护 (${stores[index].file}):`, result.reason);
       }
     });
+    if (!this.core.needsRecovery && this.getGeneral().userAgent.trim() === "") {
+      try {
+        await this.core.update(draft => {
+          if (draft.general.userAgent.trim() === "") {
+            draft.general.userAgent = DEFAULT_USER_AGENT;
+          }
+        });
+      } catch (error) {
+        // @safety Keep startup reachable and rely on getUserAgent() fallback if disk write fails.
+        console.warn(`[OmniKit][warn] 自动补全默认 User-Agent 写入失败 (${this.core.file}):`, error);
+      }
+    }
   }
 
   get needsRecovery(): boolean {
@@ -106,7 +122,12 @@ export class SettingsManager {
     return this.getGeneral().userAgent.trim() || DEFAULT_USER_AGENT;
   }
   updateGeneral(patch: Partial<GeneralSettings>): Promise<boolean> {
-    return this.core.update(draft => Object.assign(draft.general, patch));
+    return this.core.update(draft => {
+      Object.assign(draft.general, patch);
+      if (patch.userAgent !== undefined && !/[\r\n]/.test(patch.userAgent)) {
+        draft.general.userAgent = patch.userAgent.trim() || DEFAULT_USER_AGENT;
+      }
+    });
   }
 
   resetFeature(id: string): Promise<boolean> {

@@ -1,5 +1,10 @@
 import type { KernelClient } from "../../../core/host/KernelClient.ts";
-import { commitOneImage, type CommitResult } from "./SafeBlockWriter.ts";
+import {
+  commitOneImage,
+  commitOneImageDetailed,
+  type CommitDetailedResult,
+  type CommitResult,
+} from "./SafeBlockWriter.ts";
 import type { OccurrenceTarget } from "../policy/contracts.ts";
 
 export interface DocumentRow { id: string; root_id: string; box: string }
@@ -17,5 +22,10 @@ export class ReferenceService {
   /** Direct single-position API for callers that already hold an authorized occurrence snapshot. */
   commitOccurrence(target: OccurrenceTarget, newPath: string, signal?: AbortSignal): Promise<CommitResult> {
     return commitOneImage(this.k, target, newPath, this.origin, signal);
+  }
+
+  /** Same as `commitOccurrence`, also returning normalized expected block DOM on `"replaced"`. */
+  commitOccurrenceDetailed(target: OccurrenceTarget, newPath: string, signal?: AbortSignal): Promise<CommitDetailedResult> {
+    return commitOneImageDetailed(this.k, target, newPath, this.origin, signal);
   }
 }

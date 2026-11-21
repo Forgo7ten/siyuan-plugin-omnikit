@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { resolveImageOccurrence } from "../../../src/features/image-compressor/services/ImageOccurrenceResolver.ts";
-import { commitOneImage } from "../../../src/features/image-compressor/services/SafeBlockWriter.ts";
+import {
+  commitOneImage,
+  commitOneImageDetailed,
+  normalizeBlockDOMForCompare,
+} from "../../../src/features/image-compressor/services/SafeBlockWriter.ts";
 import { withBlockWriteLease } from "../../../src/core/host/BlockWriteLease.ts";
 
 const rootID = "20261113000000-abcdef0";
@@ -21,9 +25,10 @@ class Element {
   removeAttribute(name) { this.attrs.delete(name); }
   getAttributeNames() { return [...this.attrs.keys()]; }
   querySelectorAll(selector) {
-    if (selector === "[parent-heading]") {
+    if (selector === "[parent-heading]" || selector === "[updated]") {
+      const attr = selector.slice(1, -1);
       return this.children.flatMap(child => [
-        ...(child.hasAttribute("parent-heading") ? [child] : []),
+        ...(child.hasAttribute(attr) ? [child] : []),
         ...child.querySelectorAll(selector),
       ]);
     }
@@ -107,7 +112,7 @@ test("writer checks block ownership and baseline, then updates occurrence and tr
   assert.deepEqual(calls, ["/api/block/getBlockInfo", "/api/block/getBlockDOM", "/api/block/updateBlock"]);
 }));
 
-test("writer strips render-only parent-heading attribute and preserves decorative suffixes + box", async () => withDocument(async () => {
+test("writer strips render-only parent-heading attribute, drops query params, and preserves #fragment + box (I-05)", async () => withDocument(async () => {
   const current = `<div data-node-id="${blockID}" parent-heading="20261113000099-abcdef0"><img data-src="assets/a.png?width=200#fig" src="assets/a.png?width=200#fig"></div>`;
   const target = resolveImageOccurrence(current, { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/a.png?width=200#fig" });
   let written = "";
@@ -120,7 +125,8 @@ test("writer strips render-only parent-heading attribute and preserves decorativ
   const result = await commitOneImage(kernel, target, `assets/a.webp?box=${notebook}`, "http://localhost:6806");
   assert.equal(result, "replaced");
   assert.equal(written.includes("parent-heading"), false);
-  assert.equal(written.includes(`assets/a.webp?box=${notebook}&width=200#fig`), true);
+  assert.equal(written.includes("width=200"), false);
+  assert.equal(written.includes(`assets/a.webp?box=${notebook}#fig`), true);
 }));
 
 test("writer patches only the selected resource link ordinal without touching images or sibling links (D06)", async () => withDocument(async () => {
@@ -258,4 +264,56 @@ test("writer shares Core withBlockWriteLease across notebook/blockID (A-07)", as
   assert.equal(commitRes, "replaced");
   assert.equal(events[1], "peer:exit");
   assert.equal(events[2], "image:/api/block/getBlockInfo");
+}));
+
+test("I-07: writer distinguishes not-sent -> aborted, rejected -> failed, and unknown -> unknown", async () => withDocument(async () => {
+  const baseline = blockDOM(["assets/a.png"]);
+  const target = resolveImageOccurrence(baseline, { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/a.png" });
+
+  const makeKernel = (error) => ({
+    async post(path) {
+      if (path === "/api/block/getBlockInfo") return { data: { rootID, box: notebook } };
+      if (path === "/api/block/getBlockDOM") return { data: { id: blockID, dom: baseline } };
+      if (path === "/api/block/updateBlock") throw error;
+      throw new Error(path);
+    },
+  });
+
+  assert.equal(
+    await commitOneImage(makeKernel(Object.assign(new Error("cancelled"), { outcome: "not-sent", name: "AbortError" })), target, "assets/a.webp", "http://localhost:6806"),
+    "aborted",
+  );
+  assert.equal(
+    await commitOneImage(makeKernel(Object.assign(new Error("rejected"), { outcome: "rejected", code: -1 })), target, "assets/a.webp", "http://localhost:6806"),
+    "failed",
+  );
+  assert.equal(
+    await commitOneImage(makeKernel(Object.assign(new Error("post-dispatch abort"), { outcome: "unknown", name: "AbortError" })), target, "assets/a.webp", "http://localhost:6806"),
+    "unknown",
+  );
+}));
+
+test("I-04: commitOneImageDetailed keeps updated on write payload while stripping updated + parent-heading on expectedBlockDOM", async () => withDocument(async () => {
+  const domWithUpdated = `<div data-node-id="${blockID}" parent-heading="20261113000099-abcdef0" updated="20261113000001"><img data-src="assets/a.png" src="assets/a.png" updated="20261113000002"></div>`;
+  const target = resolveImageOccurrence(domWithUpdated, { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/a.png" });
+  let written = "";
+  const kernel = {
+    async post(path, body) {
+      if (path === "/api/block/getBlockInfo") return { data: { rootID, box: notebook } };
+      if (path === "/api/block/getBlockDOM") return { data: { id: blockID, dom: domWithUpdated } };
+      if (path === "/api/block/updateBlock") { written = body.data; return { data: null }; }
+      throw new Error(path);
+    },
+  };
+  const detailed = await commitOneImageDetailed(kernel, target, "assets/a.webp", "http://localhost:6806");
+  assert.equal(detailed.status, "replaced");
+  assert.equal(written.includes("parent-heading"), false);
+  assert.equal(written.includes('updated="20261113000001"'), true);
+  assert.equal(written.includes('updated="20261113000002"'), true);
+  assert.equal(detailed.expectedBlockDOM?.includes("parent-heading"), false);
+  assert.equal(detailed.expectedBlockDOM?.includes("updated="), false);
+  assert.equal(
+    normalizeBlockDOMForCompare(`<div data-node-id="${blockID}" parent-heading="x" updated="20261113999999"><img data-src="assets/a.webp" src="assets/a.webp" updated="20261113999998"></div>`),
+    detailed.expectedBlockDOM,
+  );
 }));

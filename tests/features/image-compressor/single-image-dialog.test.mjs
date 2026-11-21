@@ -339,6 +339,26 @@ test("D02 + P1-3: remote localization unknown aborts WebP replacement and compre
       mockServices,
     );
     assert.deepEqual(quickOutcome, { kind: "notify", key: "image.single.unknown" });
+
+    // I-07: rejected localization / commitOccurrence reports image.single.failed
+    mockServices.references.commitOccurrence = async () => "failed";
+    const remoteImg = {
+      matches: () => true,
+      closest: sel => sel === "[data-node-id]"
+        ? { getAttribute: attr => attr === "data-node-id" ? blockID : null, querySelectorAll: () => [remoteImg] }
+        : null,
+      hasAttribute: attr => attr === "src",
+      getAttribute: attr => attr === "src" ? "https://example.com/u.png" : null,
+    };
+    img.getAttribute = attr => attr === "src" ? "https://example.com/u.png" : null;
+    const failedOutcome = await compressSelectedImageQuick(
+      { element: remoteImg },
+      { plugin: { i18n: {} }, logger: { warn() {} } },
+      scope,
+      { rootID, notebook },
+      mockServices,
+    );
+    assert.deepEqual(failedOutcome, { kind: "notify", key: "image.single.failed" });
   } finally {
     scope.dispose();
     globalThis.document = priorDoc;

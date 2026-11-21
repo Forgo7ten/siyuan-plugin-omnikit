@@ -1,9 +1,13 @@
 import { fetchSyncPost } from "siyuan";
 
+export type KernelOutcome = "not-sent" | "rejected" | "unknown";
+
 export interface KernelResponse<T> {
   code: number;
   data: T;
   msg: string;
+  limit?: number;
+  truncated?: boolean;
 }
 
 export type KernelFetchPost = typeof fetchSyncPost;
@@ -13,11 +17,11 @@ export interface KernelRequestOptions {
   timeout?: number;
 }
 
-/** Thin adapter over SiYuan's kernel REST API. A rejected write may already have reached the kernel. */
+/** Thin adapter over SiYuan's kernel REST API. An unknown write may already have reached the kernel. */
 export class KernelRequestError extends Error {
-  readonly outcome: "not-sent" | "unknown";
+  readonly outcome: KernelOutcome;
   readonly code?: number;
-  constructor(message: string, outcome: "not-sent" | "unknown", name = "Error", code?: number) {
+  constructor(message: string, outcome: KernelOutcome, name = "Error", code?: number) {
     super(message);
     this.name = name;
     this.outcome = outcome;
@@ -72,11 +76,15 @@ export class KernelClient {
       try {
         Promise.resolve(this.request(path as any, body, undefined, false, internalController.signal))
           .then(response => {
-            const result = response as unknown as KernelResponse<T>;
-            if (!result || result.code !== 0) {
-              settle(() => reject(new KernelRequestError(result?.msg || `SiYuan API failed: ${path}`, "unknown", "Error", result?.code)));
-            } else {
+            const result = response !== null && typeof response === "object"
+              ? (response as unknown as KernelResponse<T>)
+              : undefined;
+            if (result && result.code === 0) {
               settle(() => resolve(result));
+            } else if (result && typeof result.code === "number" && result.code !== 0) {
+              settle(() => reject(new KernelRequestError(result.msg || `SiYuan API failed: ${path}`, "rejected", "Error", result.code)));
+            } else {
+              settle(() => reject(new KernelRequestError(result?.msg || `SiYuan API failed: ${path}`, "unknown", "Error", result?.code)));
             }
           })
           .catch(error => {

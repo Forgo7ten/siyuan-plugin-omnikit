@@ -100,7 +100,7 @@ function extractPageTitle(html: string): string | null {
 
 function extractMetaContent(html: string, key: "name" | "property", expected: string): string | null {
   const scope = extractTitleScope(html);
-  const tags = scope.match(/<meta\b[^>]*>/gi) ?? [];
+  const tags = scope.match(/<meta\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi) ?? [];
   for (const tag of tags) {
     if (attribute(tag, key)?.toLowerCase() !== expected) continue;
     return attribute(tag, "content");

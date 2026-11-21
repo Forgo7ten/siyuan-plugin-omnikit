@@ -9,6 +9,8 @@ const { extractStaticFileName, isStaticFileUrl } = module;
 
 test("extracts and decodes supported static file names without query or hash", () => {
   assert.equal(extractStaticFileName("https://example.com/files/%E6%89%8B%E5%86%8C-v1.0.pdf?download=1#page"), "手册-v1.0.pdf");
+  assert.equal(extractStaticFileName("https://example.com/files/manual%2Epdf?download=1"), "manual.pdf");
+  assert.equal(extractStaticFileName("https://example.com/files/report%20final%2Edocx#top"), "report final.docx");
   assert.equal(extractStaticFileName("https://example.com/APP.DMG"), "APP.DMG");
   assert.equal(extractStaticFileName("https://example.com/music/track.flac"), "track.flac");
 });
@@ -21,9 +23,11 @@ test("recognizes the configured archive, document, media and image families", ()
 
 test("rejects web pages and unsupported protocols while falling back on malformed URL encoding", () => {
   assert.equal(extractStaticFileName("https://example.com/page.html"), null);
+  assert.equal(extractStaticFileName("https://example.com/page%2Ehtml"), null);
   assert.equal(extractStaticFileName("ftp://example.com/a.pdf"), null);
   assert.equal(extractStaticFileName("siyuan://blocks/123.pdf"), null);
   assert.equal(extractStaticFileName("https://example.com/%E0%A4%A.pdf"), "%E0%A4%A.pdf");
+  assert.equal(extractStaticFileName("https://example.com/%E0%A4%A.html"), null);
   assert.equal(extractStaticFileName("https://example.com/%20.pdf"), ".pdf");
   assert.equal(extractStaticFileName("not a URL"), null);
 });

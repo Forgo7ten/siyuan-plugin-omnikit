@@ -222,8 +222,8 @@ const codec: StoreCodec<RecordsFile> = {
 export class ImageCompressionRecordStore {
   readonly store: JsonStore<RecordsFile>;
 
-  constructor(plugin: Plugin) {
-    this.store = new JsonStore(plugin, "feature-image-compressor-records.json", codec);
+  constructor(plugin: Plugin, options?: { fetchFn?: typeof fetch }) {
+    this.store = new JsonStore(plugin, "feature-image-compressor-records.json", codec, options?.fetchFn);
   }
 
   async init(): Promise<void> { await this.store.load(); }
@@ -315,10 +315,13 @@ export class ImageCompressionRecordStore {
 const stores = new WeakMap<Plugin, { store: ImageCompressionRecordStore; ready: Promise<void> }>();
 
 /** Share one in-memory write queue with the feature runtime and its Dock view. */
-export function imageRecordsFor(plugin: Plugin): { store: ImageCompressionRecordStore; ready: Promise<void> } {
+export function imageRecordsFor(
+  plugin: Plugin,
+  options?: { fetchFn?: typeof fetch },
+): { store: ImageCompressionRecordStore; ready: Promise<void> } {
   let entry = stores.get(plugin);
   if (!entry) {
-    const store = new ImageCompressionRecordStore(plugin);
+    const store = new ImageCompressionRecordStore(plugin, options);
     entry = { store, ready: store.init() };
     stores.set(plugin, entry);
   }

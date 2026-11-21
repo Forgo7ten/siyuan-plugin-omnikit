@@ -6,12 +6,35 @@ import { SettingsConflictError, isSettingsConflictError } from "../../src/core/s
 function plugin() {
   const writes = [];
   const storage = new Map();
-  return {
-    writes, storage,
-    async loadData(name) { return storage.get(name) ?? ""; },
+  const p = {
+    writes, storage, loadDataCalls: 0,
+    async loadData(name) { p.loadDataCalls += 1; return storage.get(name) ?? ""; },
     async saveData(name, value) { writes.push(name); storage.set(name, structuredClone(value)); },
   };
+  return p;
 }
+
+function createFileGetFetch(storage, pluginName = "siyuan-plugin-omnikit") {
+  const prefix = `/data/storage/petal/${pluginName}/`;
+  return async (url, request) => {
+    assert.equal(url, "/api/file/getFile");
+    assert.equal(request.method, "POST");
+    const { path } = JSON.parse(request.body);
+    assert.ok(path.startsWith(prefix), `Unexpected storage path: ${path}`);
+    const name = path.slice(prefix.length);
+    assert.equal(path, `/data/storage/petal/${pluginName}/${name}`);
+    assert.ok(!name.includes("/"));
+    if (!storage.has(name)) {
+      return new Response(JSON.stringify({ code: 404, msg: "not found" }), { status: 202 });
+    }
+    const raw = storage.get(name);
+    return new Response(typeof raw === "string" ? raw : JSON.stringify(raw), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+}
+
 const registrations = [
   {id: "imageCompressor", file: "feature-image-compressor.json", defaultEnabled: true,
     codec: {
@@ -29,7 +52,7 @@ const registrations = [
 
 test("core/feature settings are separate and feature edits never rewrite core", async () => {
   const p = plugin();
-  const settings = new SettingsManager(p, registrations);
+  const settings = new SettingsManager(p, registrations, createFileGetFetch(p.storage));
   await settings.load();
   assert.deepEqual(p.writes, []);
   assert.equal(settings.getFeatureEnabled("imageCompressor", true), true);
@@ -39,6 +62,7 @@ test("core/feature settings are separate and feature edits never rewrite core", 
   assert.deepEqual(p.writes, ["feature-image-compressor.json", "omnikit-core.json"]);
   await settings.updateFeature("textTools", config => { config.replacement = "yes"; });
   assert.equal(p.writes.at(-1), "feature-text-tools.json");
+  assert.equal(p.loadDataCalls, 0);
 });
 
 test("settings reset button text and allowlist HPath display conform to unified spec", async () => {
@@ -46,11 +70,15 @@ test("settings reset button text and allowlist HPath display conform to unified 
   const zh = JSON.parse(await readFile(new URL("../../src/i18n/zh-CN.json", import.meta.url), "utf8"));
   const en = JSON.parse(await readFile(new URL("../../src/i18n/en.json", import.meta.url), "utf8"));
   const panel = await readFile(new URL("../../src/features/image-compressor/ui/ImageSettingsPanel.svelte", import.meta.url), "utf8");
+  const allowlistPaths = await readFile(new URL("../../src/features/image-compressor/services/allowlistPaths.ts", import.meta.url), "utf8");
 
-  assert.equal(zh["settings.resetDraft"], "设为默认值（未保存）");
-  assert.equal(en["settings.resetDraft"], "Reset to defaults (unsaved)");
+  assert.equal(zh["settings.resetDraft"], "恢复默认值");
+  assert.equal(en["settings.resetDraft"], "Restore defaults");
   assert.match(panel, /<strong>\{displayTitle\}<\/strong><small>\{id\}<\/small>/);
-  assert.match(panel, /\/api\/filetree\/getHPathByID/);
+  assert.match(allowlistPaths, /SELECT id, box, hpath/);
+  assert.match(allowlistPaths, /mode:\s*"readonly"/);
+  assert.match(panel, /resolveAllowlistPaths/);
+  assert.doesNotMatch(panel, /meta\.title/);
 });
 
 test("settings navigation features title uses dedicated i18n key in both locales and SettingsRoot", async () => {
@@ -67,7 +95,7 @@ test("settings navigation features title uses dedicated i18n key in both locales
 
 test("SettingsManager load settles all stores and reloadAfterExternalChange preserves core-first order", async () => {
   const p = plugin();
-  const settings = new SettingsManager(p, registrations);
+  const settings = new SettingsManager(p, registrations, createFileGetFetch(p.storage));
   await settings.load();
 
   await p.saveData("feature-text-tools.json", { schemaVersion: 1, replacement: "a" });
@@ -76,17 +104,23 @@ test("SettingsManager load settles all stores and reloadAfterExternalChange pres
 
   const changed = await settings.reloadAfterExternalChange();
   assert.deepEqual(changed, ["core", "imageCompressor", "textTools"]);
+  assert.equal(p.loadDataCalls, 0);
 });
 
 test("SettingsManager.load resolves when stores fail and logs every unreadable store", async () => {
   const p = plugin();
-  p.loadData = async name => {
-    if (name === "omnikit-core.json" || name === "feature-text-tools.json") {
-      throw new Error(`read failed: ${name}`);
+  const baseFetch = createFileGetFetch(p.storage);
+  const fetchFn = async (url, request) => {
+    const { path } = JSON.parse(request.body);
+    if (
+      path === "/data/storage/petal/siyuan-plugin-omnikit/omnikit-core.json" ||
+      path === "/data/storage/petal/siyuan-plugin-omnikit/feature-text-tools.json"
+    ) {
+      throw new Error(`read failed: ${path}`);
     }
-    return "";
+    return baseFetch(url, request);
   };
-  const settings = new SettingsManager(p, registrations);
+  const settings = new SettingsManager(p, registrations, fetchFn);
   const warnings = [];
   const origWarn = console.warn;
   console.warn = (...args) => warnings.push(args.join(" "));
@@ -102,6 +136,7 @@ test("SettingsManager.load resolves when stores fail and logs every unreadable s
   assert.equal(warnings.length, 2);
   assert.match(warnings[0], /omnikit-core\.json/);
   assert.match(warnings[1], /feature-text-tools\.json/);
+  assert.equal(p.loadDataCalls, 0);
 });
 
 test("isPreferenceReliable separates store reliability from getFeatureEnabled preference", async () => {
@@ -116,13 +151,14 @@ test("isPreferenceReliable separates store reliability from getFeatureEnabled pr
   });
   p.storage.set("feature-image-compressor.json", { schemaVersion: 999 });
 
-  const settings = new SettingsManager(p, registrations);
+  const settings = new SettingsManager(p, registrations, createFileGetFetch(p.storage));
   await settings.load();
 
   assert.equal(settings.getFeatureEnabled("imageCompressor", false), true);
   assert.equal(settings.getFeatureEnabled("textTools", false), true);
   assert.equal(settings.isPreferenceReliable("imageCompressor"), false);
   assert.equal(settings.isPreferenceReliable("textTools"), true);
+  assert.equal(p.loadDataCalls, 0);
 });
 
 test("SettingsConflictError carries stable code SETTINGS_CONFLICT", () => {
@@ -138,9 +174,11 @@ test("SettingsRoot preserves recovery guards, UA dirty protection, and describeE
   const { readFile } = await import("node:fs/promises");
   const root = await readFile(new URL("../../src/ui/settings/SettingsRoot.svelte", import.meta.url), "utf8");
 
-  assert.match(root, /disabled=\{busy \|\| coreRecovery \|\| needsFeatureRecovery \|\| !isSupported\}/);
+  assert.match(root, /disabled=\{globalSaving \|\| coreRecovery \|\| needsFeatureRecovery \|\| !isSupported\}/);
   assert.match(root, /data-omnikit-field="user-agent"/);
-  assert.match(root, /uaDirty/);
+  assert.match(root, /coreDirty/);
+  assert.match(root, /coreConflict/);
+  assert.match(root, /discardCoreDraftAndReload/);
   assert.match(root, /preferenceUnreadable/);
   assert.match(root, /runtime\.preferenceUnreadable/);
   assert.match(root, /describeError\(/);

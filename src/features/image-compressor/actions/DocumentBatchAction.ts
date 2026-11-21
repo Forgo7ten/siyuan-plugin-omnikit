@@ -9,6 +9,7 @@ import { resolveImageOccurrence } from "../services/ImageOccurrenceResolver.ts";
 import { blockDOM } from "../services/references.ts";
 import { buildReplacementPath, resolveSource, type ImageSource } from "../policy/source.ts";
 import type { OccurrenceTarget } from "../policy/contracts.ts";
+import { normalizeBlockDOMForCompare, type CommitDetailedResult } from "../services/SafeBlockWriter.ts";
 import { downloadAndUploadRemoteImage } from "./RemoteImageWatcher.ts";
 import { scanDocumentImages, type DocumentImageOccurrence } from "./scanDocumentImages.ts";
 
@@ -17,6 +18,75 @@ export interface BatchActionOptions {
   onProgress?: (progress: CompressionProgress) => void;
   rootID?: string;
   notebook?: string;
+  getAllEditor?: () => unknown[];
+}
+
+interface FlushableEditor {
+  disabled?: boolean;
+  destroyed?: boolean;
+  block?: { rootID?: string };
+  protyle?: {
+    disabled?: boolean;
+    destroyed?: boolean;
+    block?: { rootID?: string };
+  };
+  getInstance?: () => FlushableEditor;
+  flushPendingTransactions?: () => Promise<void>;
+}
+
+async function loadGetAllEditor(): Promise<(() => unknown[]) | undefined> {
+  try {
+    const siyuan = await import("siyuan");
+    return typeof siyuan.getAllEditor === "function" ? siyuan.getAllEditor : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function flushMatchingEditors(
+  targetRootID: string,
+  detailProtyle: FlushableEditor | undefined,
+  context: FeatureContext,
+  options: BatchActionOptions,
+  signal: AbortSignal,
+  scope: FeatureScope,
+): Promise<boolean> {
+  const candidates: Array<{ editor: unknown; requireRootMatch: boolean }> = [];
+  if (detailProtyle) {
+    candidates.push({ editor: detailProtyle, requireRootMatch: false });
+  }
+  const activeEditor = (context as { activeEditor?: unknown }).activeEditor;
+  if (activeEditor) {
+    candidates.push({ editor: activeEditor, requireRootMatch: true });
+  }
+  const getAllEditor = options.getAllEditor ?? await loadGetAllEditor();
+  if (signal.aborted || !scope.active) return false;
+  if (typeof getAllEditor === "function") {
+    for (const editor of getAllEditor()) {
+      candidates.push({ editor, requireRootMatch: true });
+    }
+  }
+
+  const flushed = new Set<object>();
+  for (const { editor, requireRootMatch } of candidates) {
+    if (!editor || typeof editor !== "object") continue;
+    const item = editor as FlushableEditor;
+    const runner = typeof item.getInstance === "function" ? item.getInstance() : item;
+    if (!runner || typeof runner !== "object" || flushed.has(runner)) continue;
+    const meta = runner.protyle ?? item.protyle ?? runner;
+    const editorRootID = meta?.block?.rootID ?? runner.block?.rootID ?? item.block?.rootID;
+    if (requireRootMatch ? editorRootID !== targetRootID : (editorRootID !== undefined && editorRootID !== targetRootID)) {
+      continue;
+    }
+    if (item.disabled || runner.disabled || meta?.disabled || item.destroyed || runner.destroyed || meta?.destroyed) {
+      continue;
+    }
+    if (typeof runner.flushPendingTransactions !== "function") continue;
+    flushed.add(runner);
+    await runner.flushPendingTransactions();
+    if (signal.aborted || !scope.active) return false;
+  }
+  return true;
 }
 
 interface AuthorizedOccurrence { target: OccurrenceTarget; source: ImageSource }
@@ -95,16 +165,8 @@ export async function compressDocumentImages(
   let nestedBlockIds = new Set<string>();
   const scanned: DocumentImageOccurrence[] = [];
   try {
-    const editorRunner = (protyle && typeof protyle.getInstance === "function" ? protyle.getInstance() : protyle) as {
-      disabled?: boolean;
-      destroyed?: boolean;
-      flushPendingTransactions?: () => Promise<void>;
-    } | undefined;
-    if (editorRunner && !protyle?.disabled && !editorRunner.disabled && !editorRunner.destroyed &&
-        typeof editorRunner.flushPendingTransactions === "function") {
-      await editorRunner.flushPendingTransactions();
-      if (signal.aborted || !scope.active) return cancelledSummary(summary);
-    }
+    const flushed = await flushMatchingEditors(verifiedRootID, protyle, context, options, signal, scope);
+    if (!flushed) return cancelledSummary(summary);
     const domRes = await services.kernel.post<any>("/api/block/getBlockDOM", { id: rootID, notebook: targetNotebook }, { signal });
     if (signal.aborted || !scope.active) return cancelledSummary(summary);
     if (domRes.data?.id !== rootID || typeof domRes.data?.dom !== "string" || !domRes.data.dom.trim()) {
@@ -180,6 +242,8 @@ export async function compressDocumentImages(
       report(source.raw);
 
       if (source.kind === "remote") {
+        // 无扩展名远程图床链接由分类器放行后在此下载，并经 assertImagePayload / calibrateRemoteImageFile
+        // 按文件头魔数验证和校准扩展名；若是无扩展名动图或矢量图，本地化后的编码阶段会将其跳过并保留本地原图。
         try {
           const { localPath, file } = await downloadAndUploadRemoteImage(source, verifiedRootID, services, signal);
           const localSource = resolveSource(localPath, services.origin);
@@ -248,10 +312,34 @@ export async function compressDocumentImages(
   report();
 
   const dirtyBlocks = new Set<string>();
+  const expectedBlockDOMs = new Map<string, string>();
+
+  async function commitWithExpected(target: OccurrenceTarget, newPath: string): Promise<CommitDetailedResult> {
+    const detailed = (services.references as {
+      commitOccurrenceDetailed?: (t: OccurrenceTarget, p: string, sig?: AbortSignal) => Promise<CommitDetailedResult>;
+    }).commitOccurrenceDetailed;
+    if (typeof detailed === "function") {
+      return detailed.call(services.references, target, newPath, signal);
+    }
+    return { status: await services.references.commitOccurrence(target, newPath, signal) };
+  }
+
+  function recordBlockWrite(blockID: string, expectedBlockDOM?: string): void {
+    dirtyBlocks.add(blockID);
+    if (expectedBlockDOM !== undefined) {
+      expectedBlockDOMs.set(blockID, expectedBlockDOM);
+    } else {
+      expectedBlockDOMs.delete(blockID);
+    }
+  }
 
   async function refreshIfDirty(target: OccurrenceTarget): Promise<OccurrenceTarget | undefined> {
     if (!dirtyBlocks.has(target.blockID)) return target;
     const freshDOM = await blockDOM(services.kernel, target.blockID, target.notebook, signal);
+    const expectedDOM = expectedBlockDOMs.get(target.blockID);
+    if (expectedDOM !== undefined && normalizeBlockDOMForCompare(freshDOM) !== expectedDOM) {
+      return undefined;
+    }
     return resolveImageOccurrence(freshDOM, {
       rootID: target.rootID,
       notebook: target.notebook,
@@ -281,15 +369,19 @@ export async function compressDocumentImages(
           report(displayRaw);
           continue;
         }
-        const committed = await services.references.commitOccurrence(target, preparedItem.path, signal);
-        if (committed === "replaced") {
+        const committed = await commitWithExpected(target, preparedItem.path);
+        if (committed.status === "replaced") {
           anyReplaced = true;
-          dirtyBlocks.add(target.blockID);
+          recordBlockWrite(target.blockID, committed.expectedBlockDOM);
           recordRewrittenReference(summary, sourceKey, preparedItem.originalBytes, preparedItem.compressedBytes, countedPaths);
-        } else if (committed === "conflict") {
+        } else if (committed.status === "conflict") {
           summary.conflicts++;
           groupHasConflictOrUnknown = true;
-        } else if (committed === "aborted") {
+        } else if (committed.status === "failed") {
+          summary.failed++;
+          groupHasConflictOrUnknown = true;
+          context.logger.warn(`引用写入被内核拒绝：${displayRaw}`);
+        } else if (committed.status === "aborted") {
           return false;
         } else {
           summary.unknown++;
@@ -341,26 +433,39 @@ export async function compressDocumentImages(
             report(source.raw);
             continue;
           }
-          const localized = await services.references.commitOccurrence(target, remotePrepared.localPath, signal);
-          if (localized === "aborted") {
+          const localized = await commitWithExpected(target, remotePrepared.localPath);
+          if (localized.status === "aborted") {
             return cancelledSummary(summary);
           }
-          if (localized === "conflict") {
+          if (localized.status === "conflict") {
             summary.conflicts++;
             summary.completed++;
             report(source.raw);
             continue;
           }
-          if (localized !== "replaced") {
+          if (localized.status === "failed") {
+            summary.failed++;
+            context.logger.warn(`本地原图引用写入被内核拒绝：${source.raw}`);
+            summary.completed++;
+            report(source.raw);
+            continue;
+          }
+          if (localized.status !== "replaced") {
             summary.unknown++;
             context.logger.warn(`本地原图引用写入结果未确认：${source.raw}`);
             summary.completed++;
             report(source.raw);
             continue;
           }
-          dirtyBlocks.add(target.blockID);
+          recordBlockWrite(target.blockID, localized.expectedBlockDOM);
           const expectedLocalPath = buildReplacementPath(target.oldPath, remotePrepared.localPath, services.origin);
           const freshDOM = await blockDOM(services.kernel, target.blockID, target.notebook, signal);
+          if (localized.expectedBlockDOM !== undefined && normalizeBlockDOMForCompare(freshDOM) !== localized.expectedBlockDOM) {
+            summary.conflicts++;
+            summary.completed++;
+            report(source.raw);
+            continue;
+          }
           const recaptured = resolveImageOccurrence(freshDOM, {
             rootID: target.rootID,
             notebook: target.notebook,

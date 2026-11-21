@@ -15,15 +15,16 @@ export function extractStaticFileName(url: string): string | null {
 
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
   const encodedName = parsed.pathname.split("/").at(-1) ?? "";
-  const extension = encodedName.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase();
-  if (!extension || !STATIC_FILE_EXTENSIONS.has(extension)) return null;
-
+  let fileName: string;
   try {
-    const decoded = decodeURIComponent(encodedName).trim();
-    return decoded || encodedName.trim() || null;
+    fileName = decodeURIComponent(encodedName);
   } catch {
-    return encodedName.trim() || null;
+    fileName = encodedName;
   }
+  const trimmed = fileName.trim();
+  const extension = trimmed.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase();
+  if (!extension || !STATIC_FILE_EXTENSIONS.has(extension)) return null;
+  return trimmed || null;
 }
 
 export function isStaticFileUrl(url: string): boolean {

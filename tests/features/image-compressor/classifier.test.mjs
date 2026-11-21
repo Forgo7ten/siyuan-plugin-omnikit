@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classifyImageCandidate } from "../../../src/features/image-compressor/policy/ImageCandidateClassifier.ts";
+import { classifyImageCandidate, extractImageExtension } from "../../../src/features/image-compressor/policy/ImageCandidateClassifier.ts";
+import { BicEncoder } from "../../../src/features/image-compressor/services/image.ts";
+import { AdaptiveImageCompressor } from "../../../src/features/image-compressor/similarity/AdaptiveImageCompressor.ts";
+import { defaultImageFeatureConfig } from "../../../src/features/image-compressor/policy/parseImageConfig.ts";
 
 const excluded = ["gif", "svg", "webp"];
 
@@ -172,4 +175,43 @@ test("classifyImageCandidate normalizes URL query, fragment, and backslashes", (
   });
   assert.equal(winRes.eligible, true);
   assert.equal(winRes.extension, "jpg");
+});
+
+test("I-09: extractImageExtension handles extensionless paths with dots in parent dir and trailing dots", () => {
+  assert.equal(extractImageExtension("dir.v1/avatar"), "");
+  assert.equal(extractImageExtension("assets/photo."), "");
+  assert.equal(extractImageExtension("https://cdn.example/v1.0/avatar?format=webp#img"), "");
+  assert.equal(extractImageExtension("assets\\sub.dir\\Photo.WEBP?width=100"), "webp");
+});
+
+test("I-09: BicEncoder and AdaptiveImageCompressor skip extensionless WebP when disallowed by mode/smartEnabled", async () => {
+  const staticWebpBytes = new Uint8Array(48);
+  const view = new DataView(staticWebpBytes.buffer);
+  staticWebpBytes.set(Buffer.from("RIFF"), 0); view.setUint32(4, 40, true); staticWebpBytes.set(Buffer.from("WEBP"), 8);
+  staticWebpBytes.set(Buffer.from("VP8X"), 12); view.setUint32(16, 10, true);
+  staticWebpBytes[24] = 99; staticWebpBytes[27] = 99;
+  staticWebpBytes.set(Buffer.from("VP8 "), 30); view.setUint32(34, 10, true);
+  staticWebpBytes.set([0x9d, 0x01, 0x2a], 41);
+  view.setUint16(44, 100, true); view.setUint16(46, 100, true);
+  const extensionlessWebp = new Blob([staticWebpBytes], { type: "image/webp" });
+
+  const cfg = defaultImageFeatureConfig();
+  cfg.compression.minInputBytes = 0;
+  cfg.compression.minSavingBytes = 0;
+  cfg.compression.minSavingRatio = 0;
+  cfg.compression.smartEnabled = false;
+
+  const bic = new BicEncoder(
+    async () => { throw new Error("Must not invoke encoder for disallowed extensionless WebP"); },
+    "worker.js",
+    async () => ({ width: 100, height: 100 }),
+  );
+  const adaptive = new AdaptiveImageCompressor(bic);
+
+  for (const mode of ["auto", "document"]) {
+    const resBic = await bic.encode(extensionlessWebp, "dir.v1/avatar", cfg, undefined, undefined, mode);
+    assert.deepEqual(resBic, { kind: "skipped", reason: "protected-extension" });
+    const resAdaptive = await adaptive.encode(extensionlessWebp, "dir.v1/avatar", cfg, undefined, undefined, mode);
+    assert.deepEqual(resAdaptive, { kind: "skipped", reason: "protected-extension" });
+  }
 });

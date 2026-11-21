@@ -14,18 +14,20 @@ const source = await readFile(fileUrl, "utf8");
 const baseFeatureUrl = new URL("../../../src/core/framework/BaseFeature.ts", import.meta.url).href;
 const translateUrl = new URL("../../../src/i18n/translate.ts", import.meta.url).href;
 const controllerUrl = new URL("../../../src/features/titled-link/TitledLinkController.ts", import.meta.url).href;
+const pasteLinkCaptureUrl = new URL("../../../src/features/titled-link/services/PasteLinkCapture.ts", import.meta.url).href;
 const platformUrl = new URL("../../../src/core/host/Platform.ts", import.meta.url).href;
 const protyleAdapterUrl = new URL("../../../src/core/host/ProtyleAdapter.ts", import.meta.url).href;
 const domUrl = new URL("../../../src/core/host/dom.ts", import.meta.url).href;
 
 const runnable = stripTypeScriptTypes(source
-  .replace(/import\s*\{[^}]*\}\s*from\s*"siyuan";/, 'const getFrontend = () => "desktop"; const showMessage = () => {};')
+  .replace(/import\s*\{[^}]*\}\s*from\s*"siyuan";/, 'const showMessage = () => {}; const getAllEditor = () => globalThis.__omnikitTestGetAllEditor?.() ?? [];')
   .replace(/import\s*\{\s*KernelClient\s*\}\s*from\s*["'][^"']+["'];?/, 'class KernelClient { post() { return Promise.resolve({ data: {} }); } }')
   .replace(/from\s*["'][^"']*BaseFeature\.ts["']/, `from "${baseFeatureUrl}"`)
   .replace(/from\s*["'][^"']*Platform\.ts["']/, `from "${platformUrl}"`)
   .replace(/from\s*["'][^"']*ProtyleAdapter\.ts["']/, `from "${protyleAdapterUrl}"`)
   .replace(/from\s*["'][^"']*dom\.ts["']/, `from "${domUrl}"`)
   .replace(/from\s*["'][^"']*translate\.ts["']/, `from "${translateUrl}"`)
+  .replace(/from\s*["'][^"']*PasteLinkCapture\.ts["']/, `from "${pasteLinkCaptureUrl}"`)
   .replace(/from\s*["'][^"']*TitledLinkController\.ts["']/g, `from "${controllerUrl}"`)
 );
 
@@ -77,8 +79,8 @@ test("feature lifecycle activates event listeners, contributes menus, and dispos
   await feature.activate(mockContext);
   assert.equal(feature.status, "enabled");
 
-  // Verify event listeners were registered
-  assert.equal(events.get("paste")?.size, 1);
+  // Verify event listeners were registered (uses native capture paste instead of eventBus paste)
+  assert.equal(events.get("paste"), undefined);
   assert.equal(events.get("loaded-protyle-static")?.size, 1);
   assert.equal(events.get("switch-protyle")?.size, 1);
   assert.equal(events.get("destroy-protyle")?.size, 1);
@@ -107,7 +109,6 @@ test("feature lifecycle activates event listeners, contributes menus, and dispos
   // Deactivate feature and verify cleanup
   await feature.deactivate();
   assert.equal(feature.status, "disabled");
-  assert.equal(events.get("paste")?.size, 0);
   assert.equal(events.get("loaded-protyle-static")?.size, 0);
   assert.equal(events.get("switch-protyle")?.size, 0);
   assert.equal(events.get("destroy-protyle")?.size, 0);
@@ -182,6 +183,7 @@ function createFakeHTMLElement() {
   const el = Object.create(HTMLElement.prototype);
   el.isConnected = true;
   el.tagName = "DIV";
+  el.contains = () => true;
   el.addEventListener = (type, fn, opts) => listeners.push({ type, fn, opts });
   el.removeEventListener = (type, fn, opts) => removed.push({ type, fn, opts });
   el.dispatchCapture = (type) => {
@@ -195,18 +197,49 @@ function createFakeHTMLElement() {
   return { el, listeners, removed };
 }
 
-test("IME tracking registers capture-phase listeners, isolates split-pane editors, ignores detached editors, and expires stale composition", async () => {
+test("IME tracking and paste capture register existing editors via getAllEditor, deduplicate, and clean up on destroy/deactivate", async () => {
   let currentNow = 1_000;
   const { mockPlugin, mockSettings, mockContext } = createEditorHost();
   const feature = new TitledLinkFeature(mockPlugin, mockSettings, { now: () => currentNow });
-  await feature.activate(mockContext);
+
+  const existingRoot = createFakeHTMLElement();
+  const existingWysiwyg = createFakeHTMLElement();
+  const existingProtyle = {
+    protyle: {
+      element: existingRoot.el,
+      wysiwyg: { element: existingWysiwyg.el },
+    },
+  };
+
+  globalThis.__omnikitTestGetAllEditor = () => [existingProtyle];
+  try {
+    await feature.activate(mockContext);
+  } finally {
+    delete globalThis.__omnikitTestGetAllEditor;
+  }
+
+  // getAllEditor attached both composition tracking (on .element) and capture paste (on wysiwyg.element)
+  assert.deepEqual(existingRoot.listeners.map(l => [l.type, l.opts]), [
+    ["compositionstart", { capture: true }],
+    ["compositionend", { capture: true }],
+  ]);
+  assert.deepEqual(existingWysiwyg.listeners.map(l => [l.type, l.opts]), [
+    ["paste", { capture: true }],
+  ]);
+
+  // Emitting switch-protyle for the same wysiwyg.element must not attach duplicate paste listeners
+  mockPlugin.eventBus.emit("switch-protyle", { protyle: existingProtyle.protyle });
+  assert.equal(existingWysiwyg.listeners.length, 1);
 
   const editorA = createFakeHTMLElement();
+  const wysiwygA = createFakeHTMLElement();
   const editorB = createFakeHTMLElement();
-  mockPlugin.eventBus.emit("loaded-protyle-static", { protyle: { element: editorA.el } });
-  mockPlugin.eventBus.emit("switch-protyle", { protyle: { element: editorB.el } });
+  const wysiwygB = createFakeHTMLElement();
+  mockPlugin.eventBus.emit("loaded-protyle-static", { protyle: { element: editorA.el, wysiwyg: { element: wysiwygA.el } } });
+  mockPlugin.eventBus.emit("switch-protyle", { protyle: { element: editorB.el, wysiwyg: { element: wysiwygB.el } } });
 
   assert.equal(editorA.listeners.length, 2);
+  assert.equal(wysiwygA.listeners.length, 1);
   assert.deepEqual(editorA.listeners.map(l => [l.type, l.opts]), [
     ["compositionstart", { capture: true }],
     ["compositionend", { capture: true }],
@@ -235,16 +268,25 @@ test("IME tracking registers capture-phase listeners, isolates split-pane editor
   assert.equal(isComposing({ element: editorA.el }), false);
 
   // destroy-protyle removes listeners with { capture: true } and clears map entry
-  mockPlugin.eventBus.emit("destroy-protyle", { protyle: { element: editorA.el } });
+  mockPlugin.eventBus.emit("destroy-protyle", { protyle: { element: editorA.el, wysiwyg: { element: wysiwygA.el } } });
   assert.deepEqual(editorA.removed.map(l => [l.type, l.opts]), [
     ["compositionstart", { capture: true }],
     ["compositionend", { capture: true }],
+  ]);
+  assert.deepEqual(wysiwygA.removed.map(l => [l.type, l.opts]), [
+    ["paste", { capture: true }],
   ]);
 
   await feature.deactivate();
   assert.deepEqual(editorB.removed.map(l => [l.type, l.opts]), [
     ["compositionstart", { capture: true }],
     ["compositionend", { capture: true }],
+  ]);
+  assert.deepEqual(wysiwygB.removed.map(l => [l.type, l.opts]), [
+    ["paste", { capture: true }],
+  ]);
+  assert.deepEqual(existingWysiwyg.removed.map(l => [l.type, l.opts]), [
+    ["paste", { capture: true }],
   ]);
 });
 

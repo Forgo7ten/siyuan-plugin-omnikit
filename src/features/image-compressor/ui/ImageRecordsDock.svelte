@@ -13,6 +13,7 @@
     type UnsupportedReferenceItem,
   } from "../services/ImageReferences.ts";
   import { resolveImageOccurrence } from "../services/ImageOccurrenceResolver.ts";
+  import { buildExpectedBlockDOM, normalizeBlockDOMForCompare } from "../services/SafeBlockWriter.ts";
   import { findLinkCandidates } from "../policy/dom.ts";
   import { sameAsset, trySource } from "../policy/source.ts";
   import type { FeatureContext } from "../../../core/framework/FeatureContext.ts";
@@ -144,9 +145,8 @@
         const compChanged = prevByOriginal.get(record.originalPath) !== record.compressedPath || !prevKeys.has(record.compressedPath);
         if (origNew || compChanged) {
           changedRecords.push(record);
-          const isRecent = Date.now() - record.updatedAt < 300_000;
-          if (origNew) nextStatuses[record.originalPath] = isRecent ? "present" : "unknown";
-          if (compChanged) nextStatuses[record.compressedPath] = isRecent ? "present" : "unknown";
+          if (origNew) nextStatuses[record.originalPath] = "checking";
+          if (compChanged) nextStatuses[record.compressedPath] = "checking";
         }
       }
       assetStatuses = nextStatuses;
@@ -300,7 +300,14 @@
     await store.markOperation(record.originalPath, record.compressedPath, nextOp).catch(() => undefined);
   }
 
-  function resolveRefreshedTarget(dom: string, previous: OccurrenceTarget): OccurrenceTarget | undefined {
+  function resolveRefreshedTarget(
+    dom: string,
+    previous: OccurrenceTarget,
+    expectedBlockDOM?: string,
+  ): OccurrenceTarget | undefined {
+    if (expectedBlockDOM !== undefined && normalizeBlockDOMForCompare(dom) !== expectedBlockDOM) {
+      return undefined;
+    }
     if (previous.kind !== "link") {
       return resolveImageOccurrence(dom, {
         rootID: previous.rootID,
@@ -353,6 +360,7 @@
       let changed = 0;
       let conflicts = 0;
       const dirtyBlocks = new Set<string>();
+      const expectedBlockDOMs = new Map<string, string>();
 
       for (const item of items) {
         if (signal?.aborted) return;
@@ -363,7 +371,7 @@
         let target = item.target;
         if (dirtyBlocks.has(target.blockID)) {
           const freshDOM = await blockDOM(kernel, target.blockID, target.notebook, signal);
-          const refreshed = resolveRefreshedTarget(freshDOM, target);
+          const refreshed = resolveRefreshedTarget(freshDOM, target, expectedBlockDOMs.get(target.blockID));
           if (!refreshed) {
             conflicts++;
             continue;
@@ -375,6 +383,12 @@
         if (res === "replaced") {
           changed++;
           dirtyBlocks.add(target.blockID);
+          const expected = buildExpectedBlockDOM(target, nextPath, origin);
+          if (expected !== undefined) {
+            expectedBlockDOMs.set(target.blockID, expected);
+          } else {
+            expectedBlockDOMs.delete(target.blockID);
+          }
         } else {
           conflicts++;
         }
@@ -511,8 +525,8 @@
   {:else}
     <ul class="image-records__list">
       {#each records as record (record.originalPath)}
-        {@const origStatus = assetStatuses[record.originalPath] ?? "unknown"}
-        {@const compStatus = assetStatuses[record.compressedPath] ?? "unknown"}
+        {@const origStatus = assetStatuses[record.originalPath] ?? "checking"}
+        {@const compStatus = assetStatuses[record.compressedPath] ?? "checking"}
         <li class="image-records__card">
           <div class="image-records__card-preview">
             <img

@@ -181,6 +181,15 @@ function stripRenderOnlyAttributes(root: HTMLElement): void {
   }
 }
 
+/** Remove kernel volatile attributes (parent-heading and updated) on verification copies only. */
+function stripKernelVolatileAttributes(root: HTMLElement): void {
+  stripRenderOnlyAttributes(root);
+  root.removeAttribute("updated");
+  for (const element of root.querySelectorAll<HTMLElement>("[updated]")) {
+    element.removeAttribute("updated");
+  }
+}
+
 function abortAwareDelay(ms: number, signal?: AbortSignal): Promise<boolean> {
   if (signal?.aborted) return Promise.resolve(false);
   return new Promise(resolve => {
@@ -256,7 +265,7 @@ async function commitInactiveTitles(
   const failed = () => mapActive("failed");
   const unknown = () => mapActive("unknown");
   const aborted = () => updates.map(() => "aborted" as LinkWriteResult);
-  if (!options.kernel) return conflict();
+  if (!options.kernel) return failed();
   if (updates.every(u => !isUpdateCurrent(u, options))) {
     return updates.map(() => "superseded");
   }
@@ -270,9 +279,13 @@ async function commitInactiveTitles(
       ...(first.notebook ? { notebook: first.notebook } : {}),
     }, { signal: options.signal, timeout: 30_000 });
     if (infoRes && "code" in infoRes && infoRes.code !== undefined && infoRes.code !== 0) {
-      return conflict();
+      return failed();
     }
-    if (infoRes?.data?.rootID !== first.rootID || (first.notebook && infoRes?.data?.box !== first.notebook)) {
+    if (!infoRes?.data || typeof infoRes.data.rootID !== "string" || !infoRes.data.rootID ||
+        (first.notebook && (typeof infoRes.data.box !== "string" || !infoRes.data.box))) {
+      return failed();
+    }
+    if (infoRes.data.rootID !== first.rootID || (first.notebook && infoRes.data.box !== first.notebook)) {
       return conflict();
     }
     if (updates.every(u => !isUpdateCurrent(u, options))) {
@@ -283,18 +296,21 @@ async function commitInactiveTitles(
       id: first.blockID,
       notebook: first.notebook,
     }, { signal: options.signal });
-    if (response?.data?.id !== first.blockID || typeof response?.data?.dom !== "string") {
-      return conflict();
+    if (response && "code" in response && response.code !== undefined && response.code !== 0) {
+      return failed();
+    }
+    if (response?.data?.id !== first.blockID || typeof response?.data?.dom !== "string" || !response.data.dom) {
+      return failed();
     }
     if (updates.every(u => !isUpdateCurrent(u, options))) {
       return updates.map(() => "superseded");
     }
     const block = parseBlockFromDOM(response.data.dom, first.blockID);
-    if (!block) return conflict();
+    if (!block) return failed();
     stripRenderOnlyAttributes(block);
     if (first.originalBlockHTML !== undefined) {
       const baseline = parseBlockFromDOM(first.originalBlockHTML, first.blockID);
-      if (!baseline) return conflict();
+      if (!baseline) return failed();
       stripRenderOnlyAttributes(baseline);
       if (baseline.outerHTML !== block.outerHTML) return conflict();
     }
@@ -343,8 +359,13 @@ async function commitInactiveTitles(
     if (options.signal?.aborted || (error as { name?: string })?.name === "AbortError") {
       return aborted();
     }
-    return conflict();
+    return failed();
   }
+
+  const mapPostResults = (activeValue: LinkWriteResult) =>
+    results.map((result, index) =>
+      result === "superseded" || !isUpdateCurrent(updates[index], options) ? "superseded" : activeValue,
+    );
 
   try {
     const updateRes = await options.kernel.post<{ code?: number }>("/api/block/updateBlock", {
@@ -359,7 +380,8 @@ async function commitInactiveTitles(
     }
     return results;
   } catch (error) {
-    if ((error as { outcome?: string })?.outcome === "not-sent") {
+    const outcome = (error as { outcome?: string })?.outcome;
+    if (outcome === "not-sent" || outcome === "rejected") {
       return failed();
     }
     if (options.signal?.aborted) {
@@ -370,38 +392,39 @@ async function commitInactiveTitles(
         id: first.blockID,
         notebook: first.notebook,
       }, { signal: options.signal, timeout: 10_000 });
-      if (verifyRes?.data?.id !== first.blockID || typeof verifyRes?.data?.dom !== "string") {
-        return unknown();
+      if (verifyRes && "code" in verifyRes && verifyRes.code !== undefined && verifyRes.code !== 0) {
+        return mapPostResults("unknown");
+      }
+      if (verifyRes?.data?.id !== first.blockID || typeof verifyRes?.data?.dom !== "string" || !verifyRes.data.dom) {
+        return mapPostResults("unknown");
       }
       const latestBlock = parseBlockFromDOM(verifyRes.data.dom, first.blockID);
-      if (!latestBlock) return unknown();
-      stripRenderOnlyAttributes(latestBlock);
-      if (latestBlock.outerHTML === expectedHTML) {
+      const expectedBlock = parseBlockFromDOM(expectedHTML, first.blockID);
+      if (!latestBlock || !expectedBlock) return mapPostResults("unknown");
+      stripKernelVolatileAttributes(latestBlock);
+      stripKernelVolatileAttributes(expectedBlock);
+      if (latestBlock.outerHTML === expectedBlock.outerHTML) {
         return results;
       }
 
-      const latestLinks = linkElements(latestBlock);
-      let allHaveTargetTitle = true;
-      let allStillMatchBaseline = true;
-      for (let i = 0; i < updates.length; i++) {
-        if (results[i] !== "updated") continue;
-        const { target, title } = updates[i];
-        const latestLink = latestLinks[target.ordinal];
-        if (!latestLink || isInsideProtectedContainer(latestLink) || latestLink.getAttribute("data-href") !== target.originalHref) {
-          return conflict();
+      if (first.originalBlockHTML !== undefined) {
+        const baselineBlock = parseBlockFromDOM(first.originalBlockHTML, first.blockID);
+        if (baselineBlock) {
+          stripKernelVolatileAttributes(baselineBlock);
+          if (latestBlock.outerHTML === baselineBlock.outerHTML) {
+            return results.map((result, index) =>
+              result === "superseded" || !isUpdateCurrent(updates[index], options)
+                ? "superseded"
+                : result === "unchanged"
+                  ? "unchanged"
+                  : "unknown",
+            );
+          }
         }
-        const matchesTarget = (latestLink.textContent ?? "") === title &&
-          (!options.replaceTitle || latestLink.getAttribute("data-title") === title);
-        const matchesBaseline = (latestLink.textContent ?? "") === target.originalText &&
-          latestLink.getAttribute("data-title") === target.originalTitle;
-        if (!matchesTarget) allHaveTargetTitle = false;
-        if (!matchesBaseline) allStillMatchBaseline = false;
       }
-      if (allHaveTargetTitle) return results;
-      if (allStillMatchBaseline) return failed();
-      return conflict();
+      return mapPostResults("conflict");
     } catch {
-      return unknown();
+      return mapPostResults("unknown");
     }
   }
 }
@@ -539,7 +562,7 @@ export async function commitLinkTitles(
             restoreCollapsedCaretOffset(target.linkElement!, capturedCaret.offset);
           }
         }
-        return updates.map((u) => options.signal?.aborted ? "aborted" : isUpdateCurrent(u, options) ? "conflict" : "superseded");
+        return updates.map((u) => !isUpdateCurrent(u, options) ? "superseded" : options.signal?.aborted ? "aborted" : "failed");
       }
     });
   } catch (error) {

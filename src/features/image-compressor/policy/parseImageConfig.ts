@@ -6,7 +6,7 @@ export const NODE_ID = /^\d{14}-[a-z0-9]{7}$/;
 /** Runtime limits remain part of the validated in-memory config. */
 export interface ImageConfig {
   schemaVersion: 2;
-  auto: { globalEnabled: boolean; pageAllowlist: Record<string, { grantedAt: number; title: string }> };
+  auto: { globalEnabled: boolean; pageAllowlist: Record<string, PagePermission> };
   compression: {
     initialQuality: number; manualMaxEdge: number;
     minInputBytes: number; minSavingBytes: number; minSavingRatio: number;
@@ -22,7 +22,7 @@ export interface ImageConfig {
 }
 
 export type ImageFeatureConfig = ImageConfig;
-export interface PagePermission { grantedAt: number; title: string }
+export interface PagePermission { grantedAt: number }
 export class UnsupportedConfigError extends Error {}
 
 const runtimeDefaults = () => ({
@@ -80,8 +80,7 @@ export function parseImageConfig(raw: unknown): ImageConfig {
   for (const [id, value] of Object.entries(pages)) {
     if (!NODE_ID.test(id)) throw new Error("Invalid document ID");
     const p = object(value, "permission");
-    if (typeof p.title !== "string" || p.title.length > 512) throw new Error("Invalid title");
-    pageAllowlist[id] = { grantedAt: number(p.grantedAt, "grantedAt", 0, Number.MAX_SAFE_INTEGER, true), title: p.title };
+    pageAllowlist[id] = { grantedAt: number(p.grantedAt, "grantedAt", 0, Number.MAX_SAFE_INTEGER, true) };
   }
   if (metadata.preserveExif !== false) throw new Error("EXIF preservation is not supported");
   if (!Array.isArray(c.excludedExtensions) || c.excludedExtensions.some(v => typeof v !== "string" || !/^[a-z0-9]+$/.test(v))) throw new Error("Invalid excludedExtensions");

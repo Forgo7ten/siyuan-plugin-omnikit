@@ -29,7 +29,7 @@ test('automatic candidates use only global authorization or the exact page allow
   assert.equal(addedRemoteCandidates(new Map(), current, config(), rootID).length, 1);
   const disabled = config(); disabled.auto.globalEnabled = false;
   assert.equal(addedRemoteCandidates(new Map(), current, disabled, rootID).length, 0);
-  disabled.auto.pageAllowlist[rootID] = { grantedAt: 1, title: 'authorized' };
+  disabled.auto.pageAllowlist[rootID] = { grantedAt: 1 };
   assert.equal(addedRemoteCandidates(new Map(), current, disabled, rootID).length, 1);
   assert.equal(addedRemoteCandidates(new Map(), current, config(), 'invalid').length, 0);
 

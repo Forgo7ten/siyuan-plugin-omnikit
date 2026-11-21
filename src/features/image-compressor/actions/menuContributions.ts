@@ -11,7 +11,7 @@ export interface ImageMenuDeps {
   context: FeatureContext;
   t: (key: string, values?: Record<string, string | number>) => string;
   icon: string;
-  label: (ctx: MenuContext) => string;
+  isAllowlisted: (ctx: MenuContext) => boolean;
   compressQuick: (ctx: MenuContext) => Promise<void>;
   compressCustom: (ctx: MenuContext) => Promise<void>;
   toggleDocument: (ctx: MenuContext) => Promise<void>;
@@ -25,17 +25,18 @@ export interface ImageMenuContribution {
 }
 
 /**
- * @design Menu providers are pure and synchronous: labels come from the cached settings
- * tree, while reading/compressing/uploading only starts inside `run()`.
+ * @design Menu providers are pure and synchronous: whitelist state comes from the cached
+ * settings tree, while reading/compressing/uploading only starts inside `run()`.
  * @invariant All providers are registered through the feature scope by the caller.
  */
 export function imageMenuContributions(deps: ImageMenuDeps): ImageMenuContribution[] {
-  const toggle = (ctx: MenuContext) => [{
+  const toggle = (ctx: MenuContext) => (ctx.rootID ? [{
     id: "toggle-document",
-    label: deps.label(ctx),
+    label: deps.t("menu.whitelistDocument"),
     icon: deps.icon,
+    checked: deps.isAllowlisted(ctx),
     run: () => deps.toggleDocument(ctx),
-  }];
+  }] : []);
 
   return [
     {
@@ -67,7 +68,7 @@ export function imageMenuContributions(deps: ImageMenuDeps): ImageMenuContributi
     {
       location: "doc-tree",
       id: "toggle-document",
-      provider: ctx => (ctx.rootID ? toggle(ctx) : []),
+      provider: toggle,
     },
     {
       location: "doc-tree",
@@ -82,7 +83,7 @@ export function imageMenuContributions(deps: ImageMenuDeps): ImageMenuContributi
     {
       location: "topbar",
       id: "toggle-document",
-      provider: ctx => (ctx.rootID ? toggle(ctx) : []),
+      provider: toggle,
     },
     {
       location: "topbar",

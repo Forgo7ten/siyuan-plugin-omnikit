@@ -56,7 +56,8 @@ test("ImageController does not abort on switch-protyle/destroy-protyle, uses cre
 
   assert.doesNotMatch(featureSrc, /protected onDisable\(\): void \{\s*this\.tasks\.cancelAll\("Feature disabled"\);\s*\}/);
   assert.match(featureSrc, /resolveDocument\(menu\.rootID, ctx\.logger, notebookId, scope\.signal\)/);
-  assert.match(featureSrc, /resolveDocumentTitle\(this\.kernel, menu\.rootID/);
+  assert.doesNotMatch(featureSrc, /resolveDocumentTitle/);
+  assert.match(featureSrc, /this\.pages\.toggle\(menu\.rootID\)/);
 
   // mountDialog distinguishes programmatic close from user dismissal
   assert.match(uiSrc, /closingByController/);

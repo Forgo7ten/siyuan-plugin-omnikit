@@ -21,6 +21,8 @@ export interface RemoteWatcherHandle {
 
 const MAX_REMOTE_BATCH_SIZE = 20;
 
+// 无扩展名远程图床链接会经分类器放行，在此下载后由 assertImagePayload 与 calibrateRemoteImageFile
+// 按文件头魔数验证并校准扩展名；若是无扩展名的远程动图或矢量图，将在本地化后的压缩/格式检查阶段跳过。
 export async function downloadAndUploadRemoteImage(
   source: Extract<ImageSource, { kind: "remote" }>,
   rootID: string,
@@ -214,6 +216,10 @@ export async function watchRemoteImages(
       // Localization is a standalone commit. Even unsupported/too-small images remain
       // safely referenced by their local original if later compression is skipped.
       const localized = await services.references.commitOccurrence(target, localOriginal, task.signal);
+      if (localized === "failed") {
+        logger.warn("自动本地化外链图片被内核拒绝", { blockID: target.blockID, path: localOriginal });
+        return;
+      }
       if (localized !== "replaced" || !scope.active || task.signal.aborted) return;
 
       const refreshedDOM = await blockDOM(services.kernel, target.blockID, target.notebook, task.signal);

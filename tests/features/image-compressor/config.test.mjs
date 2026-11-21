@@ -59,16 +59,22 @@ test("validates smartEnabled and targetSimilarity bounds", () => {
   rejects(c => { c.compression.targetSimilarity = 1.0; }, "targetSimilarity upper bound");
 });
 
-test("image config validates complete grouped settings and document permissions", () => {
+test("image config validates complete grouped settings and document permissions without persisting title", () => {
   const config = valid();
-  config.auto.pageAllowlist[rootID] = { grantedAt: 0, title: "" };
+  config.auto.pageAllowlist[rootID] = { grantedAt: 0 };
   config.compression.manualMaxEdge = 8192;
   assert.deepEqual(parseImageConfig(config), config);
+
+  const legacyWithTitle = valid();
+  legacyWithTitle.auto.pageAllowlist[rootID] = { grantedAt: 123, title: "Legacy Document Title" };
+  const parsedLegacy = parseImageConfig(legacyWithTitle);
+  assert.deepEqual(parsedLegacy.auto.pageAllowlist[rootID], { grantedAt: 123 });
+  assert.equal("title" in parsedLegacy.auto.pageAllowlist[rootID], false);
+
   for (const id of ["20250101000000-ABCDEFG", "20250101000000-abcdefg_", "2025010100000-abcdefg"]) {
-    rejects(c => { c.auto.pageAllowlist[id] = { grantedAt: 1, title: "" }; }, id);
+    rejects(c => { c.auto.pageAllowlist[id] = { grantedAt: 1 }; }, id);
   }
-  rejects(c => { c.auto.pageAllowlist[rootID] = { grantedAt: -1, title: "" }; }, "negative timestamp");
-  rejects(c => { c.auto.pageAllowlist[rootID] = { grantedAt: 1, title: 7 }; }, "title type");
+  rejects(c => { c.auto.pageAllowlist[rootID] = { grantedAt: -1 }; }, "negative timestamp");
 });
 
 test("compression options enforce numeric bounds and complete schema", () => {

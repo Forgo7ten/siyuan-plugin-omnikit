@@ -204,3 +204,147 @@ test("compressDocumentImages flushes pending transactions and localizes remote i
     globalThis.HTMLElement = prevHTMLElement;
   }
 });
+
+test("I-15 + I-04 + I-07: flushes all active matching editors, verifies expectedBlockDOM on dirty blocks, and counts failed writes", async () => {
+  const prevDOMParser = globalThis.DOMParser;
+  const prevDocument = globalThis.document;
+  try {
+    const rootID = id(20);
+    const otherRootID = id(21);
+    const blockID = id(22);
+    const flushOrder = [];
+    const docDOM = `<div data-node-id="${rootID}"><div data-node-id="${blockID}"><img src="assets/a.png"/><img src="assets/b.png"/></div></div>`;
+    let currentBlockDOM = `<div data-node-id="${blockID}"><img src="assets/a.png"/><img src="assets/b.png"/></div>`;
+
+    const makeImg = src => ({
+      closest: sel => sel === "[data-node-id]" ? makeBlock(currentBlockDOM) : null,
+      hasAttribute: name => name === "src",
+      getAttribute: name => name === "src" ? src : null,
+    });
+    const makeBlock = html => {
+      const srcs = [...html.matchAll(/src="([^"]+)"/g)].map(m => m[1]);
+      return {
+        getAttribute: name => name === "data-node-id" ? blockID : null,
+        removeAttribute() {},
+        querySelector: () => null,
+        querySelectorAll: sel => sel === "img" ? srcs.map(makeImg) : [],
+        outerHTML: html,
+      };
+    };
+
+    globalThis.DOMParser = class {
+      parseFromString(html) {
+        const srcs = [...html.matchAll(/src="([^"]+)"/g)].map(m => m[1]);
+        const imgs = srcs.map(makeImg);
+        return {
+          querySelector: () => null,
+          querySelectorAll: sel => sel === "img" ? imgs : sel === "[data-node-id]" ? [makeBlock(html)] : [],
+        };
+      }
+    };
+    globalThis.document = {
+      createElement: () => ({
+        _html: "",
+        set innerHTML(val) { this._html = val; },
+        get content() {
+          return { children: [makeBlock(this._html)], querySelectorAll: () => [] };
+        },
+      }),
+    };
+
+    const { compressDocumentImages } = await import("../../../src/features/image-compressor/actions/DocumentBatchAction.ts");
+    const sharedPrimary = {
+      protyle: { block: { rootID }, disabled: false },
+      flushPendingTransactions: async () => { flushOrder.push("primary"); },
+    };
+    const secondary = {
+      protyle: { block: { rootID }, disabled: false },
+      flushPendingTransactions: async () => { flushOrder.push("secondary"); },
+    };
+    const destroyed = {
+      destroyed: true,
+      protyle: { block: { rootID }, disabled: false },
+      flushPendingTransactions: async () => { flushOrder.push("destroyed"); },
+    };
+    const otherDoc = {
+      protyle: { block: { rootID: otherRootID }, disabled: false },
+      flushPendingTransactions: async () => { flushOrder.push("other"); },
+    };
+
+    const markOps = [];
+    const services = {
+      origin: "http://localhost:6806",
+      mobile: true,
+      config: () => defaultImageFeatureConfig(),
+      kernel: {
+        post: async (path, body) => {
+          if (path === "/api/block/getBlockInfo") return { code: 0, data: { id: rootID, rootID, box: "nb-1", type: "d" } };
+          if (path === "/api/block/getBlockDOM") {
+            return { code: 0, data: { id: body.id, dom: body.id === rootID ? docDOM : currentBlockDOM } };
+          }
+          throw new Error(path);
+        },
+      },
+      compressOccurrence: async (target) => ({
+        status: "saved",
+        path: target.oldPath.includes("a.png") ? "assets/a.webp" : "assets/b.webp",
+        reference: "not-requested",
+        originalBytes: 100,
+        compressedBytes: 50,
+      }),
+      references: {
+        commitOccurrenceDetailed: async (target, newPath) => {
+          if (newPath === "assets/a.webp") {
+            // Simulate concurrent external text edit in the same block after commit
+            currentBlockDOM = `<div data-node-id="${blockID}" data-tampered="1"><img src="assets/a.webp"/><img src="assets/b.png"/></div>`;
+            return {
+              status: "replaced",
+              expectedBlockDOM: `<div data-node-id="${blockID}"><img src="assets/a.webp"/><img src="assets/b.png"/></div>`,
+            };
+          }
+          return { status: "failed" };
+        },
+      },
+      records: {
+        markOperation: async (orig, comp, status) => { markOps.push({ orig, comp, status }); },
+      },
+    };
+
+    const summary = await compressDocumentImages(
+      { protyle: { block: { rootID, box: "nb-1" }, getInstance: () => sharedPrimary } },
+      { logger: { warn() {}, debug() {} } },
+      { active: true, signal: new AbortController().signal },
+      services,
+      {
+        rootID,
+        notebook: "nb-1",
+        getAllEditor: () => [sharedPrimary, secondary, destroyed, otherDoc],
+      },
+    );
+
+    assert.deepEqual(flushOrder, ["primary", "secondary"]);
+    assert.equal(summary.succeeded, 1);
+    assert.equal(summary.conflicts, 1);
+    assert.equal(summary.failed, 0);
+
+    // Also verify failed write increments summary.failed
+    const servicesFail = {
+      ...services,
+      references: {
+        commitOccurrenceDetailed: async () => ({ status: "failed" }),
+      },
+    };
+    const failSummary = await compressDocumentImages(
+      {},
+      { logger: { warn() {}, debug() {} } },
+      { active: true, signal: new AbortController().signal },
+      servicesFail,
+      { rootID, notebook: "nb-1" },
+    );
+    assert.equal(failSummary.failed, 2);
+    assert.equal(markOps.some(m => m.status === "incomplete"), true);
+  } finally {
+    globalThis.DOMParser = prevDOMParser;
+    globalThis.document = prevDocument;
+  }
+});

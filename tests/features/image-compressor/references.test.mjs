@@ -75,3 +75,70 @@ test("ReferenceService.commitOccurrence delegates occurrence-scoped update throu
     globalThis.document = priorDoc;
   }
 });
+
+test("I-07 + I-04: ReferenceService.commitOccurrenceDetailed returns expectedBlockDOM and maps rejected to failed", async () => {
+  const blockID = id(2);
+  const rootID = id(1);
+  const notebook = id(9);
+  const dom = `<div data-node-id="${blockID}" updated="20260101000000"><img data-src="assets/a.png" src="assets/a.png"></div>`;
+  const priorDoc = globalThis.document;
+  try {
+    class MockImg {
+      constructor() { this.attrs = { "data-src": "assets/a.png", src: "assets/a.png" }; }
+      hasAttribute(n) { return n in this.attrs; }
+      getAttribute(n) { return this.attrs[n]; }
+      setAttribute(n, v) { this.attrs[n] = v; }
+      removeAttribute(n) { delete this.attrs[n]; }
+    }
+    class MockBlock {
+      constructor() { this.img = new MockImg(); this.attrs = { "data-node-id": blockID, updated: "20260101000000" }; }
+      getAttribute(n) { return this.attrs[n] ?? null; }
+      removeAttribute(n) { delete this.attrs[n]; }
+      querySelectorAll(selector) { return selector === "img" ? [this.img] : []; }
+      querySelector() { return null; }
+      get outerHTML() {
+        const updatedAttr = this.attrs.updated ? ` updated="${this.attrs.updated}"` : "";
+        return `<div data-node-id="${blockID}"${updatedAttr}><img data-src="${this.img.getAttribute("data-src")}" src="${this.img.getAttribute("src")}"></div>`;
+      }
+    }
+    globalThis.document = {
+      createElement: () => {
+        const block = new MockBlock();
+        return { content: { children: [block] }, set innerHTML(_) {} };
+      },
+    };
+
+    const okClient = {
+      async post(url) {
+        if (url === "/api/block/getBlockInfo") return { code: 0, data: { rootID, box: notebook } };
+        if (url === "/api/block/getBlockDOM") return { code: 0, data: { id: blockID, dom } };
+        if (url === "/api/block/updateBlock") return { code: 0, data: null };
+        throw new Error(url);
+      },
+    };
+    const okService = new ReferenceService(okClient, "http://localhost:6806");
+    const detailed = await okService.commitOccurrenceDetailed(
+      { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/a.png", baselineBlockDOM: dom },
+      "assets/a.webp",
+    );
+    assert.equal(detailed.status, "replaced");
+    assert.equal(detailed.expectedBlockDOM?.includes("updated="), false);
+
+    const rejectedClient = {
+      async post(url) {
+        if (url === "/api/block/getBlockInfo") return { code: 0, data: { rootID, box: notebook } };
+        if (url === "/api/block/getBlockDOM") return { code: 0, data: { id: blockID, dom } };
+        if (url === "/api/block/updateBlock") throw Object.assign(new Error("read-only"), { outcome: "rejected", code: -1 });
+        throw new Error(url);
+      },
+    };
+    const rejectedService = new ReferenceService(rejectedClient, "http://localhost:6806");
+    const failedRes = await rejectedService.commitOccurrence(
+      { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/a.png", baselineBlockDOM: dom },
+      "assets/a.webp",
+    );
+    assert.equal(failedRes, "failed");
+  } finally {
+    globalThis.document = priorDoc;
+  }
+});

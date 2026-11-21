@@ -15,16 +15,15 @@ export class PageAllowlist {
       .auto.pageAllowlist[rootId]);
   }
 
-  async toggle(rootId: string, meta: { title?: string } = {}): Promise<boolean> {
+  async toggle(rootId: string): Promise<boolean> {
     let added = false;
     await this.settings.updateFeature<ImageFeatureConfig>(IMAGE_FEATURE_ID, draft => {
       const pages = draft.auto.pageAllowlist;
-      if (pages[rootId]) { delete pages[rootId]; added = false; }
-      else {
-        pages[rootId] = {
-          grantedAt: Date.now(),
-          title: meta.title ?? "",
-        };
+      if (pages[rootId]) {
+        delete pages[rootId];
+        added = false;
+      } else {
+        pages[rootId] = { grantedAt: Date.now() };
         added = true;
       }
     });

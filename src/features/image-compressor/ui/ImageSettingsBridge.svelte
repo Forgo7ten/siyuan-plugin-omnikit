@@ -4,17 +4,19 @@
   import type { JsonStore } from "../../../core/store/JsonStore.ts";
   import { KernelClient } from "../../../core/host/KernelClient.ts";
   import { getCurrentFrontend } from "../../../core/host/Platform.ts";
+  import type { RegisterDraftParticipant } from "../../../ui/settings/DraftParticipant.ts";
   import { isDocumentRootIdentity } from "../policy/DocumentIdentity.ts";
   import { NODE_ID, type ImageFeatureConfig } from "../policy/parseImageConfig.ts";
-  import { resolveDocumentTitle } from "../services/documentTitle.ts";
   import ImageSettingsPanel from "./ImageSettingsPanel.svelte";
 
   interface Props {
     store: JsonStore<ImageFeatureConfig>;
     runtimePhase: FeaturePhase | "configured";
     t: (key: string, values?: Record<string, string | number>) => string;
+    registerDraft?: RegisterDraftParticipant;
+    globalSaving?: boolean;
   }
-  let { store, runtimePhase, t }: Props = $props();
+  let { store, runtimePhase, t, registerDraft, globalSaving = false }: Props = $props();
   let hostVersion = $state("unknown");
   let desktopFrontend = $state(false);
   const kernel = new KernelClient();
@@ -31,23 +33,21 @@
     return () => controller.abort();
   });
 
-  async function validateDocument(rootID: string): Promise<{ id: string; title: string }> {
+  async function validateDocument(rootID: string): Promise<{ id: string }> {
     if (!NODE_ID.test(rootID)) throw new Error(t("settings.invalidDocument"));
     const infoResponse = await kernel.post<{
       id?: string;
       rootID?: string;
       type?: string;
       box?: string;
-      rootTitle?: string;
     }>("/api/block/getBlockInfo", { id: rootID });
     const info = infoResponse.data;
     if (!isDocumentRootIdentity(info, rootID)) {
       throw new Error(t("settings.invalidDocument"));
     }
-    const title = await resolveDocumentTitle(kernel, rootID, { fallbackRootTitle: info?.rootTitle });
-    return { id: rootID, title };
+    return { id: rootID };
   }
 </script>
 
 <!-- Feature-owned entry point keeps settings available independently of runtime activation. -->
-<ImageSettingsPanel {store} {runtimePhase} {hostVersion} {desktopFrontend} {validateDocument} {t} />
+<ImageSettingsPanel {store} {runtimePhase} {hostVersion} {desktopFrontend} {validateDocument} {t} {registerDraft} {globalSaving} />

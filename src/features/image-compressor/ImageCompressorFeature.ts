@@ -24,7 +24,6 @@ import { createImageServices } from "./services/createImageServices.ts";
 import type { ImageProcessingServices } from "./services/ImageProcessingServices.ts";
 import { watchRemoteImages, type RemoteWatcherHandle } from "./actions/RemoteImageWatcher.ts";
 import type { DocumentRow } from "./services/references.ts";
-import { resolveDocumentTitle } from "./services/documentTitle.ts";
 
 export type ResolveDocumentResult =
   | { status: "ok"; ok: true; notebookId?: string; identity: BlockIdentity; rootTitle?: string }
@@ -89,7 +88,7 @@ export class ImageCompressorFeature extends BaseFeature {
       context: ctx,
       t: (key, values) => this.t(ctx, key, values),
       icon: this.meta.icon,
-      label: menu => this.pageLabel(menu, ctx),
+      isAllowlisted: menu => Boolean(menu.rootID && this.pages.hasCached(menu.rootID)),
       compressQuick: menu => this.runSingle(menu, ctx, controller),
       compressCustom: menu => this.runSingleCustom(menu, ctx, controller),
       toggleDocument: menu => this.toggleDocument(menu, ctx, scope),
@@ -240,15 +239,8 @@ export class ImageCompressorFeature extends BaseFeature {
         this.notify(ctx, this.t(ctx, "menu.notDocument"), "error", 5000);
         return;
       }
-      let title = "";
-      if (!this.pages.hasCached(menu.rootID)) {
-        title = await resolveDocumentTitle(this.kernel, menu.rootID, {
-          fallbackRootTitle: verified.rootTitle,
-          signal: scope.signal,
-        });
-      }
       if (!scope.active || scope.signal.aborted) return;
-      const enabled = await this.pages.toggle(menu.rootID, { title });
+      const enabled = await this.pages.toggle(menu.rootID);
       if (!scope.active || scope.signal.aborted) return;
       this.notify(ctx, this.t(ctx, enabled ? "menu.granted" : "menu.revoked"));
     } catch (error) {
@@ -256,14 +248,6 @@ export class ImageCompressorFeature extends BaseFeature {
       ctx.logger.error("保存文档白名单失败", error);
       this.notify(ctx, this.t(ctx, "menu.saveFailed"), "error", 5000);
     }
-  }
-
-  private pageLabel(menu: MenuContext, ctx: FeatureContext): string {
-    if (!menu.rootID) return this.t(ctx, "menu.resolveFailed");
-    const allowed = this.pages.hasCached(menu.rootID);
-    return allowed
-      ? this.t(ctx, "menu.disablePage")
-      : this.t(ctx, "menu.enablePage");
   }
 
   private editor(menu: MenuContext): SingleImageEditorContext | undefined {
@@ -298,13 +282,17 @@ export class ImageCompressorFeature extends BaseFeature {
     if (!menu.rootID) return;
     let detail = menu.detail;
     if (!detail?.protyle && !detail?.editor?.protyle) {
-      try {
-        const activeProtyle = (getActiveEditor() as any)?.protyle;
-        if (activeProtyle?.block?.rootID === menu.rootID) {
-          detail = { ...(detail && typeof detail === "object" ? detail : {}), protyle: activeProtyle };
+      if (menu.protyle) {
+        detail = { ...(detail && typeof detail === "object" ? detail : {}), protyle: menu.protyle };
+      } else {
+        try {
+          const activeProtyle = (getActiveEditor() as any)?.protyle;
+          if (activeProtyle?.block?.rootID === menu.rootID) {
+            detail = { ...(detail && typeof detail === "object" ? detail : {}), protyle: activeProtyle };
+          }
+        } catch {
+          // Ignore absent active editor in non-DOM/test contexts
         }
-      } catch {
-        // Ignore absent active editor in non-DOM/test contexts
       }
     }
     await controller.compressDocument(detail, menu.rootID);

@@ -159,16 +159,42 @@ test('prepareImage passes Core userAgent from services to reader (default fallba
     const storage = new Map([
       ['omnikit-core.json', { schemaVersion: 1, general: { debugLog: false, userAgent }, featureStates: {} }],
     ]);
-    return {
-      async loadData(name) { return storage.get(name) ?? ''; },
+    const plugin = {
+      storage,
+      loadDataCalls: 0,
+      async loadData(name) { plugin.loadDataCalls += 1; return storage.get(name) ?? ''; },
       async saveData(name, value) { storage.set(name, structuredClone(value)); },
+    };
+    return plugin;
+  }
+
+  function createFileGetFetch(storage, pluginName = 'siyuan-plugin-omnikit') {
+    const prefix = `/data/storage/petal/${pluginName}/`;
+    return async (url, request) => {
+      assert.equal(url, '/api/file/getFile');
+      assert.equal(request.method, 'POST');
+      const { path } = JSON.parse(request.body);
+      assert.ok(path.startsWith(prefix), `Unexpected storage path: ${path}`);
+      const name = path.slice(prefix.length);
+      assert.equal(path, `/data/storage/petal/${pluginName}/${name}`);
+      assert.ok(!name.includes('/'));
+      if (!storage.has(name)) {
+        return new Response(JSON.stringify({ code: 404, msg: 'not found' }), { status: 202 });
+      }
+      const raw = storage.get(name);
+      return new Response(typeof raw === 'string' ? raw : JSON.stringify(raw), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
     };
   }
 
   const runWithUA = async (customUA) => {
     let capturedOptions;
-    const settings = new SettingsManager(createPlugin(customUA), []);
+    const plugin = createPlugin(customUA);
+    const settings = new SettingsManager(plugin, [], createFileGetFetch(plugin.storage));
     await settings.load();
+    assert.equal(plugin.loadDataCalls, 0);
 
     const mockServices = {
       origin: 'http://localhost:6806',

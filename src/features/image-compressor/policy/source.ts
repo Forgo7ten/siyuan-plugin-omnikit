@@ -118,32 +118,21 @@ export function sameAsset(left: string, right: string, origin: string): boolean 
 }
 
 /**
- * Builds the DOM replacement attribute value for a new kernel asset path while
- * preserving decorative query params (e.g. `?width=`) and `#fragment` from `oldRaw`,
- * and never copying a stale `box` from `oldRaw` or dropping `newKernelPath`'s `box`.
+ * Builds the DOM replacement attribute value for a new kernel asset path.
+ * Remote, `file://`, and invalid local sources drop all query params and fragments,
+ * keeping only the new `?box=<notebookID>` when present. Valid local `assets/`
+ * sources keep only the new `?box=<notebookID>` and the original `#fragment`.
  */
 export function buildReplacementPath(oldRaw: string, newKernelPath: string, origin: string): string {
   const next = resolveSource(newKernelPath, origin);
   if (next.kind !== "asset") throw new Error("Replacement path must be an asset");
-  let normalizedOld = oldRaw;
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(oldRaw)) {
-    try {
-      const u = new URL(oldRaw);
-      normalizedOld = `${u.pathname}${u.search}${u.hash}`;
-    } catch {
-      normalizedOld = oldRaw;
-    }
+  const nextSuffix = next.box ? `?box=${next.box}` : "";
+  const old = trySource(oldRaw, origin);
+  if (old?.kind !== "asset") {
+    return `${next.path}${nextSuffix}`;
   }
-  const { queryPart, hashPart } = parseAssetParts(normalizedOld.replace(/\\/g, "/"));
-  const decorativeParams = queryPart
-    ? queryPart.split("&").filter(part => part.length > 0 && !/^box(?:=|$)/i.test(part))
-    : [];
-  const allParams = [
-    ...(next.box ? [`box=${next.box}`] : []),
-    ...decorativeParams,
-  ];
-  const query = allParams.length > 0 ? `?${allParams.join("&")}` : "";
-  return `${next.path}${query}${hashPart}`;
+  const { hashPart } = parseAssetParts(oldRaw.replace(/\\/g, "/"));
+  return `${next.path}${nextSuffix}${hashPart}`;
 }
 
 export function outputName(sourceName: string): string {

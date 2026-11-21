@@ -46,6 +46,7 @@ class BlockElement {
   querySelectorAll(selector) {
     if (selector === 'span[data-type~="a"]') return this.links;
     if (selector === "[parent-heading]") return this.links.filter(l => l.getAttribute("parent-heading") !== null);
+    if (selector === "[updated]") return this.links.filter(l => l.getAttribute("updated") !== null);
     if (selector === "[data-node-id]") return [];
     return [];
   }
@@ -57,10 +58,19 @@ class BlockElement {
 }
 
 function parseBlock(html) {
-  const id = html.match(/data-node-id="([^"]+)"/)?.[1];
-  const links = [...html.matchAll(/<span data-type="a" data-href="([^"]+)"(?: data-title="([^"]*)")?>(.*?)<\/span>/g)]
+  const tagMatch = html.match(/<div\b([^>]*)>/);
+  const attrs = tagMatch?.[1] ?? "";
+  const id = attrs.match(/data-node-id="([^"]+)"/)?.[1];
+  const attrMap = new Map();
+  for (const [, name, value] of attrs.matchAll(/\b(updated|parent-heading)="([^"]*)"/g)) {
+    attrMap.set(name, value);
+  }
+  const inner = html.match(/<div\b[^>]*>([\s\S]*?)<\/div>/)?.[1] ?? "";
+  const firstSpan = inner.indexOf("<span");
+  const prefix = firstSpan >= 0 ? inner.slice(0, firstSpan) : inner;
+  const links = [...inner.matchAll(/<span data-type="a" data-href="([^"]+)"(?: data-title="([^"]*)")?>(.*?)<\/span>/g)]
     .map(match => new LinkElement(match[1], match[3], match[2] ?? null));
-  return new BlockElement(id, links);
+  return new BlockElement(id, links, prefix, attrMap);
 }
 
 function installDOMParser(run) {
@@ -369,14 +379,39 @@ test("resolves and commits via SiYuan IProtyle wrapper", async () => installDOMP
   assert.match(transactions[0].newHTML, />Resolved Title<\/span>/);
 }));
 
-test("safely handles kernel network failures in non-active mode as conflict", async () => installDOMParser(async () => {
+test("safely handles kernel pre-write read failures and invalid responses in non-active mode as failed", async () => installDOMParser(async () => {
   const { links, block, protyle } = fixture();
   const target = { ...captureLinkTarget(links[0], protyle), protyle: null };
   const throwingKernel = {
     post: async () => { throw new Error("Network timeout or connection refused"); },
   };
-  const result = await commitLinkTitle(target, "Example", { replaceTitle: false, kernel: throwingKernel });
-  assert.equal(result, "conflict");
+  assert.equal(await commitLinkTitle(target, "Example", { replaceTitle: false, kernel: throwingKernel }), "failed");
+
+  const invalidInfoKernel = {
+    async post(path) {
+      if (path === "/api/block/getBlockInfo") return { code: -1, data: null, msg: "error" };
+      return { code: 0, data: {} };
+    },
+  };
+  assert.equal(await commitLinkTitle(target, "Example", { replaceTitle: false, kernel: invalidInfoKernel }), "failed");
+
+  const emptyDomKernel = {
+    async post(path) {
+      if (path === "/api/block/getBlockInfo") return { code: 0, data: { rootID: "20260101000000-rootabc", box: "notebook" } };
+      if (path === "/api/block/getBlockDOM") return { code: 0, data: { id: block.id, dom: "" } };
+      return { code: 0, data: {} };
+    },
+  };
+  assert.equal(await commitLinkTitle(target, "Example", { replaceTitle: false, kernel: emptyDomKernel }), "failed");
+
+  const unparseableDomKernel = {
+    async post(path) {
+      if (path === "/api/block/getBlockInfo") return { code: 0, data: { rootID: "20260101000000-rootabc", box: "notebook" } };
+      if (path === "/api/block/getBlockDOM") return { code: 0, data: { id: block.id, dom: "<div>broken</div>" } };
+      return { code: 0, data: {} };
+    },
+  };
+  assert.equal(await commitLinkTitle(target, "Example", { replaceTitle: false, kernel: unparseableDomKernel }), "failed");
 }));
 
 test("safely propagates AbortError during non-active kernel calls as aborted", async () => installDOMParser(async () => {
@@ -674,11 +709,30 @@ test("restores collapsed caret on rolled-back text node when updateTransactionEl
 
     const target = captureLinkTarget(link, protyle);
     const result = await commitLinkTitle(target, "New Title", { replaceTitle: false });
-    assert.equal(result, "conflict");
+    assert.equal(result, "failed");
     assert.equal(link.textContent, "https://example.com/0");
     assert.equal(appliedRanges.length, 2);
     assert.equal(appliedRanges[1].node, textNode);
     assert.equal(appliedRanges[1].offset, 8);
+
+    // Superseded and aborted cases keep their respective outcomes after rollback
+    const superseded = await commitLinkTitle(target, "New Title", { replaceTitle: false, isCurrent: () => false });
+    assert.equal(superseded, "superseded");
+    assert.equal(link.textContent, "https://example.com/0");
+
+    const controller = new AbortController();
+    const abortingProtyle = {
+      block: { rootID: "20260101000000-rootabc", box: "notebook" },
+      notebookId: "notebook",
+      async updateTransactionElement() {
+        controller.abort();
+        throw new Error("aborted tx");
+      },
+    };
+    const abortTarget = captureLinkTarget(link, abortingProtyle);
+    const aborted = await commitLinkTitle(abortTarget, "New Title", { replaceTitle: false, signal: controller.signal });
+    assert.equal(aborted, "aborted");
+    assert.equal(link.textContent, "https://example.com/0");
   } finally {
     globalThis.getSelection = prevSelection;
     globalThis.document = prevDocument;
@@ -908,17 +962,27 @@ test("non-active mode re-reads getBlockDOM only when updateBlock throws unknown 
     assert.equal(domReads, 2);
   }
 
-  // 2. Unknown updateBlock error + verify read still matches baseline -> "failed"
+  // 2. Unknown updateBlock error + verify read still matches baseline -> "unknown" (never retry)
   {
+    let domReads = 0;
+    let updateCalls = 0;
     const kernel = {
       async post(path) {
         if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-rootabc", box: "notebook" }, code: 0 };
-        if (path === "/api/block/getBlockDOM") return { data: { id: block.id, dom: block.outerHTML }, code: 0 };
-        if (path === "/api/block/updateBlock") throw new Error("timeout waiting response");
+        if (path === "/api/block/getBlockDOM") {
+          domReads += 1;
+          return { data: { id: block.id, dom: block.outerHTML }, code: 0 };
+        }
+        if (path === "/api/block/updateBlock") {
+          updateCalls += 1;
+          throw new Error("timeout waiting response");
+        }
         return { code: 0, data: {} };
       },
     };
-    assert.equal(await commitLinkTitle(baseTarget, "Resolved", { replaceTitle: false, kernel }), "failed");
+    assert.equal(await commitLinkTitle(baseTarget, "Resolved", { replaceTitle: false, kernel }), "unknown");
+    assert.equal(domReads, 2);
+    assert.equal(updateCalls, 1);
   }
 
   // 3. Unknown updateBlock error + verify read shows concurrent edit -> "conflict"
@@ -975,5 +1039,147 @@ test("non-active mode re-reads getBlockDOM only when updateBlock throws unknown 
     };
     assert.equal(await commitLinkTitle(baseTarget, "Resolved", { replaceTitle: false, kernel }), "failed");
     assert.equal(domReads, 1);
+  }
+
+  // 6. Rejected or not-sent error thrown by KernelClient on updateBlock -> "failed" without re-reading getBlockDOM
+  for (const outcome of ["rejected", "not-sent"]) {
+    let domReads = 0;
+    const kernel = {
+      async post(path) {
+        if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-rootabc", box: "notebook" }, code: 0 };
+        if (path === "/api/block/getBlockDOM") {
+          domReads += 1;
+          return { data: { id: block.id, dom: block.outerHTML }, code: 0 };
+        }
+        if (path === "/api/block/updateBlock") {
+          const err = new Error(`kernel ${outcome}`);
+          err.outcome = outcome;
+          err.code = outcome === "rejected" ? -1 : undefined;
+          throw err;
+        }
+        return { code: 0, data: {} };
+      },
+    };
+    assert.equal(await commitLinkTitle(baseTarget, "Resolved", { replaceTitle: false, kernel }), "failed");
+    assert.equal(domReads, 1);
+  }
+
+  // 7. Unknown updateBlock error when initial block had updated attr -> payload keeps original updated, verify strips updated and returns "updated"
+  {
+    const linkWithUpdated = new LinkElement("https://example.com/0", "https://example.com/0");
+    const blockWithUpdated = new BlockElement(
+      "20260101000000-updblk",
+      [linkWithUpdated],
+      "",
+      new Map([["updated", "20260101000000"]]),
+    );
+    const targetWithUpdated = {
+      ...captureLinkTarget(linkWithUpdated, {
+        block: { rootID: "20260101000000-rootabc", box: "notebook" },
+        notebookId: "notebook",
+        updateTransactionElement() {},
+      }),
+      protyle: null,
+    };
+    let domReads = 0;
+    const sentPayloads = [];
+    const kernel = {
+      async post(path, body) {
+        if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-rootabc", box: "notebook" }, code: 0 };
+        if (path === "/api/block/getBlockDOM") {
+          domReads += 1;
+          const dom = domReads === 1
+            ? blockWithUpdated.outerHTML
+            : `<div data-node-id="${blockWithUpdated.id}" updated="20260101000009"><span data-type="a" data-href="https://example.com/0">Committed</span></div>`;
+          return { data: { id: blockWithUpdated.id, dom }, code: 0 };
+        }
+        if (path === "/api/block/updateBlock") {
+          sentPayloads.push(body);
+          throw new Error("network lost");
+        }
+        return { code: 0, data: {} };
+      },
+    };
+    assert.equal(await commitLinkTitle(targetWithUpdated, "Committed", { replaceTitle: false, kernel }), "updated");
+    assert.equal(domReads, 2);
+    assert.match(sentPayloads[0].data, /updated="20260101000000"/);
+  }
+
+  // 8. Concurrent non-link edit on same block during unknown updateBlock -> "conflict" (even if link text stayed at baseline)
+  {
+    let domReads = 0;
+    const kernel = {
+      async post(path) {
+        if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-rootabc", box: "notebook" }, code: 0 };
+        if (path === "/api/block/getBlockDOM") {
+          domReads += 1;
+          const dom = domReads === 1
+            ? block.outerHTML
+            : `<div data-node-id="${block.id}">concurrent text <span data-type="a" data-href="https://example.com/0">https://example.com/0</span></div>`;
+          return { data: { id: block.id, dom }, code: 0 };
+        }
+        if (path === "/api/block/updateBlock") throw new Error("timeout waiting response");
+        return { code: 0, data: {} };
+      },
+    };
+    assert.equal(await commitLinkTitle(baseTarget, "Resolved", { replaceTitle: false, kernel }), "conflict");
+  }
+}));
+
+test("non-active mode preserves mixed updated, unchanged, and superseded outcomes on unknown updateBlock verification", async () => installDOMParser(async () => {
+  const links = [
+    new LinkElement("https://example.com/0", "https://example.com/0"),
+    new LinkElement("https://example.com/1", "Already Titled"),
+    new LinkElement("https://example.com/2", "https://example.com/2"),
+  ];
+  const block = new BlockElement("20260101000000-mixed", links, "", new Map([["updated", "20260101000000"]]));
+  const mockProtyle = {
+    block: { rootID: "20260101000000-rootmix", box: "notebook" },
+    notebookId: "notebook",
+    updateTransactionElement() {},
+  };
+  const targets = links.map(link => ({ ...captureLinkTarget(link, mockProtyle), protyle: null }));
+
+  // 1. Re-read matches baseline -> "updated" becomes "unknown", "unchanged" stays "unchanged", "superseded" stays "superseded"
+  {
+    const kernel = {
+      async post(path) {
+        if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-rootmix", box: "notebook" }, code: 0 };
+        if (path === "/api/block/getBlockDOM") return { data: { id: block.id, dom: block.outerHTML }, code: 0 };
+        if (path === "/api/block/updateBlock") throw new Error("timeout waiting response");
+        return { code: 0, data: {} };
+      },
+    };
+    const results = await commitLinkTitles([
+      { target: targets[0], title: "New Title" },
+      { target: targets[1], title: "Already Titled" },
+      { target: targets[2], title: "Ignored", isCurrent: () => false },
+    ], { replaceTitle: false, kernel });
+    assert.deepEqual(results, ["unknown", "unchanged", "superseded"]);
+  }
+
+  // 2. Re-read matches expected with updated attr changed -> "updated", "unchanged", "superseded"
+  {
+    let domReads = 0;
+    const kernel = {
+      async post(path) {
+        if (path === "/api/block/getBlockInfo") return { data: { rootID: "20260101000000-rootmix", box: "notebook" }, code: 0 };
+        if (path === "/api/block/getBlockDOM") {
+          domReads += 1;
+          const dom = domReads === 1
+            ? block.outerHTML
+            : `<div data-node-id="${block.id}" updated="20260101000005"><span data-type="a" data-href="https://example.com/0">New Title</span><span data-type="a" data-href="https://example.com/1">Already Titled</span><span data-type="a" data-href="https://example.com/2">https://example.com/2</span></div>`;
+          return { data: { id: block.id, dom }, code: 0 };
+        }
+        if (path === "/api/block/updateBlock") throw new Error("timeout waiting response");
+        return { code: 0, data: {} };
+      },
+    };
+    const results = await commitLinkTitles([
+      { target: targets[0], title: "New Title" },
+      { target: targets[1], title: "Already Titled" },
+      { target: targets[2], title: "Ignored", isCurrent: () => false },
+    ], { replaceTitle: false, kernel });
+    assert.deepEqual(results, ["updated", "unchanged", "superseded"]);
   }
 }));

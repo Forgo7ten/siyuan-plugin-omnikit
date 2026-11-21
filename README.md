@@ -38,26 +38,26 @@
 
 Asynchronously fetches webpage titles in the background and populates hyperlink anchor text when URLs are pasted in the editor.
 
-- **Automatic Title Fetching**: When an `http://` or `https://` link is pasted into the editor, the plugin fetches the webpage in the background, extracts the `<title>`, and fills in the link anchor text.
-- **Preserves Custom Text**: If the pasted content is a Markdown link with an existing title (e.g. `[title](url)`) or the link text has been manually edited, no modification is made.
+- **Automatic Title Fetching**: When pasting a single URL, multi-URL text paragraphs, or rich-text links (`http://` / `https://` links converted by SiYuan or carried by rich-text clipboard without custom anchor text), the plugin asynchronously fetches the webpage `<title>` in the background and fills the link anchor text.
+- **Preserves Custom Text & Selection Intent**: Existing titled Markdown/rich-text links (e.g. `[title](url)`) and manually edited link text are never overwritten. Pasting a single bare URL over a non-empty text selection preserves the selected text as anchor text and skips auto-fetching; replacing a selection with a text paragraph containing URLs processes the newly inserted links normally.
 - **Static File Link Detection**: Links pointing to common non-web files (such as `.pdf`, `.zip`, `.exe`, etc.) extract and decode filenames directly from the URL without making network requests.
 - **Context Menu Actions**:
   - Right-click an individual link and choose `[OmniKit] Fetch link title` to manually trigger re-fetching;
   - Right-click a block icon and choose `[OmniKit] Fetch link titles (N)` to process all HTTP/HTTPS hyperlinks in the block.
-- **Undo Support**: Title insertion is performed through SiYuan's native editor transaction and can be undone with `Ctrl+Z`.
+- **Undo Support**: When the original editor remains active, title insertion uses SiYuan's native editor transaction and can be undone with `Ctrl+Z`; background kernel write-back after closing the editor is not guaranteed to enter the editor undo stack.
 
 ## 2. Image Compressor & Localization
 
 Converts images into WebP format and downloads remote image URLs into local workspace assets.
 
-- **Automatic Compression for New Images**: Newly pasted or dropped images are compressed into WebP in the background. Can be configured to run globally or restricted to an allowlist of specific documents.
+- **Automatic Compression for New Images**: Newly pasted or dropped images are compressed into WebP in the background. Can be configured to run globally or restricted to an allowlist of specific documents, with quick checkbox toggles (`Auto-compress whitelist for this document`) available from the file tree, document title bar, and top-bar menu independently of the global switch.
 - **Manual Single Image Compression & Preview**:
   - Right-click an image in the editor and choose `[OmniKit] Compress this image` for immediate conversion;
   - Choose `[OmniKit] Compress…` to open a preview dialog where compression quality can be adjusted while comparing visual quality and file sizes, with options to save as an asset only or replace the document reference.
 - **Document Batch Compression**: Right-click a document node in the file tree, on the document title bar (`[OmniKit] Compress all images in this document`), or select **Compress all images in this document** from the top-bar menu to process all images in the document.
 - **Remote Image Localization**: Detects newly inserted external HTTP/HTTPS images in authorized documents and downloads them into the local `assets/` directory.
 - **Records Dock & Reference Revert**:
-  - Open the OmniKit Dock in the sidebar to view historical compression mappings and statuses;
+  - Open the OmniKit Dock in the sidebar to view the mapping between originals and their latest compressed WebP along with asset statuses;
   - Jump to and highlight corresponding image blocks in the editor;
   - Revert document references back to original images at any time.
 
@@ -66,11 +66,11 @@ Converts images into WebP format and downloads remote image URLs into local work
 # Usage & Settings
 
 1. Click the OmniKit icon in the SiYuan top bar and select **OmniKit settings**;
-2. Toggle individual feature modules on or off;
+2. General settings, feature toggles, and feature-specific options are edited as a unified draft and saved or reset (`Restore defaults` / `Save settings`) from the single floating bar at the bottom of the settings dialog;
 3. Available options:
    - **General**: console debug logging and shared network `User-Agent`;
    - **Image Compressor**: global automatic compression toggle, document allowlist, smart compression toggle (MS-SSIM adaptive search), target similarity, initial quality, and manual maximum edge limit;
-   - **Titled Link**: fetch link titles on paste, sync hover title attribute (`data-title`), fallback to hostname on fetch failure, and maximum title length.
+   - **Titled Link**: fetch link titles on paste, sync hover title attribute (`data-title`), and fallback to hostname on fetch failure (title truncation is fixed at 80 graphemes).
 
 ---
 

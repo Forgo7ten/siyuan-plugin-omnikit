@@ -117,14 +117,37 @@ test("image records dock renders Option A brand hero card buffer and i18n hero t
   assert.equal(en["dock.heroSubtitle"], "Asset Management & Traceability");
 });
 
+function createFileGetFetch(storage, pluginName = "siyuan-plugin-omnikit") {
+  const prefix = `/data/storage/petal/${pluginName}/`;
+  return async (url, request) => {
+    assert.equal(url, "/api/file/getFile");
+    assert.equal(request.method, "POST");
+    const { path } = JSON.parse(request.body);
+    assert.ok(path.startsWith(prefix), `Unexpected storage path: ${path}`);
+    const name = path.slice(prefix.length);
+    assert.equal(path, `/data/storage/petal/${pluginName}/${name}`);
+    assert.ok(!name.includes("/"));
+    if (!storage.has(name)) {
+      return new Response(JSON.stringify({ code: 404, msg: "not found" }), { status: 202 });
+    }
+    const raw = storage.get(name);
+    return new Response(typeof raw === "string" ? raw : JSON.stringify(raw), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+}
+
 test("D01: checkAssetAvailability treats statAsset code=1 and transport errors as unknown, never removing records on code=1", async () => {
   const storage = new Map();
+  let loadDataCalls = 0;
   const plugin = {
-    async loadData(p) { return storage.has(p) ? structuredClone(storage.get(p)) : ""; },
+    async loadData(p) { loadDataCalls += 1; return storage.has(p) ? structuredClone(storage.get(p)) : ""; },
     async saveData(p, d) { storage.set(p, structuredClone(d)); },
   };
-  const store = new ImageCompressionRecordStore(plugin);
+  const store = new ImageCompressionRecordStore(plugin, { fetchFn: createFileGetFetch(storage) });
   await store.init();
+  assert.equal(loadDataCalls, 0);
   await store.upsert("assets/a.png", "assets/a.webp");
   await store.upsert("assets/a.webp", "assets/a2.webp");
 

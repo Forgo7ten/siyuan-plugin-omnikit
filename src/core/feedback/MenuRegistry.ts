@@ -29,6 +29,7 @@ export interface OmniMenuItem {
   icon?: string;
   iconHTML?: string;
   disabled?: boolean;
+  checked?: boolean;
   run: () => void | Promise<void>;
 }
 
@@ -41,6 +42,7 @@ export interface HostMenu {
     icon?: string;
     iconHTML?: string;
     disabled?: boolean;
+    bind?: (element: HTMLElement) => void;
     click?: () => void;
   }): unknown;
 }
@@ -142,12 +144,33 @@ export class MenuRegistry {
         const disabled = item.disabled === true;
         const cleanLabel = item.label.startsWith("[OmniKit] ") ? item.label.slice("[OmniKit] ".length) : item.label;
         const label = isTopbar ? cleanLabel : (item.label.startsWith("[OmniKit] ") ? item.label : `[OmniKit] ${item.label}`);
+        const checked = item.checked;
+        const bind = checked === undefined
+          ? undefined
+          : (element: HTMLElement) => {
+              element.classList?.add("omnikit-whitelist-menu-item");
+              element.setAttribute?.("role", "menuitemcheckbox");
+              element.setAttribute?.("aria-checked", String(checked));
+              if (typeof document !== "undefined" && typeof document.createElement === "function"
+                && typeof element.appendChild === "function") {
+                const existing = typeof element.querySelector === "function"
+                  ? element.querySelector(".omnikit-menu-checkbox")
+                  : null;
+                if (!existing) {
+                  const checkbox = document.createElement("span");
+                  checkbox.className = "omnikit-menu-checkbox";
+                  checkbox.setAttribute("aria-hidden", "true");
+                  element.appendChild(checkbox);
+                }
+              }
+            };
         host.addItem({
           id: `omnikit-${entry.owner}-${item.id}`,
           label,
           icon: item.icon,
           iconHTML: item.iconHTML,
           disabled,
+          ...(bind ? { bind } : {}),
           click: () => {
             this.logger?.debug("点击菜单项", {
               owner: entry.owner,

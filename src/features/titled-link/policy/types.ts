@@ -1,5 +1,15 @@
 export const DEFAULT_MAX_TITLE_LENGTH = 80;
 
+export type LinkActionResult =
+  | "updated"
+  | "unchanged"
+  | "conflict"
+  | "failed"
+  | "unknown"
+  | "aborted"
+  | "superseded"
+  | "ime-timeout";
+
 export interface TitledLinkConfig {
   schemaVersion: 1;
   auto: {
