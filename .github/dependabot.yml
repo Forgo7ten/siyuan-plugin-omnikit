@@ -1,0 +1,35 @@
+version: 2
+updates:
+  # 1. npm 生态：前端与构建依赖监控
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    versioning-strategy: lockfile-only
+    groups:
+      dev-dependencies:
+        patterns:
+          - "*"
+    labels:
+      - "dependencies"
+      - "automated-pr"
+
+  # 2. github-actions 生态：CI/CD 外部动作监控
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      actions:
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: "actions/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "pnpm/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "ncipollo/*"
+        update-types: ["version-update:semver-major"]
+    labels:
+      - "dependencies"
+      - "automated-pr"

@@ -1,0 +1,75 @@
+import { existsSync, readFileSync, statSync } from "node:fs";
+import assert from "node:assert/strict";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const resolveRoot = (...segments) => path.join(root, ...segments);
+
+const required = [
+  "dist/index.js", "dist/index.css", "dist/plugin.json",
+  "dist/README.md", "dist/README.zh-CN.md",
+  "dist/i18n/en.json", "dist/i18n/zh-CN.json",
+  "dist/browser-image-compression.js", "dist/icon.png", "dist/preview.png",
+  "dist/assets/omnikit-menu.svg", "dist/assets/omnikit-plugin.svg", "package.zip",
+];
+for (const relPath of required) {
+  const fullPath = resolveRoot(relPath);
+  assert.ok(existsSync(fullPath), `Missing build artifact: ${relPath}`);
+  assert.ok(statSync(fullPath).size > 0, `Empty build artifact: ${relPath}`);
+}
+assert.ok(!existsSync(resolveRoot("icon.png")), "icon.png is generated only as a build artifact");
+assert.ok(!existsSync(resolveRoot("preview.png")), "preview.png is generated only as a build artifact");
+const pngMagic = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+const icon = readFileSync(resolveRoot("dist/icon.png"));
+assert.deepEqual(icon.subarray(0, 8), pngMagic);
+assert.equal(icon.readUInt32BE(16), 160, "marketplace icon width");
+assert.equal(icon.readUInt32BE(20), 160, "marketplace icon height");
+assert.ok(icon.byteLength <= 64 * 1024, "marketplace icon must be at most 64 KiB");
+const preview = readFileSync(resolveRoot("dist/preview.png"));
+assert.deepEqual(preview.subarray(0, 8), pngMagic);
+assert.equal(preview.readUInt32BE(16), 512, "marketplace preview width");
+assert.equal(preview.readUInt32BE(20), 512, "marketplace preview height");
+assert.ok(preview.byteLength <= 256 * 1024, "marketplace preview must be at most 256 KiB");
+for (const readme of ["README.md", "README.zh-CN.md"]) {
+  assert.match(readFileSync(resolveRoot(readme), "utf8"), /assets\/omnikit-plugin\.svg/);
+}
+const pkg = JSON.parse(readFileSync(resolveRoot("package.json"), "utf8"));
+const manifest = JSON.parse(readFileSync(resolveRoot("dist/plugin.json"), "utf8"));
+assert.equal(manifest.name, "siyuan-plugin-omnikit");
+assert.equal(pkg.version, manifest.version);
+assert.equal(manifest.minAppVersion, "3.8.4");
+assert.equal(manifest.icon, "icon.png");
+assert.equal(manifest.preview, "preview.png");
+for (const locale of ["en", "zh-CN"]) {
+  JSON.parse(readFileSync(resolveRoot(`dist/i18n/${locale}.json`), "utf8"));
+}
+
+// Inspect ZIP central-directory names without an additional runtime dependency.
+const archive = readFileSync(resolveRoot("package.zip"));
+let eocd = -1;
+for (let offset = Math.max(0, archive.length - 22 - 0xffff); offset <= archive.length - 22; offset++) {
+  if (archive.readUInt32LE(offset) === 0x06054b50) eocd = offset;
+}
+assert.notEqual(eocd, -1, "package.zip has no end-of-central-directory record");
+const entryCount = archive.readUInt16LE(eocd + 10);
+let cursor = archive.readUInt32LE(eocd + 16);
+const zipEntries = [];
+for (let index = 0; index < entryCount; index++) {
+  assert.equal(archive.readUInt32LE(cursor), 0x02014b50, `Invalid ZIP entry ${index}`);
+  const nameLength = archive.readUInt16LE(cursor + 28);
+  const extraLength = archive.readUInt16LE(cursor + 30);
+  const commentLength = archive.readUInt16LE(cursor + 32);
+  zipEntries.push(archive.toString("utf8", cursor + 46, cursor + 46 + nameLength));
+  cursor += 46 + nameLength + extraLength + commentLength;
+}
+for (const entry of [
+  "index.js", "index.css", "plugin.json", "i18n/en.json", "i18n/zh-CN.json",
+  "browser-image-compression.js", "icon.png", "preview.png",
+  "assets/omnikit-menu.svg", "assets/omnikit-plugin.svg",
+]) {
+  assert.ok(zipEntries.includes(entry), `Missing package.zip entry: ${entry}`);
+}
+assert.ok(!zipEntries.includes("kernel.js"), "package.zip must not contain the legacy kernel bundle");
+assert.ok(!zipEntries.some(entry => entry.startsWith("node_modules/")), "package.zip must not contain node_modules");
+console.log("OmniKit Vite build package structure verified (not an in-app runtime test)");
