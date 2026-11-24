@@ -1,15 +1,25 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
   import type { ManualCompressionPreview } from "../actions/SingleImageAction.ts";
-  import { formatBytes } from "../policy/formatStats.ts";
+  import { formatBytes, formatCompressionRatio } from "../policy/formatStats.ts";
   import OmniFormRow from "../../../ui/components/OmniFormRow.svelte";
   import OmniSlider from "../../../ui/components/OmniSlider.svelte";
 
   interface Props {
     sourceName: string;
-    defaults: { quality: number; manualMaxEdge: number };
+    defaults: {
+      quality: number;
+      manualMaxEdge: number;
+      smartEnabled?: boolean;
+      targetSimilarity?: number;
+      smartSupported?: boolean;
+    };
     t: (key: string, values?: Record<string, string | number>) => string;
-    previewEncode: (quality: number, manualMaxEdge: number) => Promise<ManualCompressionPreview>;
+    previewEncode: (
+      quality: number,
+      manualMaxEdge: number,
+      smartOptions?: { smartEnabled: boolean; targetSimilarity: number },
+    ) => Promise<ManualCompressionPreview>;
     save: (preview: ManualCompressionPreview, replace: boolean) => Promise<void>;
     onClose?: () => void;
   }
@@ -17,6 +27,9 @@
   let { sourceName, defaults, t, previewEncode, save, onClose }: Props = $props();
   let quality = $state(0.8);
   let manualMaxEdge = $state(4096);
+  let smartEnabled = $state(false);
+  let targetSimilarity = $state(0.99);
+  let smartSupported = $derived(Boolean(defaults.smartSupported));
   let replaceCurrent = $state(false);
   let allowLarger = $state(false);
   let preview = $state<ManualCompressionPreview | undefined>();
@@ -29,19 +42,27 @@
   onMount(() => {
     quality = defaults.quality;
     manualMaxEdge = defaults.manualMaxEdge;
+    smartEnabled = Boolean(defaults.smartSupported && defaults.smartEnabled);
+    targetSimilarity = defaults.targetSimilarity ?? 0.99;
   });
 
   async function prepare(): Promise<void> {
     if (busy) return;
-    if (!Number.isFinite(quality) || quality < 0.01 || quality > 1
-      || !Number.isInteger(manualMaxEdge) || manualMaxEdge < 512 || manualMaxEdge > 16384) {
+    const validMaxEdge = Number.isInteger(manualMaxEdge) && manualMaxEdge >= 512 && manualMaxEdge <= 16383;
+    const validQualityOrTarget = smartSupported && smartEnabled
+      ? Number.isFinite(targetSimilarity) && targetSimilarity >= 0.90 && targetSimilarity <= 0.999
+      : Number.isFinite(quality) && quality >= 0.01 && quality <= 1;
+    if (!validMaxEdge || !validQualityOrTarget) {
       error = t("image.dialog.invalidSettings");
       return;
     }
     busy = true;
     error = "";
     try {
-      const encoded = await previewEncode(quality, manualMaxEdge);
+      const encoded = await previewEncode(quality, manualMaxEdge, {
+        smartEnabled: Boolean(smartSupported && smartEnabled),
+        targetSimilarity,
+      });
       if (destroyed) return;
       if (previewURL) URL.revokeObjectURL(previewURL);
       if (originalURL) URL.revokeObjectURL(originalURL);
@@ -98,19 +119,50 @@
 
   <!-- Parameter Settings Card -->
   <div class="dialog-card">
-    <OmniFormRow title={t("image.dialog.quality")} description={t("image.dialog.qualityHelp")}>
-      <div class="slider-wrapper">
-        <OmniSlider
-          bind:value={quality}
-          min={0.01}
-          max={1}
-          step={0.01}
+    {#if smartSupported}
+      <OmniFormRow title={t("image.dialog.smartMode")} description={t("image.dialog.smartModeHelp")}>
+        <input
+          type="checkbox"
+          class="b3-switch"
+          aria-label={t("image.dialog.smartMode")}
+          bind:checked={smartEnabled}
+          onchange={discardPreview}
           disabled={busy}
-          displayValue={`${Math.round(quality * 100)}%`}
-          oninput={discardPreview}
         />
-      </div>
-    </OmniFormRow>
+      </OmniFormRow>
+
+      <div class="card-divider"></div>
+    {/if}
+
+    {#if smartSupported && smartEnabled}
+      <OmniFormRow title={t("settings.targetSimilarity")} description={t("image.dialog.targetSimilarityHelp")}>
+        <div class="slider-wrapper">
+          <OmniSlider
+            bind:value={targetSimilarity}
+            min={0.90}
+            max={0.999}
+            step={0.001}
+            disabled={busy}
+            displayValue={`${(targetSimilarity * 100).toFixed(1)}%`}
+            oninput={discardPreview}
+          />
+        </div>
+      </OmniFormRow>
+    {:else}
+      <OmniFormRow title={t("image.dialog.quality")} description={t("image.dialog.qualityHelp")}>
+        <div class="slider-wrapper">
+          <OmniSlider
+            bind:value={quality}
+            min={0.01}
+            max={1}
+            step={0.01}
+            disabled={busy}
+            displayValue={`${Math.round(quality * 100)}%`}
+            oninput={discardPreview}
+          />
+        </div>
+      </OmniFormRow>
+    {/if}
 
     <div class="card-divider"></div>
 
@@ -121,7 +173,7 @@
           class="b3-text-field edge-input"
           type="number"
           min="512"
-          max="16384"
+          max="16383"
           step="1"
           bind:value={manualMaxEdge}
           oninput={discardPreview}
@@ -176,15 +228,9 @@
             <span class="preview-card__tag preview-card__tag--highlight">
               {formatBytes(preview.compressedBytes)}
             </span>
-            {#if preview.compressedBytes <= preview.originalBytes}
-              <span class="saving-badge saving-badge--success">
-                -{Math.round((1 - preview.compressedBytes / preview.originalBytes) * 100)}%
-              </span>
-            {:else}
-              <span class="saving-badge saving-badge--warn">
-                +{Math.round((preview.compressedBytes / preview.originalBytes - 1) * 100)}%
-              </span>
-            {/if}
+            <span class="saving-badge {preview.compressedBytes <= preview.originalBytes ? 'saving-badge--success' : 'saving-badge--warn'}">
+              {formatCompressionRatio(preview.originalBytes, preview.compressedBytes)}
+            </span>
           </div>
         </div>
         <div class="preview-card__img-box">
@@ -223,6 +269,17 @@
           {/each}
         </div>
       </details>
+    {/if}
+
+    {#if preview.unreachable}
+      <div class="unreachable-warning-bar" role="status">
+        <span>
+          {t("image.dialog.unreachableWarning", {
+            similarity: ((preview.similarity ?? 0) * 100).toFixed(2),
+            target: ((preview.targetSimilarity ?? targetSimilarity) * 100).toFixed(1),
+          })}
+        </span>
+      </div>
     {/if}
 
     {#if preview.compressedBytes > preview.originalBytes}
@@ -495,6 +552,15 @@
       background: var(--b3-theme-error);
       color: var(--b3-theme-on-error, var(--b3-theme-on-primary));
     }
+  }
+
+  .unreachable-warning-bar {
+    padding: 10px 14px;
+    border-radius: 8px;
+    background: var(--b3-theme-surface-lighter);
+    border-inline-start: 3px solid var(--b3-theme-primary);
+    color: var(--b3-theme-on-surface);
+    line-height: 1.5;
   }
 
   .larger-warning-bar {

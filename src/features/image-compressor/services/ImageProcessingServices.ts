@@ -5,7 +5,13 @@ import { Logger } from "../../../core/host/Logger.ts";
 import type { ImageUI } from "../ui/ImageTaskUI.ts";
 import type { AssetStore } from "./assets.ts";
 import type { SourceReader } from "./download.ts";
-import { inspectImage, type ImageCodec, type ImageInfo, type SmartSearchSummary } from "./image.ts";
+import {
+  inspectImage,
+  isSmartCompressionEffective,
+  type ImageCodec,
+  type ImageInfo,
+  type SmartSearchSummary,
+} from "./image.ts";
 import type { ImageConfig } from "../policy/parseImageConfig.ts";
 import type { ReferenceService } from "./references.ts";
 import type { ImageCompressionRecordStore } from "../store/ImageCompressionRecordStore.ts";
@@ -98,7 +104,7 @@ export async function prepareImage(
     path: source.raw,
     mode,
     excludedExtensions: config.compression.excludedExtensions,
-    smartEnabled: config.compression.smartEnabled === true,
+    smartEnabled: isSmartCompressionEffective(config.compression.smartEnabled),
   });
   const originalPath = formatAssetPath(source);
   if (!decision.eligible) {

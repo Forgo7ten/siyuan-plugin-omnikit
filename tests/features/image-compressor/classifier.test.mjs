@@ -1,7 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { classifyImageCandidate, extractImageExtension } from "../../../src/features/image-compressor/policy/ImageCandidateClassifier.ts";
-import { BicEncoder } from "../../../src/features/image-compressor/services/image.ts";
+import {
+  CanvasWebpEncoder,
+  isSmartCompressionEffective,
+  probeSmartCompressionSupport,
+  setSmartSupportResolverForTest,
+} from "../../../src/features/image-compressor/services/image.ts";
+import { hasCompressibleInput } from "../../../src/features/image-compressor/actions/AutoUploadHandler.ts";
+import { addedRemoteCandidates } from "../../../src/features/image-compressor/actions/RemoteImageWatcher.ts";
+import { resolveSource } from "../../../src/features/image-compressor/policy/source.ts";
 import { AdaptiveImageCompressor } from "../../../src/features/image-compressor/similarity/AdaptiveImageCompressor.ts";
 import { defaultImageFeatureConfig } from "../../../src/features/image-compressor/policy/parseImageConfig.ts";
 
@@ -184,7 +192,7 @@ test("I-09: extractImageExtension handles extensionless paths with dots in paren
   assert.equal(extractImageExtension("assets\\sub.dir\\Photo.WEBP?width=100"), "webp");
 });
 
-test("I-09: BicEncoder and AdaptiveImageCompressor skip extensionless WebP when disallowed by mode/smartEnabled", async () => {
+test("I-09: CanvasWebpEncoder and AdaptiveImageCompressor skip extensionless WebP when disallowed by mode/smartEnabled", async () => {
   const staticWebpBytes = new Uint8Array(48);
   const view = new DataView(staticWebpBytes.buffer);
   staticWebpBytes.set(Buffer.from("RIFF"), 0); view.setUint32(4, 40, true); staticWebpBytes.set(Buffer.from("WEBP"), 8);
@@ -201,17 +209,40 @@ test("I-09: BicEncoder and AdaptiveImageCompressor skip extensionless WebP when 
   cfg.compression.minSavingRatio = 0;
   cfg.compression.smartEnabled = false;
 
-  const bic = new BicEncoder(
+  const baseCodec = new CanvasWebpEncoder(
     async () => { throw new Error("Must not invoke encoder for disallowed extensionless WebP"); },
-    "worker.js",
     async () => ({ width: 100, height: 100 }),
   );
-  const adaptive = new AdaptiveImageCompressor(bic);
+  const adaptive = new AdaptiveImageCompressor(baseCodec);
 
   for (const mode of ["auto", "document"]) {
-    const resBic = await bic.encode(extensionlessWebp, "dir.v1/avatar", cfg, undefined, undefined, mode);
-    assert.deepEqual(resBic, { kind: "skipped", reason: "protected-extension" });
+    const resCodec = await baseCodec.encode(extensionlessWebp, "dir.v1/avatar", cfg, undefined, undefined, mode);
+    assert.deepEqual(resCodec, { kind: "skipped", reason: "protected-extension" });
     const resAdaptive = await adaptive.encode(extensionlessWebp, "dir.v1/avatar", cfg, undefined, undefined, mode);
     assert.deepEqual(resAdaptive, { kind: "skipped", reason: "protected-extension" });
   }
+});
+
+test("unsupported host disables effective smart WebP pre-screening even when synced config has smartEnabled=true", async () => {
+  const syncedCfg = defaultImageFeatureConfig();
+  syncedCfg.auto.globalEnabled = true;
+  syncedCfg.compression.smartEnabled = true;
+
+  setSmartSupportResolverForTest(() => ({ supported: false, reason: "webp-encode-unsupported" }));
+  try {
+    await probeSmartCompressionSupport();
+    assert.equal(isSmartCompressionEffective(true), false);
+
+    assert.equal(
+      hasCompressibleInput({ kind: "files", files: [new File(["w"], "pic.webp", { type: "image/webp" })] }, syncedCfg),
+      false,
+    );
+
+    const remoteWebp = resolveSource("https://example.com/pic.webp", "https://siyuan.test");
+    const current = new Map([["blk\n" + remoteWebp.key, { blockID: "20240101000000-abcdefg", source: remoteWebp, count: 1 }]]);
+    assert.deepEqual(addedRemoteCandidates(new Map(), current, syncedCfg, "20240101000000-root123"), []);
+  } finally {
+    setSmartSupportResolverForTest(undefined);
+  }
+  assert.equal(isSmartCompressionEffective(true), true);
 });

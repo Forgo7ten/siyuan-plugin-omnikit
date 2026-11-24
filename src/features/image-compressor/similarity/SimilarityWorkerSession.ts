@@ -14,15 +14,41 @@ export interface SimilarityWorkerSessionOptions {
   signal?: AbortSignal;
 }
 
+export interface InitSessionOptions {
+  fullFrameMaxEdge?: number;
+  globalMaxEdge?: number;
+  patchSize?: number;
+  patchCount?: number;
+}
+
+export interface InitSessionResult {
+  width: number;
+  height: number;
+  patchCount: number;
+}
+
+export interface EncodeAndEvaluateOptions {
+  maxAllowedBytes?: number;
+  skipEvaluateIfOversize?: boolean;
+}
+
+export interface EncodeAndEvaluateResult {
+  blob: Blob;
+  bytes: number;
+  similarity?: number;
+}
+
 /**
- * Manages an inline similarity worker session for one image search.
- * Supports two-stage protocol (initOriginal pyramid caching + evaluate candidate).
+ * Manages a single-session inline similarity worker for one image search.
+ * Decodes and renders the source image once in `initSession`, then runs `encodeAndEvaluate` steps
+ * off the same `OffscreenCanvas` so candidate and reference frames are strictly co-aligned.
  */
 export class SimilarityWorkerSession {
   private readonly worker: Worker;
   private readonly pending = new Map<number, PendingRequest>();
   private nextID = 1;
   private disposed = false;
+  private disposePosted = false;
   private readonly abortHandler: () => void;
   private readonly signal?: AbortSignal;
 
@@ -49,11 +75,12 @@ export class SimilarityWorkerSession {
     this.signal?.addEventListener("abort", this.abortHandler, { once: true });
   }
 
-  initOriginal(
+  initSession(
     original: Blob,
-    maxEdge = 512,
-    originalDimensions?: { width: number; height: number },
-  ): Promise<{ width: number; height: number }> {
+    targetWidth: number,
+    targetHeight: number,
+    options: InitSessionOptions = {},
+  ): Promise<InitSessionResult> {
     if (this.disposed || this.signal?.aborted) {
       return Promise.reject(
         this.signal?.aborted
@@ -62,15 +89,19 @@ export class SimilarityWorkerSession {
       );
     }
     const id = this.nextID++;
-    return new Promise<{ width: number; height: number }>((resolve, reject) => {
+    return new Promise<InitSessionResult>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       try {
         const msg: SimilarityWorkerMessage = {
-          type: "initOriginal",
+          type: "initSession",
           id,
           original,
-          maxEdge,
-          ...(originalDimensions ? { width: originalDimensions.width, height: originalDimensions.height } : {}),
+          targetWidth,
+          targetHeight,
+          ...(options.fullFrameMaxEdge !== undefined ? { fullFrameMaxEdge: options.fullFrameMaxEdge } : {}),
+          ...(options.globalMaxEdge !== undefined ? { globalMaxEdge: options.globalMaxEdge } : {}),
+          ...(options.patchSize !== undefined ? { patchSize: options.patchSize } : {}),
+          ...(options.patchCount !== undefined ? { patchCount: options.patchCount } : {}),
         };
         this.worker.postMessage(msg);
       } catch (err) {
@@ -80,7 +111,10 @@ export class SimilarityWorkerSession {
     });
   }
 
-  evaluate(candidate: Blob): Promise<number> {
+  encodeAndEvaluate(
+    quality: number,
+    options: EncodeAndEvaluateOptions = {},
+  ): Promise<EncodeAndEvaluateResult> {
     if (this.disposed || this.signal?.aborted) {
       return Promise.reject(
         this.signal?.aborted
@@ -89,10 +123,18 @@ export class SimilarityWorkerSession {
       );
     }
     const id = this.nextID++;
-    return new Promise<number>((resolve, reject) => {
+    return new Promise<EncodeAndEvaluateResult>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       try {
-        const msg: SimilarityWorkerMessage = { type: "evaluate", id, candidate };
+        const msg: SimilarityWorkerMessage = {
+          type: "encodeAndEvaluate",
+          id,
+          quality,
+          ...(options.maxAllowedBytes !== undefined ? { maxAllowedBytes: options.maxAllowedBytes } : {}),
+          ...(options.skipEvaluateIfOversize !== undefined
+            ? { skipEvaluateIfOversize: options.skipEvaluateIfOversize }
+            : {}),
+        };
         this.worker.postMessage(msg);
       } catch (err) {
         this.pending.delete(id);
@@ -101,10 +143,55 @@ export class SimilarityWorkerSession {
     });
   }
 
+  async close(): Promise<void> {
+    if (this.disposed) return;
+    if (this.signal?.aborted) {
+      this.dispose(toAbortError(this.signal));
+      return;
+    }
+    const id = this.nextID++;
+    await new Promise<void>(resolve => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        resolve();
+      }, 50);
+      (timer as unknown as { unref?: () => void }).unref?.();
+      this.pending.set(id, {
+        resolve: () => {
+          clearTimeout(timer);
+          resolve();
+        },
+        reject: () => {
+          clearTimeout(timer);
+          resolve();
+        },
+      });
+      try {
+        const msg: SimilarityWorkerMessage = { type: "dispose", id };
+        this.disposePosted = true;
+        this.worker.postMessage(msg);
+      } catch {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        resolve();
+      }
+    });
+    this.dispose();
+  }
+
   dispose(reason: unknown = new DOMException("Similarity worker session closed", "AbortError")): void {
     if (this.disposed) return;
     this.disposed = true;
     this.signal?.removeEventListener("abort", this.abortHandler);
+    if (!this.disposePosted) {
+      try {
+        const msg: SimilarityWorkerMessage = { type: "dispose" };
+        this.disposePosted = true;
+        this.worker.postMessage(msg);
+      } catch {
+        // ignore postMessage errors on closing worker
+      }
+    }
     try {
       this.worker.terminate();
     } catch {
@@ -126,15 +213,40 @@ export class SimilarityWorkerSession {
       return;
     }
 
-    if (response.type === "initOriginal") {
-      req.resolve({ width: response.width ?? 0, height: response.height ?? 0 });
+    if (response.type === "dispose") {
+      req.resolve(undefined);
       return;
     }
 
-    if (typeof response.similarity !== "number" || !Number.isFinite(response.similarity)) {
-      req.reject(new Error("Similarity worker returned an invalid score"));
+    if (response.type === "initSession") {
+      req.resolve({
+        width: response.width ?? 0,
+        height: response.height ?? 0,
+        patchCount: response.patchCount ?? 0,
+      });
       return;
     }
-    req.resolve(response.similarity);
+
+    if (response.type === "encodeAndEvaluate") {
+      if (!(response.blob instanceof Blob) || typeof response.bytes !== "number" || response.bytes <= 0) {
+        req.reject(new Error("Similarity worker returned an invalid WebP candidate"));
+        return;
+      }
+      if (
+        response.similarity !== undefined &&
+        (!Number.isFinite(response.similarity) || response.similarity < 0 || response.similarity > 1)
+      ) {
+        req.reject(new Error("Similarity worker returned an invalid score"));
+        return;
+      }
+      req.resolve({
+        blob: response.blob,
+        bytes: response.bytes,
+        ...(response.similarity !== undefined ? { similarity: response.similarity } : {}),
+      });
+      return;
+    }
+
+    req.reject(new Error("Unexpected worker response"));
   }
 }

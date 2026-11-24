@@ -15,6 +15,7 @@ import {
   type ImageProcessingServices,
 } from "../services/ImageProcessingServices.ts";
 import type { Downloaded } from "../services/download.ts";
+import { probeSmartCompressionSupport } from "../services/image.ts";
 import { NODE_ID } from "../policy/parseImageConfig.ts";
 import { buildReplacementPath, imageSourceAttribute, resolveSource, trySource } from "../policy/source.ts";
 import { classifyImageCandidate } from "../policy/ImageCandidateClassifier.ts";
@@ -44,6 +45,7 @@ export interface ManualCompressionPreview {
   similarity?: number;
   targetSimilarity?: number;
   searchRounds?: Array<{ quality: number; similarity: number; bytes: number }>;
+  unreachable?: boolean;
 }
 
 export class LocalizationOutcomeError extends Error {
@@ -245,6 +247,11 @@ export async function compressSelectedImageCustom(
       return { kind: "notify", key: "image.single.noBenefit" };
     }
     const config = services.config();
+    const smartSupport = await probeSmartCompressionSupport().catch(() => ({
+      supported: false as const,
+      reason: "webp-encode-unsupported" as const,
+    }));
+    if (!scope.active || signal.aborted) return;
     let previewOriginal: Downloaded | undefined;
     let calibratedRemoteFile: File | undefined;
     const previewAbort = new AbortController();
@@ -260,11 +267,24 @@ export async function compressSelectedImageCustom(
         defaults: {
           quality: config.compression.initialQuality,
           manualMaxEdge: config.compression.manualMaxEdge,
+          smartEnabled: Boolean(config.compression.smartEnabled && smartSupport.supported),
+          targetSimilarity: config.compression.targetSimilarity,
+          smartSupported: smartSupport.supported,
         },
-        previewEncode: async (quality, manualMaxEdge) => {
+        previewEncode: async (quality, manualMaxEdge, smartOptions) => {
+          const smartActive = smartOptions !== undefined
+            ? smartOptions.smartEnabled
+            : Boolean(config.compression.smartEnabled && smartSupport.supported);
+          const targetSimilarity = smartOptions?.targetSimilarity ?? config.compression.targetSimilarity;
           const tunedConfig = {
             ...config,
-            compression: { ...config.compression, initialQuality: quality, manualMaxEdge },
+            compression: {
+              ...config.compression,
+              initialQuality: quality,
+              manualMaxEdge,
+              smartEnabled: smartActive,
+              targetSimilarity,
+            },
           };
           // 自定义压缩对话框在预览阶段先行下载远程图片并做魔数校验与编码测试，不上传或修改文档；
           // 仅在用户点击保存后才执行本地化上传与文档引用更新（无扩展名动图/矢量图在此即被拦截）。
@@ -303,6 +323,7 @@ export async function compressSelectedImageCustom(
             similarity: encoded.value.similarity,
             targetSimilarity: encoded.value.targetSimilarity,
             searchRounds: encoded.value.searchRounds,
+            ...(encoded.value.unreachable ? { unreachable: true } : {}),
           } satisfies ManualCompressionPreview;
         },
         save: async (preview, replace) => {

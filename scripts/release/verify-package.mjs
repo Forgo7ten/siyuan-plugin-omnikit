@@ -10,7 +10,7 @@ const required = [
   "dist/index.js", "dist/index.css", "dist/plugin.json",
   "dist/README.md", "dist/README.zh-CN.md",
   "dist/i18n/en.json", "dist/i18n/zh-CN.json",
-  "dist/browser-image-compression.js", "dist/icon.png", "dist/preview.png",
+  "dist/icon.png", "dist/preview.png",
   "dist/assets/omnikit-menu.svg", "dist/assets/omnikit-plugin.svg", "package.zip",
 ];
 for (const relPath of required) {
@@ -65,7 +65,7 @@ for (let index = 0; index < entryCount; index++) {
 }
 for (const entry of [
   "index.js", "index.css", "plugin.json", "i18n/en.json", "i18n/zh-CN.json",
-  "browser-image-compression.js", "icon.png", "preview.png",
+  "icon.png", "preview.png",
   "assets/omnikit-menu.svg", "assets/omnikit-plugin.svg",
 ]) {
   assert.ok(zipEntries.includes(entry), `Missing package.zip entry: ${entry}`);

@@ -1,4 +1,5 @@
 export const MiB = 1024 * 1024;
+export const WEBP_MAX_DIMENSION = 16_383;
 export const NODE_ID = /^\d{14}-[a-z0-9]{7}$/;
 
 /** Runtime limits remain part of the validated in-memory config. */
@@ -80,7 +81,7 @@ export function parseImageConfig(raw: unknown): ImageConfig {
     compression: {
       ...defaults.compression,
       initialQuality: number(c.initialQuality, "initialQuality", 0.01, 1),
-      manualMaxEdge: number(c.manualMaxEdge, "manualMaxEdge", 512, 16_384, true),
+      manualMaxEdge: number(c.manualMaxEdge, "manualMaxEdge", 512, WEBP_MAX_DIMENSION, true),
       excludedExtensions: [...new Set(c.excludedExtensions as string[])],
       smartEnabled,
       targetSimilarity,

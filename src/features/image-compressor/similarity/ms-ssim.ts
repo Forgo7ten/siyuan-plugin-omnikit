@@ -8,6 +8,8 @@ export interface MSSSIMOptions {
   maxScales?: number;
   windowSize?: number;
   sigma?: number;
+  weights?: readonly number[];
+  poolingExponent?: number;
 }
 
 export interface ChannelComponents {
@@ -35,11 +37,11 @@ export interface PrecomputedOriginal {
   includeAlpha: boolean;
   totalScales: number;
   weights: number[];
+  poolingExponent: number;
   scales: PrecomputedScale[];
 }
 
-const DEFAULT_WEIGHTS = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333];
-const LUMA_WEIGHTS = [0.2126, 0.7152, 0.0722];
+export const DEFAULT_WEIGHTS = [0.20, 0.30, 0.25, 0.15, 0.10];
 const C1 = (0.01 * 255) ** 2;
 const C2 = (0.03 * 255) ** 2;
 
@@ -62,33 +64,51 @@ export function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
 
-/**
- * Pre-multiplies alpha into RGB channels:
- * - When alpha === 0, RGB is zeroed out to eliminate invisible background noise.
- * - When 0 < alpha < 255, RGB is scaled by alpha/255 (not idempotent in place).
- */
-export function applyAlphaPremultiply(frame: PixelFrame): void {
-  const data = frame.data;
-  for (let i = 0; i < data.length; i += 4) {
-    const alpha = data[i + 3];
-    if (alpha === 0) {
-      data[i] = 0;
-      data[i + 1] = 0;
-      data[i + 2] = 0;
-    } else if (alpha < 255) {
-      data[i] = Math.round((data[i] * alpha) / 255);
-      data[i + 1] = Math.round((data[i + 1] * alpha) / 255);
-      data[i + 2] = Math.round((data[i + 2] * alpha) / 255);
-    }
-  }
-}
-
 export function containsTransparency(frame: PixelFrame): boolean {
   const data = frame.data;
   for (let i = 3; i < data.length; i += 4) {
     if (data[i] !== 255) return true;
   }
   return false;
+}
+
+/**
+ * Extracts perceptual Rec.709 floating-point premultiplied luminance plane and optional alpha plane
+ * in a single pass without mutating `frame.data`.
+ */
+export function extractPerceptualPlanes(frame: PixelFrame): { luma: Float32Array; alpha?: Float32Array } {
+  assertFrame(frame, "frame");
+  const pixelCount = frame.width * frame.height;
+  const luma = new Float32Array(pixelCount);
+  let alpha: Float32Array | undefined;
+  const data = frame.data;
+
+  for (let p = 0, i = 0; p < pixelCount; p++, i += 4) {
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const a = data[i + 3];
+    if (a === 255) {
+      luma[p] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      if (alpha !== undefined) {
+        alpha[p] = 255;
+      }
+    } else {
+      if (alpha === undefined) {
+        alpha = new Float32Array(pixelCount);
+        alpha.fill(255, 0, p);
+      }
+      if (a === 0) {
+        luma[p] = 0;
+        alpha[p] = 0;
+      } else {
+        luma[p] = (0.2126 * r + 0.7152 * g + 0.0722 * b) * (a / 255);
+        alpha[p] = a;
+      }
+    }
+  }
+
+  return alpha ? { luma, alpha } : { luma };
 }
 
 export function makeGaussianKernel(size: number, sigma: number): Float32Array {
@@ -110,11 +130,24 @@ export function gaussianBlur(
   width: number,
   height: number,
   kernel: Float32Array,
+  scratchHorizontal?: Float32Array,
+  outputBuffer?: Float32Array,
 ): Float32Array {
-  if (kernel.length === 1) return source;
+  const len = width * height;
+  if (kernel.length === 1) {
+    if (outputBuffer && outputBuffer.length >= len && outputBuffer !== source) {
+      outputBuffer.set(source.subarray(0, len), 0);
+      return outputBuffer.length === len ? outputBuffer : outputBuffer.subarray(0, len);
+    }
+    return source.length === len ? source : source.subarray(0, len);
+  }
   const radius = Math.floor(kernel.length / 2);
-  const horizontal = new Float32Array(source.length);
-  const output = new Float32Array(source.length);
+  const horizontal = scratchHorizontal && scratchHorizontal.length >= len
+    ? scratchHorizontal
+    : new Float32Array(len);
+  const output = outputBuffer && outputBuffer.length >= len
+    ? outputBuffer
+    : new Float32Array(len);
 
   for (let y = 0; y < height; y++) {
     const row = y * width;
@@ -129,24 +162,17 @@ export function gaussianBlur(
   }
 
   for (let y = 0; y < height; y++) {
+    const row = y * width;
     for (let x = 0; x < width; x++) {
       let sum = 0;
       for (let k = -radius; k <= radius; k++) {
         const sy = Math.max(0, Math.min(height - 1, y + k));
         sum += horizontal[sy * width + x] * kernel[k + radius];
       }
-      output[y * width + x] = sum;
+      output[row + x] = sum;
     }
   }
-  return output;
-}
-
-export function channelPlane(frame: PixelFrame, channel: number): Float32Array {
-  const output = new Float32Array(frame.width * frame.height);
-  for (let pixel = 0, offset = channel; pixel < output.length; pixel++, offset += 4) {
-    output[pixel] = frame.data[offset];
-  }
-  return output;
+  return output.length === len ? output : output.subarray(0, len);
 }
 
 export function downsample(
@@ -189,72 +215,71 @@ export function windowFor(width: number, height: number, preferred: number): num
   return edge % 2 === 0 ? edge - 1 : edge;
 }
 
-export function combineChannels(
+function combinePerceptualChannels(
   values: ChannelComponents[],
   includeAlpha: boolean,
 ): ChannelComponents {
-  const rgbLuminance =
-    values[0].luminance * LUMA_WEIGHTS[0] +
-    values[1].luminance * LUMA_WEIGHTS[1] +
-    values[2].luminance * LUMA_WEIGHTS[2];
-  const rgbContrast =
-    values[0].contrastStructure * LUMA_WEIGHTS[0] +
-    values[1].contrastStructure * LUMA_WEIGHTS[1] +
-    values[2].contrastStructure * LUMA_WEIGHTS[2];
-
-  if (!includeAlpha || values.length < 4) {
-    return { luminance: rgbLuminance, contrastStructure: rgbContrast };
+  if (!includeAlpha || values.length < 2) {
+    return values[0];
   }
   return {
-    luminance: rgbLuminance * 0.8 + values[3].luminance * 0.2,
-    contrastStructure: rgbContrast * 0.8 + values[3].contrastStructure * 0.2,
+    luminance: values[0].luminance * 0.85 + values[1].luminance * 0.15,
+    contrastStructure: values[0].contrastStructure * 0.85 + values[1].contrastStructure * 0.15,
   };
 }
 
 /**
- * Precalculates the 5-scale pyramid and Gaussian statistics (meanA, meanA2, varianceA)
- * for the original image once.
+ * Precalculates the 5-scale pyramid and Gaussian statistics (meanA, varianceA)
+ * for the original image once without mutating `frame.data`.
  */
 export function precalculateOriginal(
   frame: PixelFrame,
   options: MSSSIMOptions = {},
 ): PrecomputedOriginal {
   assertFrame(frame, "original");
-  applyAlphaPremultiply(frame);
 
   const requestedScales = Math.max(1, Math.min(5, Math.floor(options.maxScales ?? 5)));
   const preferredWindow = Math.max(1, Math.floor(options.windowSize ?? 11));
   const preferredSigma = Math.max(0.1, options.sigma ?? 1.5);
+  const poolingExponent = options.poolingExponent ?? 4;
   const totalScales = scaleCount(frame.width, frame.height, requestedScales);
 
-  const weights = DEFAULT_WEIGHTS.slice(0, totalScales);
+  const sourceWeights = options.weights && options.weights.length >= totalScales
+    ? options.weights
+    : DEFAULT_WEIGHTS;
+  const weights = sourceWeights.slice(0, totalScales);
   const weightTotal = weights.reduce((sum, v) => sum + v, 0);
   for (let i = 0; i < weights.length; i++) weights[i] /= weightTotal;
 
-  const includeAlpha = containsTransparency(frame);
-  const activeChannels = includeAlpha ? [0, 1, 2, 3] : [0, 1, 2];
+  const planes = extractPerceptualPlanes(frame);
+  const includeAlpha = planes.alpha !== undefined;
+  let channels: Float32Array[] = planes.alpha ? [planes.luma, planes.alpha] : [planes.luma];
 
   let width = frame.width;
   let height = frame.height;
-  let channels = activeChannels.map(c => channelPlane(frame, c));
+  const maxLen = width * height;
+  const a2Scratch = new Float32Array(maxLen);
+  const scratchH = new Float32Array(maxLen);
+  const meanA2Scratch = new Float32Array(maxLen);
   const scales: PrecomputedScale[] = [];
 
   for (let scale = 0; scale < totalScales; scale++) {
     const windowSize = windowFor(width, height, preferredWindow);
     const sigma = preferredSigma * (windowSize / preferredWindow);
     const kernel = makeGaussianKernel(windowSize, sigma);
+    const len = width * height;
 
     const scaleChannels: PrecomputedScaleChannel[] = [];
     for (let i = 0; i < channels.length; i++) {
       const a = channels[i];
-      const a2 = new Float32Array(a.length);
-      for (let j = 0; j < a.length; j++) {
+      const a2 = a2Scratch.subarray(0, len);
+      for (let j = 0; j < len; j++) {
         a2[j] = a[j] * a[j];
       }
-      const meanA = gaussianBlur(a, width, height, kernel);
-      const meanA2 = gaussianBlur(a2, width, height, kernel);
-      const varianceA = new Float32Array(a.length);
-      for (let j = 0; j < a.length; j++) {
+      const meanA = gaussianBlur(a, width, height, kernel, scratchH);
+      const meanA2 = gaussianBlur(a2, width, height, kernel, scratchH, meanA2Scratch.subarray(0, len));
+      const varianceA = new Float32Array(len);
+      for (let j = 0; j < len; j++) {
         varianceA[j] = Math.max(0, meanA2[j] - meanA[j] * meanA[j]);
       }
       scaleChannels.push({ a, meanA, varianceA });
@@ -275,35 +300,56 @@ export function precalculateOriginal(
     includeAlpha,
     totalScales,
     weights,
+    poolingExponent,
     scales,
   };
 }
 
 /**
- * Fast evaluation of candidate WebP using precalculated original statistics.
- * Bypasses 50%+ of Gaussian convolution work and avoids re-decoding original image.
+ * Fast evaluation of candidate WebP using precalculated original statistics,
+ * reusable convolution scratch buffers, and L4 error spatial pooling.
  */
 export function evaluateMSSSIMWithPrecomputed(
   precomputed: PrecomputedOriginal,
   candidate: PixelFrame,
+  options?: Pick<MSSSIMOptions, "poolingExponent">,
 ): number {
   assertFrame(candidate, "candidate");
   if (candidate.width !== precomputed.width || candidate.height !== precomputed.height) {
     throw new Error("Candidate dimensions do not match precalculated original");
   }
-  applyAlphaPremultiply(candidate);
 
-  const activeChannels = precomputed.includeAlpha ? [0, 1, 2, 3] : [0, 1, 2];
-  let channels = activeChannels.map(c => channelPlane(candidate, c));
+  const planes = extractPerceptualPlanes(candidate);
+  let channels: Float32Array[];
+  if (precomputed.includeAlpha) {
+    let alphaPlane = planes.alpha;
+    if (!alphaPlane) {
+      alphaPlane = new Float32Array(candidate.width * candidate.height);
+      alphaPlane.fill(255);
+    }
+    channels = [planes.luma, alphaPlane];
+  } else {
+    channels = [planes.luma];
+  }
+
   let width = candidate.width;
   let height = candidate.height;
+  const maxLen = width * height;
+  const b2Buf = new Float32Array(maxLen);
+  const abBuf = new Float32Array(maxLen);
+  const scratchH = new Float32Array(maxLen);
+  const meanBBuf = new Float32Array(maxLen);
+  const meanB2Buf = new Float32Array(maxLen);
+  const meanABBuf = new Float32Array(maxLen);
 
+  const poolingExponent = options?.poolingExponent ?? precomputed.poolingExponent ?? 4;
   const luminanceByScale: number[] = [];
   const contrastByScale: number[] = [];
 
   for (let scale = 0; scale < precomputed.totalScales; scale++) {
     const scaleInfo = precomputed.scales[scale];
     const kernel = scaleInfo.kernel;
+    const len = width * height;
 
     const channelResults: ChannelComponents[] = [];
     for (let i = 0; i < channels.length; i++) {
@@ -313,39 +359,77 @@ export function evaluateMSSSIMWithPrecomputed(
       const meanA = preCh.meanA;
       const varianceA = preCh.varianceA;
 
-      const b2 = new Float32Array(b.length);
-      const ab = new Float32Array(b.length);
-      for (let j = 0; j < b.length; j++) {
+      const b2 = b2Buf.subarray(0, len);
+      const ab = abBuf.subarray(0, len);
+      for (let j = 0; j < len; j++) {
         b2[j] = b[j] * b[j];
         ab[j] = a[j] * b[j];
       }
 
-      const meanB = gaussianBlur(b, width, height, kernel);
-      const meanB2 = gaussianBlur(b2, width, height, kernel);
-      const meanAB = gaussianBlur(ab, width, height, kernel);
+      const meanB = gaussianBlur(b, width, height, kernel, scratchH, meanBBuf.subarray(0, len));
+      const meanB2 = gaussianBlur(b2, width, height, kernel, scratchH, meanB2Buf.subarray(0, len));
+      const meanAB = gaussianBlur(ab, width, height, kernel, scratchH, meanABBuf.subarray(0, len));
 
       let luminanceTotal = 0;
-      let contrastStructureTotal = 0;
-      const len = b.length;
-      for (let j = 0; j < len; j++) {
-        const ma = meanA[j];
-        const mb = meanB[j];
-        const va = varianceA[j];
-        const vb = Math.max(0, meanB2[j] - mb * mb);
-        const cov = meanAB[j] - ma * mb;
+      let contrastStructure = 0;
 
-        const lum = (2 * ma * mb + C1) / (ma * ma + mb * mb + C1);
-        const cs = (2 * cov + C2) / (va + vb + C2);
-        luminanceTotal += clamp01(lum);
-        contrastStructureTotal += clamp01(cs);
+      if (poolingExponent === 1) {
+        let csTotal = 0;
+        for (let j = 0; j < len; j++) {
+          const ma = meanA[j];
+          const mb = meanB[j];
+          const va = varianceA[j];
+          const vb = Math.max(0, meanB2[j] - mb * mb);
+          const cov = meanAB[j] - ma * mb;
+
+          const lum = (2 * ma * mb + C1) / (ma * ma + mb * mb + C1);
+          const cs = (2 * cov + C2) / (va + vb + C2);
+          luminanceTotal += clamp01(lum);
+          csTotal += clamp01(cs);
+        }
+        contrastStructure = csTotal / len;
+      } else if (poolingExponent === 4) {
+        let err4Total = 0;
+        for (let j = 0; j < len; j++) {
+          const ma = meanA[j];
+          const mb = meanB[j];
+          const va = varianceA[j];
+          const vb = Math.max(0, meanB2[j] - mb * mb);
+          const cov = meanAB[j] - ma * mb;
+
+          const lum = (2 * ma * mb + C1) / (ma * ma + mb * mb + C1);
+          const cs = (2 * cov + C2) / (va + vb + C2);
+          luminanceTotal += clamp01(lum);
+          const csClamped = clamp01(cs);
+          const err = 1 - csClamped;
+          const err2 = err * err;
+          err4Total += err2 * err2;
+        }
+        contrastStructure = clamp01(1 - Math.pow(err4Total / len, 0.25));
+      } else {
+        let errPTotal = 0;
+        for (let j = 0; j < len; j++) {
+          const ma = meanA[j];
+          const mb = meanB[j];
+          const va = varianceA[j];
+          const vb = Math.max(0, meanB2[j] - mb * mb);
+          const cov = meanAB[j] - ma * mb;
+
+          const lum = (2 * ma * mb + C1) / (ma * ma + mb * mb + C1);
+          const cs = (2 * cov + C2) / (va + vb + C2);
+          luminanceTotal += clamp01(lum);
+          errPTotal += Math.pow(1 - clamp01(cs), poolingExponent);
+        }
+        contrastStructure = clamp01(1 - Math.pow(errPTotal / len, 1 / poolingExponent));
       }
+
       channelResults.push({
         luminance: luminanceTotal / len,
-        contrastStructure: contrastStructureTotal / len,
+        contrastStructure,
       });
     }
 
-    const combined = combineChannels(channelResults, precomputed.includeAlpha);
+    const combined = combinePerceptualChannels(channelResults, precomputed.includeAlpha);
     luminanceByScale.push(combined.luminance);
     contrastByScale.push(combined.contrastStructure);
 
@@ -378,5 +462,5 @@ export function computeMSSSIM(
   options: MSSSIMOptions = {},
 ): number {
   const pre = precalculateOriginal(a, options);
-  return evaluateMSSSIMWithPrecomputed(pre, b);
+  return evaluateMSSSIMWithPrecomputed(pre, b, options);
 }

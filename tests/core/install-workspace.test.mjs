@@ -13,7 +13,6 @@ const files = [
   "preview.png",
   "README.md",
   "README.zh-CN.md",
-  "browser-image-compression.js",
   "assets/omnikit-plugin.svg",
   "assets/omnikit-menu.svg",
   "i18n/en.json",

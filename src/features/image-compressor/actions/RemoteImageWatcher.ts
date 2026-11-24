@@ -6,6 +6,7 @@ import {
   localizeRemoteAsset,
   type ImageProcessingServices,
 } from "../services/ImageProcessingServices.ts";
+import { isSmartCompressionEffective } from "../services/image.ts";
 import type { OccurrenceTarget } from "../policy/contracts.ts";
 import { autoAllowed, type ImageConfig } from "../policy/parseImageConfig.ts";
 import { blockDOM, type DocumentRow } from "../services/references.ts";
@@ -45,7 +46,7 @@ export function addedRemoteCandidates(
       path: candidate.source.raw,
       mode: "auto",
       excludedExtensions: config.compression.excludedExtensions,
-      smartEnabled: config.compression.smartEnabled === true,
+      smartEnabled: isSmartCompressionEffective(config.compression.smartEnabled),
     });
     return decision.eligible ? [candidate] : [];
   });

@@ -1,6 +1,8 @@
 import { outputName } from "../policy/source.ts";
 import type { CompressionMode } from "../policy/contracts.ts";
 import { extractImageExtension, isProtectedDrawingPath, isWebpAllowed } from "../policy/ImageCandidateClassifier.ts";
+import { WEBP_MAX_DIMENSION } from "../policy/parseImageConfig.ts";
+export { WEBP_MAX_DIMENSION };
 
 export interface CompressionOptions {
   initialQuality: number;
@@ -25,6 +27,144 @@ export interface ImageInfo {
   width: number;
   height: number;
   animated: boolean;
+}
+
+export type SmartSupportReason =
+  | "missing-worker"
+  | "missing-offscreen-canvas"
+  | "missing-image-bitmap"
+  | "webp-encode-unsupported";
+
+export type SmartCompressionSupport =
+  | { supported: true }
+  | { supported: false; reason: SmartSupportReason };
+
+let customSmartSupportResolver: (() => SmartCompressionSupport | Promise<SmartCompressionSupport>) | undefined;
+let cachedSmartSupportPromise: Promise<SmartCompressionSupport> | undefined;
+let cachedSmartSupportValue: SmartCompressionSupport | undefined;
+
+export function setSmartSupportResolverForTest(
+  resolver?: () => SmartCompressionSupport | Promise<SmartCompressionSupport>,
+): void {
+  customSmartSupportResolver = resolver;
+  cachedSmartSupportPromise = undefined;
+  cachedSmartSupportValue = undefined;
+}
+
+export function getCachedSmartCompressionSupport(): SmartCompressionSupport | undefined {
+  return cachedSmartSupportValue;
+}
+
+export function isSmartCompressionEffective(smartEnabled: boolean | undefined): boolean {
+  if (!smartEnabled) return false;
+  return cachedSmartSupportValue ? cachedSmartSupportValue.supported : true;
+}
+
+async function canSpawnInlineWorker(): Promise<boolean> {
+  if (typeof Worker !== "function") return false;
+  if (typeof Blob !== "function" || typeof URL?.createObjectURL !== "function") {
+    return true;
+  }
+  const blob = new Blob(["self.onmessage=function(){self.postMessage(1)};"], {
+    type: "text/javascript;charset=utf-8",
+  });
+  const url = URL.createObjectURL(blob);
+  let worker: Worker | undefined;
+  try {
+    worker = new Worker(url);
+    if (typeof worker.postMessage !== "function") {
+      return true;
+    }
+    return await new Promise<boolean>(resolve => {
+      const timer = setTimeout(() => resolve(false), 200);
+      (timer as unknown as { unref?: () => void }).unref?.();
+      worker!.onmessage = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      worker!.onerror = () => {
+        clearTimeout(timer);
+        resolve(false);
+      };
+      worker!.postMessage(0);
+    });
+  } catch {
+    return false;
+  } finally {
+    try {
+      worker?.terminate();
+    } catch {
+      // ignore worker termination errors
+    }
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function detectSmartCompressionSupport(): Promise<SmartCompressionSupport> {
+  if (!(await canSpawnInlineWorker())) {
+    return { supported: false, reason: "missing-worker" };
+  }
+  if (typeof OffscreenCanvas !== "function") {
+    return { supported: false, reason: "missing-offscreen-canvas" };
+  }
+  if (typeof createImageBitmap !== "function") {
+    return { supported: false, reason: "missing-image-bitmap" };
+  }
+  const canvas = new OffscreenCanvas(1, 1);
+  try {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return { supported: false, reason: "missing-offscreen-canvas" };
+    }
+    if (typeof ctx.fillRect === "function") {
+      ctx.fillStyle = "#808080";
+      ctx.fillRect(0, 0, 1, 1);
+    }
+    const blob = await canvas.convertToBlob({ type: "image/webp", quality: 0.8 });
+    if (!blob || blob.type !== "image/webp" || blob.size <= 0) {
+      return { supported: false, reason: "webp-encode-unsupported" };
+    }
+    return { supported: true };
+  } catch {
+    return { supported: false, reason: "webp-encode-unsupported" };
+  } finally {
+    canvas.width = 0;
+    canvas.height = 0;
+  }
+}
+
+export function probeSmartCompressionSupport(): Promise<SmartCompressionSupport> {
+  if (customSmartSupportResolver) {
+    return Promise.resolve()
+      .then(() => customSmartSupportResolver!())
+      .then(result => {
+        cachedSmartSupportValue = result;
+        return result;
+      });
+  }
+  cachedSmartSupportPromise ??= detectSmartCompressionSupport().then(result => {
+    cachedSmartSupportValue = result;
+    return result;
+  });
+  return cachedSmartSupportPromise;
+}
+
+export function computeTargetDimensions(
+  width: number,
+  height: number,
+  mode: CompressionMode,
+  manualMaxEdge: number,
+): { width: number; height: number } {
+  if (mode === "auto" || mode === "document") {
+    return { width, height };
+  }
+  const longest = Math.max(1, width, height);
+  const maxEdge = Math.min(manualMaxEdge, longest);
+  const scale = Math.min(1, maxEdge / longest);
+  return {
+    width: Math.max(1, Math.floor(width * scale)),
+    height: Math.max(1, Math.floor(height * scale)),
+  };
 }
 
 const text = (b: Uint8Array, at: number, n: number) => String.fromCharCode(...b.subarray(at, at + n));
@@ -91,7 +231,6 @@ export function inspectImage(b: Uint8Array): ImageInfo {
       if (p + 2 > b.length) throw new Error("Truncated JPEG");
       const n = v.getUint16(p);
       if (n < 2 || n > b.length - p) throw new Error("Truncated JPEG segment");
-      if (marker === 226 && text(b, p + 2, 4) === "MPF\0") throw new Error("Multi-picture JPEG is protected");
       if (marker === 225 && n >= 14 && text(b, p + 2, 4) === "Exif" && b[p + 6] === 0 && b[p + 7] === 0) {
         const tiffStart = p + 8;
         const isLittle = b[tiffStart] === 0x49 && b[tiffStart + 1] === 0x49;
@@ -130,21 +269,14 @@ export function inspectImage(b: Uint8Array): ImageInfo {
   throw new Error("Unsupported image signature; GIF/SVG/HEIF/AVIF are not converted by this engine");
 }
 
-export interface BicOptions {
-  fileType: string;
-  initialQuality: number;
-  maxWidthOrHeight: number;
-  maxSizeMB: number;
-  maxIteration: number;
-  alwaysKeepResolution: boolean;
-  useWebWorker: boolean;
-  libURL: string;
+export interface RawWebpEncodeRequest {
+  width: number;
+  height: number;
+  quality: number;
   signal: AbortSignal;
-  preserveExif: boolean;
-  onProgress?: (percentage: number) => void;
 }
 
-export type BicFunction = (file: File, options: BicOptions) => Promise<Blob>;
+export type RawWebpEncodeFn = (blob: Blob, request: RawWebpEncodeRequest) => Promise<Blob>;
 
 export interface EncodedImage {
   file: File;
@@ -156,6 +288,7 @@ export interface EncodedImage {
   similarity?: number;
   targetSimilarity?: number;
   searchRounds?: Array<{ quality: number; similarity: number; bytes: number }>;
+  unreachable?: boolean;
 }
 
 export interface SmartSearchSummary {
@@ -253,6 +386,10 @@ export async function validateEncodeInput(
   if (!Number.isSafeInteger(info.width * info.height) || info.width * info.height > c.maxPixels) {
     throw new Error("Decoded pixel limit exceeded");
   }
+  const target = computeTargetDimensions(info.width, info.height, mode, c.manualMaxEdge);
+  if (target.width > WEBP_MAX_DIMENSION || target.height > WEBP_MAX_DIMENSION) {
+    return { kind: "skipped", reason: "dimension-limit-exceeded" };
+  }
   return { kind: "valid", info };
 }
 
@@ -296,17 +433,151 @@ export async function verifyBitmap(blob: Blob, signal?: AbortSignal, maxEdge?: n
   }
 }
 
+async function loadHtmlImage(blob: Blob, signal: AbortSignal): Promise<HTMLImageElement> {
+  if (signal.aborted) throw toAbortError(signal);
+  const objectURL = URL.createObjectURL(blob);
+  try {
+    return await new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image();
+      const cleanup = () => {
+        signal.removeEventListener("abort", cancel);
+        image.onload = null;
+        image.onerror = null;
+      };
+      const cancel = () => {
+        cleanup();
+        image.src = "";
+        reject(toAbortError(signal));
+      };
+      image.onload = () => {
+        cleanup();
+        resolve(image);
+      };
+      image.onerror = () => {
+        cleanup();
+        reject(new Error("Image decoder failed to decode source"));
+      };
+      signal.addEventListener("abort", cancel, { once: true });
+      if (signal.aborted) cancel();
+      else image.src = objectURL;
+    });
+  } finally {
+    URL.revokeObjectURL(objectURL);
+  }
+}
+
+export async function defaultCanvasWebpEncode(blob: Blob, request: RawWebpEncodeRequest): Promise<Blob> {
+  const { width, height, quality, signal } = request;
+  if (signal.aborted) throw toAbortError(signal);
+
+  if (typeof OffscreenCanvas === "function" && typeof createImageBitmap === "function") {
+    const canvas = new OffscreenCanvas(width, height);
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      const bitmap = await createImageBitmap(blob);
+      let bitmapClosed = false;
+      const closeBitmap = () => {
+        if (!bitmapClosed) {
+          bitmapClosed = true;
+          bitmap.close();
+        }
+      };
+      try {
+        if (signal.aborted) throw toAbortError(signal);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(bitmap, 0, 0, width, height);
+        closeBitmap();
+        if (signal.aborted) throw toAbortError(signal);
+        const encoded = await canvas.convertToBlob({ type: "image/webp", quality });
+        if (encoded && encoded.type === "image/webp" && encoded.size > 0) {
+          return encoded;
+        }
+      } finally {
+        closeBitmap();
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+    } else {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+  }
+
+  if (typeof document !== "undefined" && typeof document.createElement === "function") {
+    const canvas = document.createElement("canvas");
+    try {
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("HTMLCanvasElement 2D context unavailable");
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+
+      if (typeof createImageBitmap === "function") {
+        const bitmap = await createImageBitmap(blob);
+        let bitmapClosed = false;
+        const closeBitmap = () => {
+          if (!bitmapClosed) {
+            bitmapClosed = true;
+            bitmap.close();
+          }
+        };
+        try {
+          if (signal.aborted) throw toAbortError(signal);
+          ctx.drawImage(bitmap, 0, 0, width, height);
+          closeBitmap();
+        } finally {
+          closeBitmap();
+        }
+      } else {
+        const image = await loadHtmlImage(blob, signal);
+        if (signal.aborted) throw toAbortError(signal);
+        ctx.drawImage(image, 0, 0, width, height);
+      }
+
+      if (signal.aborted) throw toAbortError(signal);
+      return await new Promise<Blob>((resolve, reject) => {
+        let settled = false;
+        const onAbort = () => {
+          if (settled) return;
+          settled = true;
+          reject(toAbortError(signal));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        canvas.toBlob(
+          encoded => {
+            if (settled) return;
+            settled = true;
+            signal.removeEventListener("abort", onAbort);
+            if (!encoded) {
+              reject(new Error("Canvas toBlob returned null"));
+            } else {
+              resolve(encoded);
+            }
+          },
+          "image/webp",
+          quality,
+        );
+      });
+    } finally {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+  }
+
+  throw new Error("Canvas WebP encoding is unavailable in the current environment");
+}
+
 /**
- * Browser-Image-Compression (Canvas/UPNG based) implementation of ImageCodec.
- * Relies on hard limits (maxDimension, maxPixels, maxInputBytes) and worker concurrency
- * instead of an artificial virtual memory quota.
+ * Zero-dependency native Canvas WebP encoder (OffscreenCanvas primary, HTMLCanvasElement fallback).
+ * Encodes strictly once at the requested quality without hidden iterative quality degradation.
  */
-export class BicEncoder implements ImageCodec {
-  readonly name = "bic-encoder";
+export class CanvasWebpEncoder implements ImageCodec {
+  readonly name = "canvas-webp-encoder";
 
   constructor(
-    private readonly bic: BicFunction,
-    private readonly libURL: string,
+    private readonly rawEncode: RawWebpEncodeFn = defaultCanvasWebpEncode,
     private readonly decode = verifyBitmap,
   ) {}
 
@@ -315,7 +586,7 @@ export class BicEncoder implements ImageCodec {
     name: string,
     config: ImageConfig,
     signal?: AbortSignal,
-    onProgress?: (n: number) => void,
+    _onProgress?: (n: number) => void,
     mode: CompressionMode = "auto",
     options: EncodeOptions = {},
   ): Promise<EncodeResult> {
@@ -323,45 +594,41 @@ export class BicEncoder implements ImageCodec {
     if (validated.kind === "skipped") return validated;
     const info = validated.info;
     const c = config.compression;
+    const expected = computeTargetDimensions(info.width, info.height, mode, c.manualMaxEdge);
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("Encode deadline exceeded")), c.maxEncodeMs);
     const relay = () => controller.abort(signal ? toAbortError(signal) : new DOMException("Operation cancelled", "AbortError"));
-    signal?.addEventListener("abort", relay, { once: true });
+    if (signal?.aborted) relay();
+    else signal?.addEventListener("abort", relay, { once: true });
 
     try {
-      const file = new File([blob], name, { type: info.mime });
-      const output = await this.bic(file, {
-        fileType: "image/webp",
-        initialQuality: c.initialQuality,
-        maxWidthOrHeight: (mode === "auto" || mode === "document")
-          ? Math.max(info.width, info.height) : Math.min(c.manualMaxEdge, Math.max(info.width, info.height)),
-        maxSizeMB: Infinity,
-        maxIteration: 3,
-        alwaysKeepResolution: mode === "auto" || mode === "document",
-        useWebWorker: true,
-        libURL: this.libURL,
+      const output = await this.rawEncode(blob, {
+        width: expected.width,
+        height: expected.height,
+        quality: c.initialQuality,
         signal: controller.signal,
-        preserveExif: false, // TODO: expose preserveExif once the WebP encoder reliably preserves EXIF metadata.
-        onProgress,
       });
 
       if (controller.signal.aborted) throw toAbortError(controller.signal);
-      if (output.type !== "image/webp" || !output.size || output.size > c.maxInputBytes) {
+      if (output.type !== "image/webp") {
+        return { kind: "skipped", reason: "webp-encode-unsupported" };
+      }
+      if (!output.size || output.size > c.maxInputBytes) {
         throw new Error("Encoder returned an invalid format/size");
       }
       const actual = inspectImage(new Uint8Array(await output.arrayBuffer()));
       if (actual.mime !== "image/webp" || actual.animated) throw new Error("Encoder output signature mismatch");
 
       const dimensions = await this.decode(output, controller.signal, OUTPUT_VERIFY_MAX_EDGE);
-      const strictDimensions = mode === "auto" || mode === "document";
-      const expectedMaxEdge = strictDimensions ? Math.max(info.width, info.height)
-        : Math.min(c.manualMaxEdge, Math.max(info.width, info.height));
-      const expectedScale = Math.min(1, expectedMaxEdge / Math.max(info.width, info.height));
-      const expectedWidth = Math.max(1, Math.floor(info.width * expectedScale));
-      const expectedHeight = Math.max(1, Math.floor(info.height * expectedScale));
-      if (!dimensions.width || !dimensions.height || !actual.width || !actual.height
-        || Math.abs(actual.width - expectedWidth) > 1 || Math.abs(actual.height - expectedHeight) > 1) {
+      if (
+        !dimensions.width ||
+        !dimensions.height ||
+        !actual.width ||
+        !actual.height ||
+        Math.abs(actual.width - expected.width) > 1 ||
+        Math.abs(actual.height - expected.height) > 1
+      ) {
         throw new Error("Unexpected output dimensions");
       }
 

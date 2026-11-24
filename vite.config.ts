@@ -13,8 +13,8 @@ const outDir = isDev ? "dev" : "dist";
  * Vite is the active bundler; no kernel.js is built, and all i18n source files remain
  * in src/i18n/{en,zh-CN}.json (NOT public/i18n).
  *
- * @safety browser-image-compression Worker is copied as an offline-local resource.
- * The output must be verified on both desktop and mobile before claiming support.
+ * @safety Similarity Worker is bundled as a self-contained inline worker (?worker&inline)
+ * with zero external static codec scripts. The output must be verified on both desktop and mobile.
  */
 export default defineConfig({
   plugins: [
@@ -24,11 +24,6 @@ export default defineConfig({
         { src: "plugin.json", dest: ".", rename: { stripBase: true } },
         { src: "README*.md", dest: ".", rename: { stripBase: true } },
         { src: "src/i18n/*.json", dest: "i18n", rename: { stripBase: true } },
-        {
-          src: "node_modules/browser-image-compression/dist/browser-image-compression.js",
-          dest: ".",
-          rename: { stripBase: true },
-        },
         { src: ".generated/icon.png", dest: ".", rename: { stripBase: true } },
         { src: ".generated/preview.png", dest: ".", rename: { stripBase: true } },
         { src: "assets/omnikit-*.svg", dest: "assets", rename: { stripBase: true } },

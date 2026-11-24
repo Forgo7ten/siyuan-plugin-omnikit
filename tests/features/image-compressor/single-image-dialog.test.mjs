@@ -39,15 +39,161 @@ test("manual compression previews in memory, hides EXIF UI controls, and saves t
   assert.match(ui, /manualCompression\(options\)/);
   assert.doesNotMatch(ui, /pickImage/);
   assert.match(dialog, /let replaceCurrent = \$state\(false\)/);
+  assert.match(dialog, /let smartEnabled = \$state\(false\)/);
+  assert.match(dialog, /image\.dialog\.smartMode/);
+  assert.match(dialog, /preview\.unreachable/);
+  assert.match(dialog, /image\.dialog\.unreachableWarning/);
+  assert.match(dialog, /formatCompressionRatio\(preview\.originalBytes, preview\.compressedBytes\)/);
+  assert.match(dialog, /max="16383"/);
   assert.match(dialog, /URL\.createObjectURL\(encoded\.file\)/);
   assert.match(dialog, /URL\.revokeObjectURL\(previewURL\)/);
   assert.doesNotMatch(dialog, /window\.confirm|>\s*取消\s*</);
+
+  // Settings panel capability gating, mobile perf hint, and mutually exclusive quality vs similarity slider
+  assert.match(settingsPanel, /probeSmartCompressionSupport/);
+  assert.match(settingsPanel, /disabled=\{!smartSupport\?\.supported\}/);
+  assert.match(settingsPanel, /settings\.smartUnsupported\.\$\{smartSupport\.reason\}/);
+  assert.match(settingsPanel, /settings\.smartMobilePerfHint/);
+  assert.match(settingsPanel, /\{#if \(smartSupport \? smartSupport\.supported : true\) && draft\.compression\.smartEnabled\}[\s\S]*?\{:else\}[\s\S]*?settings\.initialQuality/);
 
   // D09: No visible EXIF UI controls in either dialog or settings panel; schema preserves default false
   assert.doesNotMatch(dialog, /image\.dialog\.preserveExif/);
   assert.doesNotMatch(settingsPanel, /settings\.preserveExif|settings\.metadata/);
   assert.equal(defaultImageFeatureConfig().metadata.preserveExif, false);
   assert.throws(() => parseImageConfig({ ...defaultImageFeatureConfig(), metadata: { preserveExif: true } }));
+});
+
+test("compressSelectedImageCustom wires smart compression defaults, smartOptions overrides, and unreachable preview flag", async () => {
+  const { compressSelectedImageCustom } = await import("../../../src/features/image-compressor/actions/SingleImageAction.ts");
+  const { setSmartSupportResolverForTest } = await import("../../../src/features/image-compressor/services/image.ts");
+
+  const rootID = "20240101000000-abcdefg";
+  const notebook = "20240101000000-hijklmn";
+  const blockID = "20240101000000-opqrstu";
+  const assetPath = "assets/chart.png";
+  const dom = `<div data-node-id="${blockID}"><img src="${assetPath}"></div>`;
+
+  const priorDoc = globalThis.document;
+  globalThis.document = {
+    createElement: () => ({
+      innerHTML: "",
+      content: {
+        children: [{
+          getAttribute: attr => attr === "data-node-id" ? blockID : null,
+          querySelector: () => null,
+          querySelectorAll: () => [{
+            hasAttribute: attr => attr === "src",
+            getAttribute: attr => attr === "src" ? assetPath : null,
+          }],
+        }],
+      },
+    }),
+  };
+
+  const scope = new FeatureScope();
+  try {
+    const imgElement = {
+      matches: () => true,
+      closest: sel => sel === "[data-node-id]"
+        ? { getAttribute: attr => attr === "data-node-id" ? blockID : null, querySelectorAll: () => [imgElement] }
+        : null,
+      hasAttribute: attr => attr === "src",
+      getAttribute: attr => attr === "src" ? assetPath : null,
+    };
+
+    const seenConfigs = [];
+    let dialogOpts;
+    const cfg = defaultImageFeatureConfig();
+    cfg.compression.smartEnabled = true;
+    cfg.compression.targetSimilarity = 0.992;
+
+    setSmartSupportResolverForTest(() => ({ supported: true }));
+
+    await compressSelectedImageCustom(
+      { element: imgElement },
+      { plugin: { i18n: {} }, logger: { warn() {}, debug() {} } },
+      scope,
+      { rootID, notebook },
+      {
+        origin: "https://siyuan.test",
+        userAgent: () => "OmniKit/Test",
+        config: () => cfg,
+        kernel: { post: async () => ({ code: 0, data: { id: blockID, dom } }) },
+        reader: {
+          read: async () => ({
+            blob: new Blob([new Uint8Array(64)], { type: "image/png" }),
+            name: "chart.png",
+          }),
+        },
+        encoder: {
+          encode: async (_blob, _name, tunedConfig) => {
+            seenConfigs.push(tunedConfig);
+            return {
+              kind: "encoded",
+              value: {
+                file: new File(["webp"], "chart.webp", { type: "image/webp" }),
+                originalBytes: 64,
+                outputBytes: 32,
+                width: 100,
+                height: 80,
+                quality: tunedConfig.compression.smartEnabled ? 1.0 : tunedConfig.compression.initialQuality,
+                similarity: tunedConfig.compression.smartEnabled ? 0.975 : undefined,
+                targetSimilarity: tunedConfig.compression.smartEnabled ? tunedConfig.compression.targetSimilarity : undefined,
+                unreachable: tunedConfig.compression.smartEnabled ? true : undefined,
+              },
+            };
+          },
+        },
+        ui: {
+          manualCompression: opts => { dialogOpts = opts; },
+          notify() {},
+          copyablePath() {},
+        },
+      },
+    );
+
+    assert.equal(dialogOpts.defaults.smartSupported, true);
+    assert.equal(dialogOpts.defaults.smartEnabled, true);
+    assert.equal(dialogOpts.defaults.targetSimilarity, 0.992);
+
+    // Smart preview propagates unreachable: true
+    const smartPreview = await dialogOpts.previewEncode(0.8, 2048, { smartEnabled: true, targetSimilarity: 0.995 });
+    assert.equal(smartPreview.unreachable, true);
+    assert.equal(seenConfigs[0].compression.smartEnabled, true);
+    assert.equal(seenConfigs[0].compression.targetSimilarity, 0.995);
+    assert.equal(seenConfigs[0].compression.manualMaxEdge, 2048);
+
+    // Toggling smart search off in dialog overrides global smartEnabled=true
+    const fixedPreview = await dialogOpts.previewEncode(0.65, 2048, { smartEnabled: false, targetSimilarity: 0.995 });
+    assert.equal(fixedPreview.unreachable, undefined);
+    assert.equal(seenConfigs[1].compression.smartEnabled, false);
+    assert.equal(seenConfigs[1].compression.initialQuality, 0.65);
+
+    // Unsupported host disables smart defaults while keeping config untouched
+    setSmartSupportResolverForTest(() => ({ supported: false, reason: "webp-encode-unsupported" }));
+    await compressSelectedImageCustom(
+      { element: imgElement },
+      { plugin: { i18n: {} }, logger: { warn() {}, debug() {} } },
+      scope,
+      { rootID, notebook },
+      {
+        origin: "https://siyuan.test",
+        userAgent: () => "OmniKit/Test",
+        config: () => cfg,
+        kernel: { post: async () => ({ code: 0, data: { id: blockID, dom } }) },
+        reader: { read: async () => ({ blob: new Blob(["x"]), name: "chart.png" }) },
+        encoder: { encode: async () => ({ kind: "skipped", reason: "unused" }) },
+        ui: { manualCompression: opts => { dialogOpts = opts; }, notify() {}, copyablePath() {} },
+      },
+    );
+    assert.equal(dialogOpts.defaults.smartSupported, false);
+    assert.equal(dialogOpts.defaults.smartEnabled, false);
+    assert.equal(cfg.compression.smartEnabled, true, "stored config boolean must remain untouched");
+  } finally {
+    setSmartSupportResolverForTest(undefined);
+    scope.dispose();
+    globalThis.document = priorDoc;
+  }
 });
 
 test("savePreview with replace: false generates asset and record with zero updateBlock calls for local assets", async () => {

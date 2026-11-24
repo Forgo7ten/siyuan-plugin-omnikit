@@ -55,8 +55,12 @@ test("image config validates complete grouped settings and document permissions 
 });
 
 test("compression options enforce numeric bounds and complete schema", () => {
+  const maxAllowed = valid();
+  maxAllowed.compression.manualMaxEdge = 16383;
+  assert.equal(parseImageConfig(maxAllowed).compression.manualMaxEdge, 16383);
+
   for (const value of [0.009, 1.01]) rejects(c => { c.compression.initialQuality = value; }, `quality ${value}`);
-  for (const value of [512.5, 511, 16385]) rejects(c => { c.compression.manualMaxEdge = value; }, `dimension ${value}`);
+  for (const value of [512.5, 511, 16384]) rejects(c => { c.compression.manualMaxEdge = value; }, `dimension ${value}`);
   rejects(c => { c.metadata.preserveExif = true; }, "EXIF unsupported");
 });
 

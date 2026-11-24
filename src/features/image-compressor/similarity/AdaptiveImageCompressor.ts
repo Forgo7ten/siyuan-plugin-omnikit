@@ -3,18 +3,27 @@ import { adaptiveQualitySearch, type QualitySearchProgress } from "./adaptive-qu
 import { SimilarityWorkerSession, type WorkerFactory } from "./SimilarityWorkerSession.ts";
 import { getSimilarityPolicy } from "./similarity-policy.ts";
 import type { CompressionMode } from "../policy/contracts.ts";
+import { outputName } from "../policy/source.ts";
 import {
+  computeTargetDimensions,
+  inspectImage,
+  probeSmartCompressionSupport,
   toAbortError,
   validateEncodeInput,
+  verifyBitmap,
   type EncodeOptions,
   type EncodeResult,
   type ImageCodec,
+  type ImageInfo,
 } from "../services/image.ts";
 import type { ImageConfig } from "../policy/parseImageConfig.ts";
 
 export interface AdaptiveImageCompressorOptions {
   workerFactory?: WorkerFactory;
+  decode?: typeof verifyBitmap;
 }
+
+const OUTPUT_VERIFY_MAX_EDGE = 64;
 
 function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) {
@@ -50,11 +59,10 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 }
 
 /**
- * Opt-in adaptive quality search wrapping an underlying ImageCodec (e.g. BicEncoder).
- * When smartEnabled is false, delegates directly to the underlying codec.
- * When smartEnabled is true, conducts an MS-SSIM bounded search across quality levels,
- * enforcing the 4 KiB / 5% dual savings threshold, a bounded overall time budget, and
- * returning unreachable if the target similarity cannot be achieved.
+ * Opt-in adaptive quality search wrapping an underlying ImageCodec (e.g. CanvasWebpEncoder).
+ * When smartEnabled is false (or the host lacks Worker/OffscreenCanvas/WebP support), delegates
+ * to the fixed-quality codec. When smartEnabled is true, runs single-session co-aligned WebP
+ * encoding and hybrid MS-SSIM evaluation in an inline Worker.
  */
 export class AdaptiveImageCompressor implements ImageCodec {
   readonly name = "adaptive-ms-ssim";
@@ -77,10 +85,36 @@ export class AdaptiveImageCompressor implements ImageCodec {
       return this.codec.encode(blob, name, config, signal, onProgress, mode, options);
     }
 
+    if (!this.options.workerFactory) {
+      const support = await probeSmartCompressionSupport();
+      if (!support.supported) {
+        const fallbackConfig: ImageConfig = {
+          ...config,
+          compression: { ...config.compression, smartEnabled: false },
+        };
+        return this.codec.encode(blob, name, fallbackConfig, signal, onProgress, mode, options);
+      }
+    }
+
     const validated = await validateEncodeInput(blob, name, config, mode, signal, options.originalInfo);
     if (validated.kind === "skipped") return validated;
     const originalInfo = validated.info;
     const c = config.compression;
+    const target = computeTargetDimensions(originalInfo.width, originalInfo.height, mode, c.manualMaxEdge);
+
+    const enforceSavings = options.enforceSavings !== false && mode !== "manual-dialog";
+    let maxAllowedBytes: number | undefined;
+    if (enforceSavings) {
+      const requiredSaving = Math.max(1, c.minSavingBytes, Math.ceil(blob.size * c.minSavingRatio));
+      maxAllowedBytes = blob.size - requiredSaving;
+      if (maxAllowedBytes <= 0) {
+        return {
+          kind: "skipped",
+          reason: "insufficient-savings",
+          originalBytes: blob.size,
+        };
+      }
+    }
 
     const policy = getSimilarityPolicy();
     const budgetMs = Number.isFinite(c.maxEncodeMs) && c.maxEncodeMs > 0 ? c.maxEncodeMs : 45_000;
@@ -90,8 +124,34 @@ export class AdaptiveImageCompressor implements ImageCodec {
     }, budgetMs);
     const effectiveSignal = combineSignals(signal, deadlineController.signal) ?? deadlineController.signal;
 
+    const verifyCandidateBlob = async (candidateBlob: Blob): Promise<ImageInfo> => {
+      if (effectiveSignal.aborted) throw toAbortError(effectiveSignal);
+      if (candidateBlob.type !== "image/webp") {
+        throw new Error("WebP encoding is not supported by the current host engine");
+      }
+      if (!candidateBlob.size || candidateBlob.size > c.maxInputBytes) {
+        throw new Error("Encoder returned an invalid format/size");
+      }
+      const actual = inspectImage(new Uint8Array(await candidateBlob.arrayBuffer()));
+      if (actual.mime !== "image/webp" || actual.animated) {
+        throw new Error("Encoder output signature mismatch");
+      }
+      const decode = this.options.decode ?? verifyBitmap;
+      const dimensions = await decode(candidateBlob, effectiveSignal, OUTPUT_VERIFY_MAX_EDGE);
+      if (
+        !dimensions.width ||
+        !dimensions.height ||
+        !actual.width ||
+        !actual.height ||
+        Math.abs(actual.width - target.width) > 1 ||
+        Math.abs(actual.height - target.height) > 1
+      ) {
+        throw new Error("Unexpected output dimensions");
+      }
+      return actual;
+    };
+
     let worker: SimilarityWorkerSession | undefined;
-    const encodedByQuality = new Map<number, Extract<EncodeResult, { kind: "encoded" }>["value"]>();
 
     try {
       const session = new SimilarityWorkerSession({
@@ -100,9 +160,11 @@ export class AdaptiveImageCompressor implements ImageCodec {
       });
       worker = session;
       await raceAbort(
-        session.initOriginal(blob, policy.benchmarkMaxEdge, {
-          width: originalInfo.width,
-          height: originalInfo.height,
+        session.initSession(blob, target.width, target.height, {
+          fullFrameMaxEdge: policy.fullFrameMaxEdge,
+          globalMaxEdge: policy.globalMaxEdge,
+          patchSize: policy.patchSize,
+          patchCount: policy.patchCount,
         }),
         effectiveSignal,
       );
@@ -111,36 +173,18 @@ export class AdaptiveImageCompressor implements ImageCodec {
       const search = await raceAbort(
         adaptiveQualitySearch({
           targetSimilarity,
-          initialQuality: config.compression.initialQuality,
+          initialQuality: policy.startQuality,
           minQuality: policy.minQuality,
           maxQuality: policy.maxQuality,
           qualityTolerance: policy.qualityTolerance,
           maxEvaluations: policy.maxEvaluations,
+          maxAllowedBytes: enforceSavings ? maxAllowedBytes : undefined,
           signal: effectiveSignal,
-          encode: async (quality, stepSignal) => {
-            const tunedConfig: ImageConfig = {
-              ...config,
-              compression: { ...config.compression, initialQuality: quality },
-            };
-            const encoded = await this.codec.encode(
-              blob,
-              name,
-              tunedConfig,
-              stepSignal ?? effectiveSignal,
-              onProgress,
-              mode,
-              {
-                enforceSavings: false,
-                originalInfo,
-              },
-            );
-            if (encoded.kind === "skipped") {
-              return { kind: "skipped", reason: encoded.reason };
-            }
-            encodedByQuality.set(quality, encoded.value);
-            return encoded.value.file;
-          },
-          evaluate: candidate => session.evaluate(candidate),
+          probeStep: (quality, stepOpts) =>
+            session.encodeAndEvaluate(quality, {
+              maxAllowedBytes: enforceSavings ? maxAllowedBytes : undefined,
+              skipEvaluateIfOversize: stepOpts.skipEvaluateIfOversize,
+            }),
           onProgress: options.onSearchProgress as (progress: QualitySearchProgress) => void,
         }),
         effectiveSignal,
@@ -156,7 +200,41 @@ export class AdaptiveImageCompressor implements ImageCodec {
         bytes: candidate.bytes,
       }));
 
+      if (search.status === "insufficient-savings") {
+        return {
+          kind: "skipped",
+          reason: "insufficient-savings",
+          originalBytes: blob.size,
+          ...(search.bestCandidate ? { compressedBytes: search.bestCandidate.bytes } : {}),
+          smart: {
+            quality: search.bestCandidate?.quality,
+            similarity: search.bestCandidate?.similarity,
+            targetSimilarity,
+            searchRounds,
+          },
+        };
+      }
+
       if (search.status === "unreachable") {
+        if (mode === "manual-dialog") {
+          const actual = await verifyCandidateBlob(search.bestCandidate.blob);
+          const file = new File([search.bestCandidate.blob], outputName(name), { type: "image/webp" });
+          return {
+            kind: "encoded",
+            value: {
+              file,
+              originalBytes: blob.size,
+              outputBytes: file.size,
+              width: actual.width,
+              height: actual.height,
+              quality: search.bestCandidate.quality,
+              similarity: search.bestCandidate.similarity,
+              targetSimilarity,
+              searchRounds,
+              unreachable: true,
+            },
+          };
+        }
         return {
           kind: "skipped",
           reason: `target-similarity-unreachable:${search.bestCandidate.similarity}`,
@@ -164,35 +242,29 @@ export class AdaptiveImageCompressor implements ImageCodec {
           smart: {
             quality: search.bestCandidate.quality,
             similarity: search.bestCandidate.similarity,
-            targetSimilarity: config.compression.targetSimilarity,
+            targetSimilarity,
             searchRounds,
           },
         };
       }
 
-      const encoded = encodedByQuality.get(search.candidate.quality);
-      if (!encoded) {
-        throw new Error("Selected adaptive candidate is missing its encoded metadata");
-      }
-
-      const savedBytes = blob.size - encoded.file.size;
+      const actual = await verifyCandidateBlob(search.candidate.blob);
+      const file = new File([search.candidate.blob], outputName(name), { type: "image/webp" });
+      const savedBytes = blob.size - file.size;
       const savingRatio = blob.size > 0 ? savedBytes / blob.size : 0;
-      const enforceSavings = options.enforceSavings !== false && mode !== "manual-dialog";
       if (
         enforceSavings &&
-        (savedBytes < config.compression.minSavingBytes ||
-          savedBytes <= 0 ||
-          savingRatio < config.compression.minSavingRatio)
+        (savedBytes < c.minSavingBytes || savedBytes <= 0 || savingRatio < c.minSavingRatio)
       ) {
         return {
           kind: "skipped",
           reason: "insufficient-savings",
           originalBytes: blob.size,
-          compressedBytes: encoded.file.size,
+          compressedBytes: file.size,
           smart: {
             quality: search.candidate.quality,
             similarity: search.candidate.similarity,
-            targetSimilarity: config.compression.targetSimilarity,
+            targetSimilarity,
             searchRounds,
           },
         };
@@ -201,16 +273,20 @@ export class AdaptiveImageCompressor implements ImageCodec {
       return {
         kind: "encoded",
         value: {
-          ...encoded,
+          file,
+          originalBytes: blob.size,
+          outputBytes: file.size,
+          width: actual.width,
+          height: actual.height,
           quality: search.candidate.quality,
           similarity: search.candidate.similarity,
-          targetSimilarity: config.compression.targetSimilarity,
+          targetSimilarity,
           searchRounds,
         },
       };
     } finally {
       clearTimeout(deadlineTimer);
-      worker?.dispose();
+      await worker?.close();
     }
   }
 }

@@ -14,7 +14,6 @@ const requiredFiles = [
   "preview.png",
   "README.md",
   "README.zh-CN.md",
-  "browser-image-compression.js",
 ];
 const requiredAssets = [
   "assets/omnikit-plugin.svg",

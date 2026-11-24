@@ -23,7 +23,7 @@
 │ ├─ SingleImage   │ ├─ Classifier         │ ├─ assets / download      │
 │ ├─ DocBatch      │ ├─ CompressionResult  │ ├─ desktop                │
 │ ├─ RemoteWatcher │ ├─ Contracts          │ ├─ documentTitle          │
-│ ├─ menuContrib   │ ├─ DocumentIdentity   │ ├─ image (BicEncoder)     │
+│ ├─ menuContrib   │ ├─ DocumentIdentity   │ ├─ image (CanvasWebpCodec)│
 │ └─ scanDocImages │ ├─ dom / source       │ ├─ ImageOccurrenceResolver│
 │                  │ ├─ PageAllowlist      │ ├─ ImageProcessingServices│
 │                  │ ├─ parseImageConfig   │ ├─ createImageServices    │
@@ -35,9 +35,10 @@
 │ └─ ImageRecord   │ ├─ ImageRecordsDock   │ ├─ AdaptiveImageCompressor│
 │    Store         │ ├─ ImageSettingsPanel │ ├─ similarity-policy      │
 │                  │ ├─ ImageSettingsBridge│ ├─ ms-ssim                │
-│                  │ ├─ ImageCompressionDlg│ ├─ adaptive-quality-search│
-│                  │ ├─ ImageTaskPanel     │ ├─ SimilarityWorkerSession│
-│                  │ └─ ImageTaskUI        │ └─ similarity.worker      │
+│                  │ ├─ ImageCompressionDlg│ ├─ patch-selector         │
+│                  │ ├─ ImageTaskPanel     │ ├─ adaptive-quality-search│
+│                  │ └─ ImageTaskUI        │ ├─ SimilarityWorkerSession│
+│                  │                       │ └─ similarity.worker      │
 └──────────────────┴───────────────────────┴───────────────────────────┘
 ```
 
@@ -114,7 +115,7 @@
 - 找到新增图片后，等待思源保存对应块，再由 `ImageOccurrenceResolver` 定位图片并创建 `OccurrenceTarget`。处理结束后向 `ImageController` 返回 `AutoUploadNotice` 数据。
 
 ### 3.3 单图操作和远程图片处理 (`SingleImageAction.ts`、`RemoteImageWatcher.ts`、`desktop.ts`、`download.ts`)
-- **图片节点过滤和格式检查**：`SingleImageAction` 与 `policy/dom.ts` 复用 Core 的 `PROTECTED_CONTAINER_SELECTOR`（`src/core/host/dom.ts`），跳过 `[data-type="NodeCodeBlock"]`、`[data-type="NodeBlockQueryEmbed"]`、`.protyle-wysiwyg__embed`、`pre`、`code` 中的图片。`ImageCandidateClassifier`、`BicEncoder` 和 `AdaptiveImageCompressor` 在 `manual-dialog`、`manual-quick` 模式始终支持静态 WebP；在 `auto`、`document` 模式中，开启智能压缩（`smartEnabled === true`）时支持静态 WebP，关闭时跳过。三处均跳过路径位于 `drawing/` 或 `drawings/` 目录的绘图文件，但不跳过 `drawings_v2.png` 等普通文件名；均使用正则精确提取路径末段扩展名（去除查询参数与片段后取最后一段文件名匹配 `/\.([a-z0-9]{1,10})$/i` 并转小写，无扩展名或以点号结尾时返回 `""`）；编码器在 `inspectImage` 检查 APNG、多帧动画 WebP 并识别出 `image/webp` 后，执行 `isWebpAllowed("webp", mode, smartEnabled)` 二次校验；
+- **图片节点过滤和格式检查**：`SingleImageAction` 与 `policy/dom.ts` 复用 Core 的 `PROTECTED_CONTAINER_SELECTOR`（`src/core/host/dom.ts`），跳过 `[data-type="NodeCodeBlock"]`、`[data-type="NodeBlockQueryEmbed"]`、`.protyle-wysiwyg__embed`、`pre`、`code` 中的图片。`ImageCandidateClassifier`、`CanvasWebpEncoder` 和 `AdaptiveImageCompressor` 在 `manual-dialog`、`manual-quick` 模式始终支持静态 WebP；在 `auto`、`document` 模式中，开启智能压缩（`smartEnabled === true` 且宿主支持智能压缩）时支持静态 WebP，关闭时跳过。三处均跳过路径位于 `drawing/` 或 `drawings/` 目录的绘图文件，但不跳过 `drawings_v2.png` 等普通文件名；均使用正则精确提取路径末段扩展名（去除查询参数与片段后取最后一段文件名匹配 `/\.([a-z0-9]{1,10})$/i` 并转小写，无扩展名或以点号结尾时返回 `""`）；编码器在 `inspectImage` 检查 APNG、多帧动画 WebP 并识别出 `image/webp` 后，执行 `isWebpAllowed("webp", mode, smartEnabled)` 二次校验；
 - **无扩展名远程图片处理边界**：`ImageCandidateClassifier` 基于路径扩展名预过滤，保留无扩展名的远程 URL（`extension === ""`）。`RemoteImageWatcher`、`DocumentBatchAction` 与 `SingleImageAction.compressSelectedImageQuick` 会先将无扩展名远程图片下载并本地化到 `assets/`，再进入解码与压缩阶段（无扩展名的远程动图或矢量图在本地化后于格式检查或编码阶段跳过或失败）；`SingleImageAction.compressSelectedImageCustom` 则在预览阶段先行下载并解码，仅在用户确认保存后才上传本地化并更新文档引用；
 - **统一显示操作结果**：`SingleImageAction` 返回 `ImageActionOutcome`，由 `ImageController.present()` 调用 `services.ui.notify(...)` 显示结果；
 - **手动处理远程图片**：预览时不上传图片或修改文档。用户点击保存后，如果目标是远程 URL，`localizeRemoteOccurrence` 先下载并调用 `/api/asset/upload` 上传原图，再通过 `SafeBlockWriter` 更新该处引用；不调用文档级 `/api/format/netImg2LocalAssets`。
@@ -123,10 +124,13 @@
 - **远程图片监听的分批与并发控制**：`RemoteImageWatcher` 使用 `MutationObserver` 跳过嵌入块和代码块。非 `rebasing` 且观察到图片变化、首次 `sweep()` 未发现新图片时，通过一个定时器最多再检查一次。新插入的远程图片按每批最多 20 张顺序推进下一批；每批内部桌面端按 `concurrencyDesktop`（默认 3）并行下载上传与压缩（移动端并发 1），同时按 `blockID` 串行排序写入任务，保证同块多图依次改写时的顺序一致性。上传本地原图并替换引用后，调用 `blockDOM` 读取最新块 DOM 并通过 `policy/dom.ts` 的 `parseSingleLeafBlock` 验证单块无嵌套及对应序号图片路径已更新为本地原图路径，构造新的 `OccurrenceTarget` 后再传入经 `inspectImage` 与格式校准检查的 `providedFile`；
 - **不同平台的远程图片下载方式**：`services/desktop.ts` 仅提供桌面端（`desktop` / `desktop-window`）远程 HTTP(S) 下载能力（使用 Node `http` / `https` 请求并携带 Core 设置的 `general.userAgent`）；浏览器和移动端由 `services/download.ts` 使用 `fetch`，不发送 Cookie 或 Referer，并按浏览器规则跟随重定向。全平台仅支持工作区 `assets/` 本地附件与 `http(s)` 远程图片源（不支持本机文件系统路径读取）；远程下载总超时为 30 秒，最多读取 32 MiB，并检查图片格式和 XSS 内容。不拦截内网、本机或链路本地地址，因此访问风险与思源原生网络图片下载相同。
 
-### 3.4 配置结构、EXIF 设置和质量模式 (`ImageSettingsPanel.svelte`、`ImageCompressionDialog.svelte`、`parseImageConfig.ts`、`BicEncoder`、`AdaptiveImageCompressor.ts`)
-- `parseImageConfig.ts` 仅校验单一现行 `schemaVersion: 2` 配置结构（包含 `auto: { globalEnabled, pageAllowlist }`、`compression: { initialQuality, manualMaxEdge, minInputBytes, minSavingBytes, minSavingRatio, maxInputBytes, maxPixels, maxEncodeMs, concurrencyDesktop, excludedExtensions, smartEnabled, targetSimilarity }` 与 `metadata: { preserveExif: false }`）；`services/ImageProcessingServices.ts` 的 `prepareImage` 直接接收 `mode: CompressionMode`；
-- `ImageSettingsPanel.svelte` 和 `ImageCompressionDialog.svelte` 不显示 EXIF 设置。仅 `parseImageConfig.ts` 校验配置中的 `metadata.preserveExif === false`（遇到其他值时抛出错误），`BicEncoder` 在调用 `browser-image-compression` 时固定传入 `preserveExif: false`；
-- `AdaptiveImageCompressor` 根据 `smartEnabled` 选择质量模式：`false` 时由 `BicEncoder` 使用 `initialQuality` 固定质量编码；`true` 时执行 MS-SSIM 搜索，`initialQuality` 作为搜索起始值。`manual-dialog` 允许预览小图片或未达到节省要求的结果；大于原图的结果是否允许保存由 PRD 中的复选框规则定义。
+### 3.4 配置结构、能力探测、EXIF 设置和质量模式 (`ImageSettingsPanel.svelte`、`ImageCompressionDialog.svelte`、`parseImageConfig.ts`、`CanvasWebpEncoder`、`AdaptiveImageCompressor.ts`)
+- `parseImageConfig.ts` 校验单一现行 `schemaVersion: 2` 配置结构（包含 `auto: { globalEnabled, pageAllowlist }`、`compression: { initialQuality, manualMaxEdge, minInputBytes, minSavingBytes, minSavingRatio, maxInputBytes, maxPixels, maxEncodeMs, concurrencyDesktop, excludedExtensions, smartEnabled, targetSimilarity }` 与 `metadata: { preserveExif: false }`，其中 `manualMaxEdge` 取值范围为整数 `512–16383` 以匹配 WebP 帧头上限）；`services/ImageProcessingServices.ts` 的 `prepareImage` 直接接收 `mode: CompressionMode`；
+- `ImageSettingsPanel.svelte` 和 `ImageCompressionDialog.svelte` 不显示 EXIF 设置。`parseImageConfig.ts` 校验配置中的 `metadata.preserveExif === false`（遇到其他值时抛出错误），`CanvasWebpEncoder` 通过原生 Canvas 重绘输出 WebP，天然剥离 EXIF 元数据并遵循图像视觉旋转方向；
+- **宿主智能压缩能力探测 (`probeSmartCompressionSupport`)**：检查运行环境是否同时具备可用内联 `Blob` `Worker`（实测最小消息握手以识别远程内核或反向代理 `worker-src` CSP 拦截）、`OffscreenCanvas`、`createImageBitmap` 及 `OffscreenCanvas` 原生 `image/webp` 编码支持（通过 `1×1` 画布编码校验返回 MIME 为 `image/webp`，拦截 WebKit 静默回退 `image/png` 的情况）：
+  - 支持智能压缩时，桌面端与移动端均允许开启 `smartEnabled`；移动端（`isMobileFrontend() === true`）在 `smartEnabled` 开启时渲染性能与电量消耗提示条；设置页在 `smartEnabled === true` 时渲染 `targetSimilarity` 滑块、隐藏固定质量滑块，在 `smartEnabled === false` 时渲染默认压缩质量滑块（绑定 `initialQuality`）；
+  - 不支持智能压缩时，设置页将 `smartEnabled` 开关置为 `disabled` 并展示具体不支持原因，不改写存储中已同步的 `smartEnabled` 布尔值，运行时回退至 `CanvasWebpEncoder`（若主线程 `HTMLCanvasElement` 亦不支持 `image/webp` 编码，则直接返回 `skipped` 保留原图）；
+- **手动微调弹窗模式 (`ImageCompressionDialog.svelte`、`SingleImageAction.ts`)**：支持智能压缩的宿主在弹窗内提供 `smartEnabled` 局部开关（初始继承全局配置）：关闭时展示固定质量滑块（`0.01–1.00`）单次编码；开启时展示目标相似度滑块（`0.90–0.999`）执行自适应质量搜索。`manual-dialog` 允许预览小图片、未达节省要求的结果以及未达目标相似度的最高质量候选（携带 `unreachable: true` 标记供界面渲染未达标告警，不抛错中断预览）；大于原图的结果是否允许保存由 PRD 复选框规则定义。
 
 ---
 
@@ -144,33 +148,36 @@
 3. **进度 Dialog 用户关闭与程序关闭隔离 (`ImageTaskUI.ts`)**：`ImageController` 通过 `services.ui.progress(...)` 委托 `ImageTaskUI.ts`（`mountDialog`）管理 `ImageTaskPanel` 模态框（面板不提供独立“取消”按钮）；`ImageTaskUI.ts` 的 `mountDialog` 内部维护 `closingByController` 标记区分两种关闭来源：
    - 用户主动关闭进度弹窗（含点击关闭或按 Esc，即 `!closingByController`）：触发 `onClose()` 通知批处理中止尚未开始的后续步骤；
    - 控制器在扫描失败、零图片或任务结束时调用 `view.close()`（由 `ImageTaskUI.ts` 置 `closingByController = true`）：仅完成 Svelte 卸载与 DOM 释放，不触发 `onClose()` 取消回调，防止将完成或扫描失败态误报为 `cancelled`；
-4. **显示两个处理阶段和结果**：资源准备完成并开始写入块时，`DocumentBatchAction` 调用 `onPhase("applying")` 更新进度窗口。`CompressionProgress` / `CompressionBatchSummary` 分别记录 `succeeded`、`skipped`、`failed`、`conflicts`、`unknown` 和 `cancelled`；`aborted` 和 `unknown` 不计入 `failed`。每批任务结束时只发送一条汇总通知，面向用户的文案必显总数，其余非零分项动态拼接展示；结果未知时，Dock 保留记录或将记录标记为 `"incomplete"`。
+4. **显示两个处理阶段和结果**：资源准备完成并开始写入块时，`DocumentBatchAction` 通过 `options.onProgress` 汇报 `phase: "applying"` 更新进度窗口。`CompressionProgress` / `CompressionBatchSummary` 分别记录 `succeeded`、`skipped`、`failed`、`conflicts`、`unknown` 和 `cancelled`；`aborted` 和 `unknown` 不计入 `failed`。每批任务结束时只发送一条汇总通知，面向用户的文案必显总数，其余非零分项动态拼接展示；结果未知时，Dock 保留记录或将记录标记为 `"incomplete"`。
 5. **并发数与远程图片本地化**：准备阶段桌面端通过 `concurrencyDesktop` 并行准备图片，默认并发数为 3；移动端并发数为 1。对文档内的远程图片（`source.kind === "remote"`），准备阶段按 URL 去重后调用 `localizeRemoteAsset` 下载并上传为本地原图（同步落盘 `图片链接 → 本地原图` 记录）；应用阶段逐项将原远程引用先更新为本地原图并重取块快照，随后更新外链记录操作状态再统一执行 WebP 编码与替换。块写回逐项顺序执行。
 
 ---
 
-## 5. 智能画质计算 (`similarity/`)
+## 5. 原生 WebP 编码与智能画质计算 (`services/image.ts`、`similarity/`)
 
-### 5.1 MS-SSIM 相似度目标
-固定质量过低可能使细线和文字边缘变得模糊；固定质量过高则会增加文件体积。MS-SSIM 分别比较图片的结构、对比度和亮度。默认相似度目标为 $\ge 0.99$，压缩器在达到该目标的编码结果中选择文件较小的一份。
+### 5.1 内置零依赖 WebP 编码器 (`CanvasWebpEncoder`)
+- **无第三方运行时编码库**：编码器基于宿主原生 `OffscreenCanvas`（优先）与 `HTMLCanvasElement`（当无 `OffscreenCanvas` 或 `OffscreenCanvas.convertToBlob` 未返回 `image/webp` 时回退）将位图编码为 `image/webp`，严格按请求 `quality` 执行单次编码，不对大于原图的产物执行隐式降质重试；若当前宿主两种画布均不支持 `image/webp` 编码（如静默回退 `image/png`），返回 `{ kind: "skipped", reason: "webp-encode-unsupported" }` 保留原图；
+- **目标尺寸统一计算 (`computeTargetDimensions`) 与边长上限**：`auto` 与 `document` 模式保持原图经 EXIF 方向校正后的完整宽高 `(info.width, info.height)`；`manual-quick` 与 `manual-dialog` 模式在长边超过 `manualMaxEdge`（上限 `16383`）时按 `scale = Math.min(1, manualMaxEdge / Math.max(info.width, info.height))` 及 `Math.max(1, Math.floor(dim * scale))` 统一计算目标宽高；目标宽高任一边超过 `WEBP_MAX_DIMENSION = 16383` 时由 `validateEncodeInput` 返回 `{ kind: "skipped", reason: "dimension-limit-exceeded" }`；
+- **输入与输出双重校验**：编码前通过 `validateEncodeInput` 执行扩展名、专有绘图目录、`minInputBytes`（`manual-dialog` 除外）、`maxInputBytes`、`inspectImage` 容器头与动图保护（APNG / 动画 WebP 返回 `animation-protected`；含 `APP2` `MPF\0` / Ultra HDR Gain Map 的实拍 JPEG 正常解析主帧）、静态 WebP 准入、`maxPixels: 32_000_000` 及 `WEBP_MAX_DIMENSION = 16383` 校验，并对整个编码过程设置 `maxEncodeMs: 45_000` 超时保护；编码后严格校验 `output.type === "image/webp"`、`inspectImage` RIFF/WEBP 头尺寸一致性与 `verifyBitmap`（`maxEdge = 64`）可解码性，显式调用 `ImageBitmap.close()` 并将临时画布宽高置 `0` 释放显存/内存。
 
-### 5.2 五尺度 MS-SSIM 计算和动图检查
-- **标准权重**：`[0.0448, 0.2856, 0.3001, 0.2363, 0.1333]`；
-- **局部平滑窗口**：$11 \times 11$ 高斯平滑核，标准差 $\sigma = 1.5$；
-- **透明图片处理**：对有透明通道的图片执行 Alpha 预乘；全透明像素的 RGB 设为 0，半透明像素按透明度计算；
-- **比较图片尺寸**：原图和压缩图等比缩放，长边不超过 512px 后再比较；
-- **质量模式、格式与编码限制检查**：`AdaptiveImageCompressor` 在 `smartEnabled === false` 时调用 `BicEncoder` 使用固定质量编码；`smartEnabled === true` 时运行 MS-SSIM 搜索，`initialQuality` 作为搜索起点。`ImageCandidateClassifier`、`BicEncoder` 和 `AdaptiveImageCompressor` 统一通过正则精确提取末段扩展名（无扩展名或末尾点号返回 `""`），在 `manual-dialog`、`manual-quick` 模式始终支持静态 WebP，在 `auto`、`document` 模式仅当 `smartEnabled === true` 时支持静态 WebP（`smartEnabled === false` 时跳过）；创建 `SimilarityWorkerSession` 前调用 `inspectImage` 检查动图，APNG 或多帧 WebP 返回 `{ kind: "skipped", reason: "animation-protected" }`，识别为 `image/webp` 后同时执行 `isWebpAllowed("webp", mode, smartEnabled)` 二次校验。原图解析结果 `originalInfo` 传给 `BicEncoder.encode`，避免每轮重复解析；`BicEncoder` 校验像素总量上限 `maxPixels: 32_000_000`（超限抛出 `"Decoded pixel limit exceeded"` 错误）并对单次编码设置 `maxEncodeMs: 45_000` 超时中止（超时通过内部 `AbortController` 抛出错误，上层按失败/中止处理而不记为正常跳过）；每轮仍检查输出 WebP 的 `inspectImage(output)` 和 `verifyBitmap`。`adaptiveQualitySearch` 遇到 `skipped` 结果时返回跳过状态，不抛出异常；
-- **尺寸控制与资源释放**：`BicEncoder` 在 `auto` 与 `document` 模式下设置 `alwaysKeepResolution: true`；`ImageCompressionDialog.svelte` 维护 `destroyed` 状态标志防止卸载后进行中的预览生成未释放的 `ObjectURL`。
+### 5.2 亮度通道 5 尺度 MS-SSIM、$L_4$ 空间池化与细尺度提权 (`ms-ssim.ts`)
+- **预乘浮点亮度与透明通道提取**：单遍遍历 RGBA 像素缓冲区（不原地修改输入 `PixelFrame.data`），按 $\alpha / 255$ 浮点缩放计算预乘 Rec.709 亮度平面 $Y = (0.2126 R + 0.7152 G + 0.0722 B) \times (\alpha / 255)$（$\alpha = 0$ 时归零），同时检测是否存在透明像素（$\alpha < 255$）。不透明图仅评估单通道 $Y$；含透明像素的图片评估 $Y$ 与 $A$ 双通道并按 `0.85 : 0.15` 合成，在消除 WebP YUV 4:2:0 彩色边缘假性不可达天花板的同时将卷积开销降低约 2/3；
+- **局部平滑与缓冲复用**：采用 $11 \times 11$ 可分离高斯核（$\sigma = 1.5$），复用水平卷积与均值/协方差临时 `Float32Array` 缓冲区，减少多轮迭代中的类型化数组分配；
+- **$L_4$ 局部误差池化与尺度权重**：每层对比度-结构项采用四次方误差范数池化 $\text{cs}_{\text{pool}} = 1 - \left(\frac{1}{N}\sum_{i=1}^{N}(1 - \text{cs}_i)^4\right)^{1/4}$（防止大面积留白背景稀释细小文字边缘失真），5 尺度权重设为 `[0.20, 0.30, 0.25, 0.15, 0.10]`，强化原生精细尺度的锐度敏感度。
 
-### 5.3 Worker 如何比较图片
-- **第一步：处理原图 (`initOriginal`)**：主线程将原图 Blob 传给 Worker。Worker 解码一次，处理 Alpha 并建立五层缩小图，缓存各层的均值和方差；
-- **第二步：比较压缩图 (`evaluate`)**：每次尝试新质量时，Worker 只解码压缩图，并使用缓存的原图数据计算 MS-SSIM；
-- Vite 使用 `?worker&inline` 将 Worker 编译进插件，各平台运行时不需要额外查找 Worker 文件路径。
+### 5.3 全图 1:1 与大图双视角选区评估 (`patch-selector.ts`、`similarity-policy.ts`)
+- **小图与中等图全图 1:1 路径**：当目标输出尺寸满足 `Math.max(targetW, targetH) <= 768` 时，直接对整幅输出尺寸图像执行 1:1 5 尺度 MS-SSIM 评估；
+- **大图“全局概览 + 原生 1:1 细节块”双视角路径**：当 `Math.max(targetW, targetH) > 768` 时，组合两类视图评估：
+  1. **全局视图**：等比缩放到长边不超过 `512px`，捕获整体亮度、对比度与大面积渐变色带表现；
+  2. **原生 1:1 局部细节块（最多 2 块）**：每块尺寸为 `pw = Math.min(targetW, 384)`、`ph = Math.min(targetH, 384)`（完整支持 5 层金字塔并避开极小尺寸高斯核边界截断效应）；
+  3. **双向梯度抗边框选区**：在短边受保护的低分代理图上同时计算预乘亮度与透明通道的双向梯度响应（$g_x = \max(|g_{Lx}|, |g_{Ax}|)$、$g_y = \max(|g_{Ly}|, |g_{Ay}|)$，$E = \sqrt{g_x g_y} + 0.15(g_x + g_y)$），利用积分图 $O(1)$ 滑窗求和选出信息密度最高的非重叠文字/线条区域（覆盖透明底深色图形文字并抑制纯水平或纯竖直 1px 分割线吸附）；当长宽比 $\ge 2.2$（如长截图）时沿长轴分为前后两半区分别选取有实际梯度能量（`meanEnergy > 1e-3`）的最高响应块，空半区名额回退至全局高响应非重叠候选；
+  4. **双视角合成得分**：`score = 0.20 * globalScore + 0.80 * Math.min(...patchScores)`。
 
-### 5.4 割线法 + 二分法混合区间搜索
-- 初始质量点探测（默认 0.80）；
-- 质量预测点在范围内时使用割线法；如果预测点超出范围、斜率分母过小或缓存区间未继续缩小，则切换为二分法；
-- 桌面端最多搜索 7 轮，移动端最多 5 轮。质量范围为 $[0.10, 1.00]$，容差为 0.01。
+### 5.4 单会话内联 Worker 与体积预算单调早停 (`similarity.worker.ts`、`SimilarityWorkerSession.ts`、`adaptive-quality-search.ts`)
+- **单图片单会话同源编解码与显存回收**：Vite 通过 `?worker&inline` 将 Worker 内联打包。每张图片搜索启动时，`initSession` 将原图解码一次并绘制到 `sourceCanvas(targetW, targetH)`（立即 `close()` 原始 `ImageBitmap`），保持 `sourceCanvas` 不调用全图 `getImageData`，而是通过绘制到小尺寸复用的全局/局部读取画布提取参考金字塔统计量；后续每轮 `encodeAndEvaluate` 直接对同一 `sourceCanvas` 调用 `convertToBlob({ type: "image/webp", quality })` 并在 Worker 内解码候选图完成双视角评分，使手动缩放与 EXIF 旋转下的参考图与候选图严格同源对齐；正常结束时 `SimilarityWorkerSession.close()` 发送 `{ type: "dispose", id }` 等待 Worker 确认已将画布宽高置 `0`（含 `50 ms` 超时兜底）后再调用 `worker.terminate()`，取消或超时中止时直接调用 `dispose()` 立即终止线程；
+- **受保护割线 + 二分搜索与体积单调早停**：
+  - 搜索质量区间为 `[0.50, 1.00]`，固定首轮探测点 `0.78`，收敛容差 `0.02`，桌面端最多评估 `5` 轮、移动端最多 `4` 轮；
+  - 在启用节省校验的模式（`auto`、`document`、`manual-quick`）下传入字节上限 `maxAllowedBytes = originalBytes - Math.max(minSavingBytes, Math.ceil(originalBytes * minSavingRatio))`：若探测点字节数超过 `maxAllowedBytes` 且相似度未达目标（继续提质体积更大、降质相似度更低），或 `minQuality` 处字节数已超过 `maxAllowedBytes`，立即提前终止搜索并返回 `insufficient-savings`；仅在 `bytes <= maxAllowedBytes` 且 `similarity >= targetSimilarity` 的合格候选中按最小体积选优。
 
 ---
 

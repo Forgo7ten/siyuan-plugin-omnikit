@@ -73,8 +73,8 @@ flowchart TD
             AutoUpload["AutoUploadHandler (上传完成异步捕获)"]
             RemoteWatcher["RemoteImageWatcher (外链安全本地化)"]
             SafeWriter["SafeBlockWriter (使用 BlockWriteLease 检查并改写 Occurrence 节点)"]
-            WorkerCodec["BicEncoder (WebP 编解码引擎)"]
-            SimilarityDomain["similarity/ (5尺度MS-SSIM/自适应搜索/内联Worker)"]
+            WorkerCodec["CanvasWebpEncoder (原生 WebP 编解码引擎)"]
+            SimilarityDomain["similarity/ (亮度L4多尺度MS-SSIM/1:1混合选区/单会话Worker)"]
             RecordStore["ImageCompressionRecordStore (Dock 业务数据持久化)"]
             AllowlistPaths["allowlistPaths.ts (白名单只读 SQL 批量路径)"]
             DockView["ImageRecordsDock.svelte (Tab 视图组件)"]
@@ -508,11 +508,11 @@ sequenceDiagram
     end
 
     rect rgb(255, 250, 240)
-    Note over Handler,Similarity: 步骤二：异步读取与两阶段智能质量搜索
+    Note over Handler,Similarity: 步骤二：异步读取与单会话智能质量搜索
     Handler->>Host: 读取原图二进制内容
     Host-->>Handler: 原图数据 (ArrayBuffer / Blob)
-    Handler->>Similarity: 两阶段 Worker 评估 (initOriginal 预计算金字塔)
-    Similarity->>Similarity: 5 尺度 MS-SSIM 与割线+二分搜索 (桌面端≤7轮, 移动端≤5轮)
+    Handler->>Similarity: 单会话内联 Worker 建图与参考金字塔预计算 (单次原图解码)
+    Similarity->>Similarity: 亮度 L4 多尺度 MS-SSIM + 全局/1:1 双视角与体积早停搜索 (桌面≤5轮, 移动≤4轮)
     Similarity-->>Handler: 最优达标 WebP Blob 与质量指标 (>=0.99)
     Handler->>Handler: 核验三大收益条件 (>=100KiB, >=4KiB, >=5%)
     end
@@ -603,8 +603,8 @@ sequenceDiagram
 | `AutoUploadHandler.ts` | `AutoUploadHandler` | 监听 Protyle 编辑器上传事件；`shouldCompress` 同步检查配置、功能状态和白名单；未开启或上传内容无可处理图片时直接退出，不创建观察器；`before-upload-assets` 异常由 `try/catch` 捕获；`onComplete` 只使用本次上传观察到的新图片，不扫描已有图片；等待块保存后定位并返回 `AutoUploadNotice` |
 | `RemoteImageWatcher.ts` | `RemoteImageWatcher` | 监听新插入的 HTTP/HTTPS 图片；自动压缩未开启时不读取块 DOM；使用 Core 的 DOM 选择器过滤嵌入块和代码块；首轮 `sweep()` 没发现新图片时最多再检查一次；每批最多处理 20 张后继续下一批，桌面端默认并发 3（`concurrencyDesktop`）、移动端并发 1，同块内通过尾承诺串行写入避免同块多图改写次序交错；下载最多 30 秒、最多读取 32 MiB，不发送凭据或 Cookie，跟随宿主允许的重定向，不额外拦截内网地址；桌面端使用 Core `general.userAgent`，浏览器和移动端使用 `fetch` |
 | `ImageOccurrenceResolver.ts` & `policy/source.ts` | `AssetAddress` / `ImageOccurrenceResolver` / `buildReplacementPath` / `sameSource` | `AssetAddress` 分离 `raw`、`kernelPath`、`key`（大小写敏感 + `box`）、`fetchURL` 与 `box` 并保护 `%25` 字面路径；`sameSource` 统一比对本地 `asset` 或规范化 `remote` URL；`buildReplacementPath` 接受本地 `assets/` 与无凭据 `http(s)://` 替换目标：写入本地附件时对远程源与非法本地源仅保留新 `?box=<notebookID>`、对合法本地 `assets/` 源保留新 `?box=<notebookID>` 与原有 `#fragment`，恢复为 `http(s)://` 时原样输出规范化 URL；在块 DOM 中建立 `OccurrenceTarget`（`rootID` + `notebook` + `blockID` + `kind` + `attribute` + `imageOrdinal` + `oldPath`） |
-| `src/features/image-compressor/similarity/` | 智能压缩计算模块 | 包含 `AdaptiveImageCompressor`（`smartEnabled === false` 使用固定质量；`true` 执行 MS-SSIM 搜索）、`computeMSSSIM`、`adaptiveQualitySearch`、`SimilarityWorkerSession`、`getSimilarityPolicy` 和内联 Worker；编码前由 `inspectImage` 检查动图并对无扩展名 `image/webp` 二次校验 `isWebpAllowed("webp", mode, smartEnabled)` |
-| `services/image.ts` | `BicEncoder` | 封装 WebP 编码生成引擎；正则精确提取末段扩展名并在 `inspectImage` 检出 `info.mime === "image/webp"` 时执行 `isWebpAllowed("webp", mode, smartEnabled)` 二次校验；在 `manual-dialog` / `manual-quick` 模式始终放行静态 WebP，在 `auto` / `document` 模式仅于开启智能压缩时放行；执行保尺寸校验、EXIF 方向校正、整数网格对齐、`inspectImage` 容器头解析、`maxPixels: 32_000_000` 像素上限校验（超限抛错 `"Decoded pixel limit exceeded"`）、`maxEncodeMs: 45_000` 编码超时中止，以及 `verifyBitmap`（支持紧缩尺寸 `maxEdge = 64` 像素级可解码核验，避免输出大图全分辨率解码）校验；固定传 `preserveExif: false`（由 `parseImageConfig.ts` 校验配置中 `metadata.preserveExif === false`） |
+| `src/features/image-compressor/similarity/` | 智能压缩计算模块 | 包含 `AdaptiveImageCompressor`（未开启智能压缩或宿主不支持时走固定质量；开启且支持时执行单会话自适应搜索）、`ms-ssim.ts`（预乘浮点亮度 + 可选 Alpha、$L_4$ 误差池化与细尺度提权 5 尺度 MS-SSIM）、`patch-selector.ts`（大图双向梯度抗边框 1:1 选区）、`adaptive-quality-search.ts`（含体积预算单调早停）、`SimilarityWorkerSession`、`getSimilarityPolicy` 和内联 Worker；编码前由 `inspectImage` 检查动图并对无扩展名 `image/webp` 二次校验 `isWebpAllowed("webp", mode, smartEnabled)` |
+| `services/image.ts` | `CanvasWebpEncoder` | 零外部依赖封装宿主原生 `OffscreenCanvas` / `HTMLCanvasElement` WebP 编码引擎（`OffscreenCanvas` 不支持 WebP 时回退 `HTMLCanvasElement`，宿主完全不支持 WebP 编码时返回 `skipped` 保留原图）；提供宿主智能压缩能力探测 `probeSmartCompressionSupport`（含内联 `Blob` Worker CSP 握手核验）与统一目标尺寸计算 `computeTargetDimensions`；正则精确提取末段扩展名并在 `inspectImage` 检出 `info.mime === "image/webp"` 时执行 `isWebpAllowed("webp", mode, smartEnabled)` 二次校验；在 `manual-dialog` / `manual-quick` 模式始终放行静态 WebP，在 `auto` / `document` 模式仅于开启且支持智能压缩时放行；执行保尺寸校验、EXIF 方向自动校正、整数网格对齐、`inspectImage` 容器头解析、`maxPixels: 32_000_000` 像素上限校验（超限抛错 `"Decoded pixel limit exceeded"`）、`WEBP_MAX_DIMENSION = 16_383` 目标单边上限保护（超限跳过）、`maxEncodeMs: 45_000` 编码超时中止、输出 `image/webp` MIME 核验，以及 `verifyBitmap`（支持紧缩尺寸 `maxEdge = 64` 像素级可解码核验）与显式位图/画布资源释放 |
 | `services/assets.ts` & `ImageProcessingServices.ts` | `AssetStore` / `ImageProcessingServices` | `AssetStore.upload` 对 `KernelRequestError` 的 `"not-sent"` 与 `"rejected"` 直接上抛确定失败，仅 `"unknown"` 或不可靠响应抛 `UploadOutcomeUnknown`；`ImageProcessingServices` 统一提供 `localizeRemoteAsset`、`prepareImage`、`savePreview` 与统一持久化闸门 `persistMappedAsset`（覆盖 `图片链接 → 本地原图` 与 `本地原图 → 压缩图` 双记录写入），并统一导出 `logSkippedImage` / `logReferenceStatus` 输出全任务 `info` 日志 |
 | `ImageCompressionRecordStore.ts` | `ImageCompressionRecordStore` | 管理 `feature-image-compressor-records.json`（含 `imageRecordsFor` 支持注入可选 `fetchFn`）；通过 `isRemoteRecordSource` / `recordSourceIdentity` 支持左键 `originalPath` 为 `assets/...` 或无凭据 `http(s)://` URL、右键 `compressedPath` 限定为 `assets/...`；`upsert` 与 `markOperation` 置顶排序；最多保存 100 条，超限时按 `updatedAt` 自动淘汰最旧临时记录（`codec.parse` 不拒绝超长文件）；`compareAndRemove` 在 `JsonStore.update` 队列中二次核对配对后移除确认缺失记录 |
 | `SafeBlockWriter.ts` | `SafeBlockWriter` | 接入 Core 共享块写入队列（`notebook/blockID`）；入锁前允许合法本地 `assets/` 或无凭据 `http(s)://` 替换目标；写前调用 `/api/block/getBlockInfo` 与 `/api/block/getBlockDOM` 核验块归属、单块无嵌套、序号节点存在且源路径仍精确等于 `target.oldPath`（忽略块级 `data-node-index`、`updated`、`parent-heading` 及同块其余非目标节点变化；读取失败向上传播为读取错误，不包装为冲突）；基于实时读取块 DOM 仅改写目标节点属性（写回 `writeDOM` 仅剥离 `parent-heading`，保留实时内容与 `updated` 等属性）；返回五态联合类型 `CommitResult`（`"replaced" \| "conflict" \| "failed" \| "aborted" \| "unknown"`）与可选 `conflictReason` 诊断原因：`updateBlock` 捕获中 `outcome === "not-sent"` 或前置中止归 `"aborted"`、`outcome === "rejected"` 归 `"failed"`、仅传输结果不确定归 `"unknown"`（不重试） |
@@ -616,42 +616,32 @@ sequenceDiagram
 
 #### 3. 智能压缩质量计算模块解耦与性能规范
 
-智能压缩通过客观图像质量指标（MS-SSIM）自适应探索最佳编码质量，设计遵循以下解耦与性能规范：
+智能压缩通过多尺度结构相似度（MS-SSIM）自适应搜索满足目标视觉质量的最小体积编码结果，设计遵循以下解耦与性能规范：
 
 1. **模块职责**：
-   - 相似度计算代码放在 `src/features/image-compressor/similarity/`；
-   - 包含算法纯函数（`ms-ssim.ts`）、自适应搜索逻辑（`adaptive-quality-search.ts`）、Worker 会话驱动（`SimilarityWorkerSession.ts`）与内联 Worker 脚本（`similarity.worker.ts`）；
-   - 该模块不直接依赖思源内核 REST API、Protyle 编辑器 DOM 或文件存储体系，可独立进行纯数学与像素级单元测试。
-2. **全平台标准 5 尺度 MS-SSIM 评估体系**：
-   - 全平台统一采用标准的 **5 尺度 MS-SSIM** 评估体系，不降低尺度数量以保证质量指标的客观一致性与跨端准确性；
-   - 尺度标准权重分配：`[0.0448, 0.2856, 0.3001, 0.2363, 0.1333]`；
-   - 卷积核配置：$11 \times 11$ 局部高斯平滑窗口，标准差 $\sigma = 1.5$；
-   - 通道加权与合成：RGB 三通道分别计算局部亮度（Luminance）、对比度（Contrast）与结构项（Structure），依据标准亮度加权系数合并；
-   - **Alpha 通道与预乘优化 (Alpha-Premultiply)**：对含透明通道图片执行 Alpha 预乘，像素色值严格按公式 $\text{RGB} \times (\alpha / 255)$ 缩放计算，将全透明像素（$\alpha = 0$）的 RGB 色值归零，消除透明背景下因杂色数据导致的假性结构差异；同时当存在半透明像素时将 Alpha 相似度独立加权合并。
-3. **平台算力分流与搜索预算**：
-   - 通过调用思源官方 `getFrontend()` 区分平台算力预算：
-     - **桌面端（`desktop` / `desktop-window` / `browser-desktop`）**：单张图片最多允许 7 轮编码与评估搜索；
-     - **移动端（`mobile` / `browser-mobile`）**：单张图片最多允许 5 轮编码与评估搜索；
-   - **像素尺度归一化**：原图与候选图比较时，基准边长统一限制在不超过 512px（长边等比缩放至 512px，宽高比差异 $\le 0.005$），在保证高频纹理评估准确度的同时严格控制计算耗时。
-4. **自包含内联 Worker 与两阶段通信协议**：
-   - **Vite 内联打包机制**：Worker 脚本通过 Vite 原生 `import SimilarityWorker from "./similarity.worker.ts?worker&inline"` 打包为内联自包含 Blob Worker，消除 CommonJS 打包产物与 `window.eval` 运行环境下的跨端路径解析与权限异常；
-   - **两阶段通信协议**：
-     - **阶段一：原图预计算 (`initOriginal`)**：在单张图片质量搜索开始时，`AdaptiveImageCompressor` 先行调用 `inspectImage` 检测动图（APNG / 动画 WebP 直接返回 `{ kind: "skipped", reason: "animation-protected" }`）并将预解析的 `originalInfo` 透传至 `BicEncoder.encode`（每轮仍完整执行输出 WebP 的 `inspectImage(output)` 与 `verifyBitmap` 校验）；随后主线程向 Worker 传递原图 Blob，Worker 仅执行一次原图解码、Alpha 预乘、5 尺度降采样高斯金字塔构建，并常驻缓存原图各层的均值与方差统计量；
-     - **阶段二：候选图轻量评估 (`evaluate`)**：后续质量探索轮次中，主线程仅向 Worker 传递当前轮次的候选 WebP Blob。Worker 仅对候选图进行单向解码与金字塔生成，直接与缓存的原图金字塔与统计量执行 MS-SSIM 卷积计算；单次搜索复用同一 Worker 实例，完成或中止时立即销毁释放。
-5. **带区间保护的割线法 + 二分法混合搜索**：
-   - 基于初始质量点探测；
-   - 未达标时将最高质量作为合格区间端点；已达标时将最低质量作为未达标区间端点；
-   - 割线预测点位于范围内且距两端至少 10% 时使用割线法；预测越界、斜率分母过小或搜索区间未继续缩小时改用二分法；
-   - 质量范围为 $[0.10, 1.00]$，搜索容差为 0.01；界面显示搜索进度和指标，文案从语言包读取。
-6. **提前停止条件与收益条件规则**：
-   - **达标提前停止条件**：仅在“已达到目标相似度（默认 $\ge 0.99$）且候选 WebP 体积满足收益条件（原图 $\ge 100\text{ KiB}$，比原图节省 $\ge 4\text{ KiB}$ 且节省比例 $\ge 5\%$）”时，允许提前安全终止搜索；
-   - 如果最高质量仍未达到目标相似度，返回 `unreachable`，不自动替换原图。
-7. **图片尺寸精确对齐与 EXIF 预处理 (EXIF Pre-decoding & Pixel Alignment)**：
-   - 在尺寸缩放与评估前，先读取解析原图 EXIF 旋转标记（Orientation 1~8），计算真实的有效呈现宽高；
-   - 缩放目标尺寸计算采用 `Math.floor` 向下取整，与底层 Canvas 位图整数网格保持严格一致，避免 1 像素舍入偏差导致的尺寸校验误判。
-8. **智能压缩前的检查**：
-   - 启动 Worker 线程前，检查原图是否达到 100 KiB、图片格式是否支持等条件；
-   - 若未达压缩条件，直接返回结构化的 `{ status: "skipped", reason: "below_threshold" }` 正常结果，不创建 Worker 线程，不产生额外计算开销与业务异常。
+   - 相似度计算与选区代码位于 `src/features/image-compressor/similarity/`；
+   - 包含算法纯函数（`ms-ssim.ts`）、双向梯度选区纯函数（`patch-selector.ts`）、自适应搜索逻辑（`adaptive-quality-search.ts`）、Worker 会话驱动（`SimilarityWorkerSession.ts`）与内联 Worker 脚本（`similarity.worker.ts`）；
+   - 该模块不依赖思源内核 REST API、Protyle 编辑器 DOM 或文件存储体系，支持独立进行纯数学与像素级单元测试。
+2. **亮度通道 5 尺度 MS-SSIM、$L_4$ 误差池化与双视角评估体系**：
+   - 采用 5 尺度金字塔与 $11 \times 11$ 可分离高斯核（$\sigma = 1.5$），复用中间 `Float32Array` 卷积缓冲；
+   - **浮点预乘亮度与透明通道**：单遍扫描 RGBA 像素（不修改输入缓冲区），按 $\alpha / 255$ 浮点缩放生成预乘 Rec.709 亮度平面 $Y$（$\alpha = 0$ 时归零）；不透明图仅评估单通道 $Y$，含透明像素（$\alpha < 255$）的图片同时评估 Alpha 通道并按 `0.85 : 0.15` 权重合成；
+   - **$L_4$ 误差范数池化与细尺度提权**：空间池化采用四次方误差范数 $\text{cs}_{\text{pool}} = 1 - (\frac{1}{N}\sum (1 - \text{cs}_i)^4)^{1/4}$，尺度权重为 `[0.20, 0.30, 0.25, 0.15, 0.10]`，防止大面积平滑留白背景稀释细小文字边缘失真；
+   - **按输出尺寸分流双视角**：目标长边 $\le 768\text{ px}$ 时直接对整幅输出尺寸做 1:1 评估；目标长边 $> 768\text{ px}$ 时组合长边 `512px` 的全局缩略图与最多 `2` 个 `min(W, 384) × min(H, 384)` 的原生 1:1 局部细节块（通过短边保护代理图上预乘亮度与透明通道的双向梯度响应选区，过滤 1px 直线边框，长宽比 $\ge 2.2$ 时对非空半区分区采样），按 `0.20 * globalScore + 0.80 * min(patchScores)` 计算综合相似度。
+3. **平台算力预算与宿主能力守卫**：
+   - 通过 `probeSmartCompressionSupport()` 核验宿主具备可用内联 `Blob` `Worker`、`OffscreenCanvas`、`createImageBitmap` 与 `OffscreenCanvas` 原生 `image/webp` 编码能力；不支持的运行环境禁用智能压缩开关切换并展示原因，运行时回退固定质量路径（若宿主完全不支持 Canvas WebP 编码则自动跳过编码）且保留已同步配置值；
+   - 通过 `getFrontend()` 区分搜索轮次上限：桌面端（`desktop` / `desktop-window` / `browser-desktop`）单图最多 5 轮，移动端（`mobile` / `browser-mobile`）单图最多 4 轮并在开启设置时展示耗时与电量提示。
+4. **自包含内联 Worker 与单会话同源编解码协议**：
+   - **Vite 内联打包机制**：Worker 脚本通过 Vite 原生 `import SimilarityWorker from "./similarity.worker.ts?worker&inline"` 打包为内联自包含 Blob Worker，零外部静态脚本依赖；
+   - **单会话协议**：
+     - **阶段一：建图与参考预计算 (`initSession`)**：主线程先经 `validateEncodeInput` 校验大小、扩展名、容器魔数与动图保护（APNG / 动画 WebP 返回 `animation-protected`），再向 Worker 传入原图 Blob 与目标输出宽高；Worker 仅解码原图 1 次并绘制到 `sourceCanvas(targetW, targetH)`（立即释放原始 `ImageBitmap`），直接从同一 `sourceCanvas` 采样生成全局与局部参考金字塔统计量，保证 EXIF 旋转与手动最大边长缩放下的像素严格同源对齐；
+     - **阶段二：同会话编码与评估 (`encodeAndEvaluate`)**：每轮探测直接在 Worker 内对缓存的 `sourceCanvas` 调用 `convertToBlob({ type: "image/webp", quality })`，并在需要评估相似度时在同 Worker 内解码候选图完成评分；整个会话结束或中止时清零画布并终止 Worker。
+5. **受保护割线法 + 二分法搜索与体积预算单调早停**：
+   - 固定首轮探针 `0.78`，搜索质量范围 `[0.50, 1.00]`，收敛容差 `0.02`；
+   - 割线预测点位于区间内部且距两端至少 10% 时使用割线法，越界、斜率过小或出现非单调波动时切换为二分法；
+   - **体积单调早停**：在要求满足体积节省条件的操作模式下（原图 $\ge 100\text{ KiB}$、节省 $\ge 4\text{ KiB}$ 且节省比例 $\ge 5\%$），根据最大允许输出字节数 `maxAllowedBytes` 执行剪枝：若当前质量产物已超出 `maxAllowedBytes` 且相似度低于目标值，或最低质量 `0.50` 产物已超出 `maxAllowedBytes`，立即终止搜索并返回 `insufficient-savings`；最高质量 `1.00` 仍未达到目标相似度时返回 `unreachable`（后台与快捷模式保留原图，手动微调弹窗展示最高质量候选预览与未达标提示）。
+6. **图片尺寸精确对齐与前置门槛检查**：
+   - `inspectImage` 解析原图宽高与 JPEG EXIF 旋转标记（Orientation 1~8），`computeTargetDimensions` 统一按 `Math.floor` 计算缩放目标整数网格；
+   - 启动 Worker 前完成最小体积、最大字节、像素上限与动图检查，不满足前置条件时零 Worker 开销直接返回跳过结果。
 
 #### 4. 批量处理性能与体验规范
 
@@ -1073,7 +1063,7 @@ scripts/
   - 若目标目录 `data/plugins/siyuan-plugin-omnikit` 已存在，必须读取其内部的 `plugin.json`（仅 `ENOENT` 视作清单缺失，JSON 解析错误或权限错误直接显式报错退出）；
   - 严格校验其 `name` 属性必须精确等于 `"siyuan-plugin-omnikit"`；若不匹配，拒绝覆盖并报错退出，防止因路径误配损坏其他第三方插件；
 - **待部署构建产物完整性前置核验**：
-  - 在执行任何写入前，校验 `dist/` 下必须完整包含：`plugin.json`、`index.js`、`index.css`、`icon.png`、`preview.png`、`README.md`、`README.zh-CN.md`、`browser-image-compression.js`、`assets/`、`i18n/`；
+  - 在执行任何写入前，校验 `dist/` 下必须完整包含：`plugin.json`、`index.js`、`index.css`、`icon.png`、`preview.png`、`README.md`、`README.zh-CN.md`、`assets/`、`i18n/`；
 - **两阶段暂存部署与原子备份恢复**：
   1. 生成包含高精度时间戳与 UUID 的专属暂存目录 `.${pluginName}.install-${Date.now()}-${uuid}`；
   2. 将产物文件及资源目录完整写入暂存目录；
@@ -1093,7 +1083,7 @@ scripts/
 - **双清单版本一致校验**：`package.json.version === dist/plugin.json.version`；
 - **思源内核最低版本约束**：`dist/plugin.json.minAppVersion === "3.8.4"`；
 - **物理产物存在性与非空校验**：
-  - 核验必须文件：`dist/index.js`、`dist/index.css`、`dist/plugin.json`、`dist/README.md`、`dist/README.zh-CN.md`、`dist/i18n/en.json`、`dist/i18n/zh-CN.json`、`dist/browser-image-compression.js`、`dist/icon.png`、`dist/preview.png`、`dist/assets/omnikit-menu.svg`、`dist/assets/omnikit-plugin.svg` 及 `package.zip` 全部存在且大小 $> 0$；
+  - 核验必须文件：`dist/index.js`、`dist/index.css`、`dist/plugin.json`、`dist/README.md`、`dist/README.zh-CN.md`、`dist/i18n/en.json`、`dist/i18n/zh-CN.json`、`dist/icon.png`、`dist/preview.png`、`dist/assets/omnikit-menu.svg`、`dist/assets/omnikit-plugin.svg` 及 `package.zip` 全部存在且大小 $> 0$；
   - 仓库根目录检查：断言根目录下禁止散落未管理的 `icon.png` 与 `preview.png`；
 - **PNG 标头与集市规格深度核验**：
   - 读取 `dist/icon.png` 与 `dist/preview.png` 二进制数据，比对前 8 字节 PNG 魔数标头 `[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]`；
@@ -1104,7 +1094,7 @@ scripts/
 - **零依赖原生 ZIP Central Directory 静态审查**：
   - 避免引入外部依赖，直接从 `package.zip` 尾部定位 End of Central Directory (EOCD) 标头 `0x06054b50`；
   - 解析 Central Directory 偏移与条目总数，逐条遍历 Central Directory Header `0x02014b50` 提取所有分发文件条目路径；
-  - 必须包含所有必要分发文件条目：`index.js`、`index.css`、`plugin.json`、`i18n/en.json`、`i18n/zh-CN.json`、`browser-image-compression.js`、`icon.png`、`preview.png`、`assets/omnikit-menu.svg`、`assets/omnikit-plugin.svg`；
+  - 必须包含所有必要分发文件条目：`index.js`、`index.css`、`plugin.json`、`i18n/en.json`、`i18n/zh-CN.json`、`icon.png`、`preview.png`、`assets/omnikit-menu.svg`、`assets/omnikit-plugin.svg`；
   - **安全排除项**：断言 ZIP 包内**禁止包含 `kernel.js`**，**禁止包含 `node_modules/` 下的任何文件**。
 
 #### 5. 本地发版准备脚本 (`scripts/release/release.mjs`) 与产物清理 (`scripts/clean.mjs`)

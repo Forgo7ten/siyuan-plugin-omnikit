@@ -5,6 +5,7 @@
   import { describeError } from "../../../core/host/describeError.ts";
   import { KernelClient } from "../../../core/host/KernelClient.ts";
   import { Logger } from "../../../core/host/Logger.ts";
+  import { isMobileFrontend } from "../../../core/host/Platform.ts";
   import type { JsonStore } from "../../../core/store/JsonStore.ts";
   import { SettingsConflictError, isSettingsConflictError } from "../../../core/store/SettingsConflictError.ts";
   import type { RegisterDraftParticipant } from "../../../ui/settings/DraftParticipant.ts";
@@ -12,6 +13,11 @@
   import { defaultImageFeatureConfig, NODE_ID, parseImageConfig } from "../policy/parseImageConfig.ts";
   import { IMAGE_FEATURE_ID } from "../policy/settings.ts";
   import { resolveAllowlistPaths } from "../services/allowlistPaths.ts";
+  import {
+    getCachedSmartCompressionSupport,
+    probeSmartCompressionSupport,
+    type SmartCompressionSupport,
+  } from "../services/image.ts";
 
   interface Props {
     store: JsonStore<ImageFeatureConfig>;
@@ -116,6 +122,8 @@
   let readOnly = $state(untrack(() => store.needsRecovery));
   let error = $state("");
   let notice = $state("");
+  let smartSupport = $state<SmartCompressionSupport | undefined>(getCachedSmartCompressionSupport());
+  const isMobile = isMobileFrontend();
   let dirty = $derived(!same(draft, baseline));
   let permissionRows = $derived(Object.entries(draft.auto.pageAllowlist)
     .filter(([id]) => {
@@ -165,6 +173,14 @@
   }
 
   onMount(() => {
+    let unmounted = false;
+    void probeSmartCompressionSupport()
+      .then(res => {
+        if (!unmounted) smartSupport = res;
+      })
+      .catch(() => {
+        if (!unmounted) smartSupport = { supported: false, reason: "webp-encode-unsupported" };
+      });
     const unsubscribe = store.subscribe(value => {
       readOnly = store.needsRecovery;
       const isDirty = !same($state.snapshot(draft), $state.snapshot(baseline));
@@ -183,6 +199,7 @@
       hasConflict: () => conflict,
     });
     return () => {
+      unmounted = true;
       unregisterDraft?.();
       unsubscribe();
       lookupAbort.abort();
@@ -262,10 +279,27 @@
     <section class="setting-card">
       <header><h3>{t("settings.quality")}</h3><p>{t("settings.qualityHelp")}</p></header>
       <label class="setting-row">
-        <span><strong>{t("settings.smartEnabled")}</strong><small>{t("settings.smartEnabledHelp")}</small></span>
-        <input type="checkbox" class="b3-switch" bind:checked={draft.compression.smartEnabled} />
+        <span>
+          <strong>{t("settings.smartEnabled")}</strong>
+          <small>{t("settings.smartEnabledHelp")}</small>
+          {#if smartSupport && !smartSupport.supported}
+            <small class="smart-hint smart-hint--unsupported" role="status">
+              {t(`settings.smartUnsupported.${smartSupport.reason}`)}
+            </small>
+          {:else if smartSupport?.supported && draft.compression.smartEnabled && isMobile}
+            <small class="smart-hint smart-hint--mobile">
+              {t("settings.smartMobilePerfHint")}
+            </small>
+          {/if}
+        </span>
+        <input
+          type="checkbox"
+          class="b3-switch"
+          bind:checked={draft.compression.smartEnabled}
+          disabled={!smartSupport?.supported}
+        />
       </label>
-      {#if draft.compression.smartEnabled}
+      {#if (smartSupport ? smartSupport.supported : true) && draft.compression.smartEnabled}
         <label class="setting-row">
           <span><strong>{t("settings.targetSimilarity")}</strong><small>{t("settings.targetSimilarityHelp")}</small></span>
           <span class="range-control">
@@ -274,18 +308,19 @@
             <output>{(draft.compression.targetSimilarity * 100).toFixed(1)}%</output>
           </span>
         </label>
+      {:else}
+        <label class="setting-row">
+          <span><strong>{t("settings.initialQuality")}</strong><small>{t("settings.notSimilarity")}</small></span>
+          <span class="range-control">
+            <input type="range" min="0.01" max="1" step="0.01" bind:value={draft.compression.initialQuality}
+              aria-label={t("settings.initialQuality")} />
+            <output>{Math.round(draft.compression.initialQuality * 100)}%</output>
+          </span>
+        </label>
       {/if}
       <label class="setting-row">
-        <span><strong>{t("settings.initialQuality")}</strong><small>{t("settings.notSimilarity")}</small></span>
-        <span class="range-control">
-          <input type="range" min="0.01" max="1" step="0.01" bind:value={draft.compression.initialQuality}
-            aria-label={t("settings.initialQuality")} />
-          <output>{Math.round(draft.compression.initialQuality * 100)}%</output>
-        </span>
-      </label>
-      <label class="setting-row">
         <span><strong>{t("settings.manualMaxEdge")}</strong><small>{t("settings.manualMaxEdgeHelp")}</small></span>
-        <span class="number-control"><input type="number" class="b3-text-field" min="512" max="16384" step="1"
+        <span class="number-control"><input type="number" class="b3-text-field" min="512" max="16383" step="1"
           bind:value={draft.compression.manualMaxEdge} /><span>px</span></span>
       </label>
     </section>
@@ -347,6 +382,9 @@
   .number-control input { width: 104px; }
   .notice { background: var(--b3-theme-surface); border-radius: 6px; padding: 12px; margin: 8px 0 16px; line-height: 1.6; }
   .notice--error { border-inline-start: 3px solid var(--b3-theme-error); }
+  .smart-hint { margin-top: 6px; padding: 6px 10px; border-radius: 4px; background: var(--b3-theme-surface); }
+  .smart-hint--unsupported { color: var(--b3-theme-error); border-inline-start: 3px solid var(--b3-theme-error); }
+  .smart-hint--mobile { color: var(--b3-theme-on-surface); border-inline-start: 3px solid var(--b3-theme-primary); }
   .warning { color: var(--b3-theme-error); }
   .capabilities { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-bottom: 16px; color: var(--b3-theme-on-surface); font-size: 12px; }
   .document-controls { display: flex; flex-wrap: wrap; gap: 8px; }

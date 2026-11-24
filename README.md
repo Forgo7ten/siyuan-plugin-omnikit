@@ -53,7 +53,7 @@ Converts images into WebP format and downloads remote image URLs into local work
 - **Automatic Compression for New Images**: Newly pasted or dropped images are compressed into WebP in the background. Can be configured to run globally or restricted to an allowlist of specific documents, with quick checkbox toggles (`Auto-compress whitelist for this document`) available from the file tree, document title bar, and top-bar menu independently of the global switch.
 - **Manual Single Image Compression & Preview**:
   - Right-click an image in the editor and choose `[OmniKit] Compress this image` for immediate conversion;
-  - Choose `[OmniKit] Compress…` to open a preview dialog where compression quality can be adjusted while comparing visual quality and file sizes, with options to save as an asset only or replace the document reference.
+  - Choose `[OmniKit] Compress…` to open a preview dialog supporting both fixed-quality encoding and MS-SSIM smart optimization while comparing visual quality and file sizes, with options to save as an asset only or replace the document reference.
 - **Document Batch Compression**: Right-click a document node in the file tree, on the document title bar (`[OmniKit] Compress all images in this document`), or select **Compress all images in this document** from the top-bar menu to process all images in the document.
 - **Remote Image Localization**: Detects newly inserted external HTTP/HTTPS images in authorized documents and downloads them into the local `assets/` directory.
 - **Records Dock & Reference Revert**:
@@ -69,7 +69,7 @@ Converts images into WebP format and downloads remote image URLs into local work
 2. General settings, feature toggles, and feature-specific options are edited as a unified draft and saved or reset (`Restore defaults` / `Save settings`) from the single floating bar at the bottom of the settings dialog;
 3. Available options:
    - **General**: console debug logging and shared network `User-Agent`;
-   - **Image Compressor**: global automatic compression toggle, document allowlist, smart compression toggle (MS-SSIM adaptive search), target similarity, initial quality, and manual maximum edge limit;
+   - **Image Compressor**: global automatic compression toggle, document allowlist, smart compression toggle (adaptive search based on MS-SSIM and local detail patches; shows a performance notice when enabled on mobile and disables automatically on hosts without WebP encoding support), target similarity, default compression quality (used when smart compression is off), and manual maximum edge limit;
    - **Titled Link**: fetch link titles on paste, sync hover title attribute (`data-title`), and fallback to hostname on fetch failure (title truncation is fixed at 80 graphemes).
 
 ---

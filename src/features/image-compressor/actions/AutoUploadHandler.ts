@@ -3,6 +3,7 @@ import type { FeatureScope } from "../../../core/framework/FeatureScope.ts";
 import { isInsideProtectedContainer } from "../../../core/host/dom.ts";
 import { resolveEditorRootID, resolveNotebookID } from "../../../core/host/ProtyleAdapter.ts";
 import { logSkippedImage, type ImageProcessingServices } from "../services/ImageProcessingServices.ts";
+import { isSmartCompressionEffective } from "../services/image.ts";
 import { waitForPersistedImageOccurrence, type ImageOccurrenceEvidence } from "../services/ImageOccurrenceResolver.ts";
 import { resolveSource, trySource } from "../policy/source.ts";
 import { classifyImageCandidate } from "../policy/ImageCandidateClassifier.ts";
@@ -55,7 +56,7 @@ export function hasCompressibleInput(input: UploadInput | undefined, config: Ima
     path,
     mode: "auto",
     excludedExtensions: excluded,
-    smartEnabled: config?.compression?.smartEnabled === true,
+    smartEnabled: isSmartCompressionEffective(config?.compression?.smartEnabled),
   }).eligible);
 }
 
@@ -267,7 +268,7 @@ async function processCompletedUpload(
       path,
       mode: "auto",
       excludedExtensions: excluded,
-      smartEnabled: currentConfig?.compression?.smartEnabled === true,
+      smartEnabled: isSmartCompressionEffective(currentConfig?.compression?.smartEnabled),
     });
     if (!decision.eligible) {
       if (decision.reason === "animated-format" || decision.reason === "vector-format" || decision.reason === "excluded-extension") {

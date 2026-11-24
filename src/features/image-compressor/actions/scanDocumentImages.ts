@@ -2,6 +2,7 @@ import { isInsideProtectedContainer } from "../../../core/host/dom.ts";
 import { imageSourceAttribute, trySource, type ImageSource } from "../policy/source.ts";
 import type { ImageConfig } from "../policy/parseImageConfig.ts";
 import { classifyImageCandidate } from "../policy/ImageCandidateClassifier.ts";
+import { isSmartCompressionEffective } from "../services/image.ts";
 
 export interface DocumentImageOccurrence { blockId: string; imageOrdinal: number; source: ImageSource }
 
@@ -32,7 +33,7 @@ export function scanDocumentImages(dom: string, origin: string, config: ImageCon
       path: source.raw,
       mode: "document",
       excludedExtensions: config.compression.excludedExtensions,
-      smartEnabled: config.compression.smartEnabled === true,
+      smartEnabled: isSmartCompressionEffective(config.compression.smartEnabled),
     });
     if (!decision.eligible) continue;
     if (owner && typeof (owner as Element).querySelector === "function" && !checkedBlocks.has(blockId)) {

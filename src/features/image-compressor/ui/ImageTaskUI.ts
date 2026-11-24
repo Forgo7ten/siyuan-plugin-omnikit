@@ -32,12 +32,29 @@ export interface ImageTaskScope {
   own(dispose: () => void): () => void;
 }
 
+export interface ManualCompressionDefaults {
+  quality: number;
+  manualMaxEdge: number;
+  smartEnabled?: boolean;
+  targetSimilarity?: number;
+  smartSupported?: boolean;
+}
+
+export interface ManualCompressionSmartOptions {
+  smartEnabled: boolean;
+  targetSimilarity: number;
+}
+
 /** UI adapter contract consumed by ImageController. */
 export interface ImageUI {
   manualCompression(options: {
     sourceName: string;
-    defaults: { quality: number; manualMaxEdge: number };
-    previewEncode(quality: number, manualMaxEdge: number): Promise<ManualCompressionPreview>;
+    defaults: ManualCompressionDefaults;
+    previewEncode(
+      quality: number,
+      manualMaxEdge: number,
+      smartOptions?: ManualCompressionSmartOptions,
+    ): Promise<ManualCompressionPreview>;
     save(preview: ManualCompressionPreview, replace: boolean): Promise<void>;
     onClose(): void;
   }): void;
@@ -94,7 +111,11 @@ export function mountDialog<P extends Record<string, unknown>>(
   };
 }
 
-export function createImageUI(scope: ImageTaskScope, t: (key: string) => string, feedback: UiFeedback): ImageUI {
+export function createImageUI(
+  scope: ImageTaskScope,
+  t: (key: string, values?: Record<string, string | number>) => string,
+  feedback: UiFeedback,
+): ImageUI {
   return {
     notify(message) {
       feedback.notify(message, "info", { timeout: 5000 });
