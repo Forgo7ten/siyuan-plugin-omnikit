@@ -51,7 +51,7 @@ export class ImageCompressorFeature extends BaseFeature {
       description: translate(plugin.i18n as Record<string, unknown>, `feature.${IMAGE_FEATURE_ID}.description`),
       category: "media",
       icon: "iconOmnikitMenu",
-      defaultEnabled: false,
+      defaultEnabled: true,
       minimumAppVersion: "3.8.4",
       frontends: ["all"],
     });

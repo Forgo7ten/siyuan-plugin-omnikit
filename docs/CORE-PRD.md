@@ -220,7 +220,7 @@ OmniKit 在思源侧边栏仅注册 1 个统一图标与面板容器：
 
 | Feature ID | 中文名称 | 支持端 | 业务规范文档 | 默认状态 | 说明 |
 |---|---|---|---|---|---|
-| `imageCompressor` | 图片压缩 | 全端通用 (`all`) | [PRD](features/image-compressor/PRD.md) · [DESIGN](features/image-compressor/DESIGN.md) | 关闭 (`false`) | 针对思源中新插入的图片和当前文档中的图片进行 WebP 压缩，并提供统一的 Dock 记录和引用管理 |
+| `imageCompressor` | 图片压缩 | 全端通用 (`all`) | [PRD](features/image-compressor/PRD.md) · [DESIGN](features/image-compressor/DESIGN.md) | 开启 (`true`) | 针对思源中新插入的图片和当前文档中的图片进行 WebP 压缩，并提供统一的 Dock 记录和引用管理 |
 | `titled-link` | 自动标题链接 | 全端通用 (`all`) | [PRD](features/titled-link/PRD.md) · [DESIGN](features/titled-link/DESIGN.md) | 开启 (`true`) | 针对思源行内超链接异步获取并填充网页标题，支持非网页文件免抓取、单链右键菜单与块级批量提取，具备双轨网络、流式截断、多字符集编码识别与并发冲突保护 |
 
 *(后续新增 Feature 需在完成需求规范编写与定稿后，补充更新至本索引表)*
