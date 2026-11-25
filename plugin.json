@@ -18,8 +18,8 @@
     "zh-CN": "OmniKit"
   },
   "description": {
-    "default": "A modular personal toolkit for SiYuan",
-    "zh-CN": "思源笔记模块化个人工具箱插件"
+    "default": "A modular personal toolkit for SiYuan, supporting automatic hyperlink titles, image compression, and remote image localization",
+    "zh-CN": "思源笔记个人工具箱插件，支持自动标题链接、图片压缩与外链图片转存等功能"
   },
   "readme": {
     "default": "README.md",

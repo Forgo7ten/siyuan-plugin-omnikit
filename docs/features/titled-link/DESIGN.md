@@ -17,9 +17,9 @@
 └──────────────────┬───────────────────────────────┬───────────────────┘
                    │ 粘贴范围捕获                  │ 菜单/自动任务调度
 ┌──────────────────▼───────────────┐ ┌─────────────▼───────────────────┐
-│   services/PasteLinkCapture.ts   │ │       TitledLinkController        │
-│ (trackRange + MutationObserver   │ │ (版本检查 / 并发池 / 汇总通知)    │
-│  + flushPendingTransactions)     │ └──┬──────────────┬─────────────┬───┘
+│   services/PasteLinkCapture.ts   │ │       TitledLinkController      │
+│ (trackRange + MutationObserver   │ │ (版本检查 / 并发池 / 汇总通知)  │
+│  + flushPendingTransactions)     │ └──┬──────────────┬─────────────┬─┘
 └──────────────────┬───────────────┘    │              │             │
                    │                    │              │             │
 ┌──────────────────▼────────────────────▼──┐ ┌─────────▼─────────┐ ┌─▼───────────────────┐
@@ -31,6 +31,90 @@
 └──────────────────────────────────────────┘ │ safe-writer       │ └─────────────────────┘
                                              │ title-cache       │
                                              └───────────────────┘
+```
+
+### 1.1 模块职责速查表
+
+| 模块文件 | 核心职责 | 技术规范与边界 |
+|---|---|---|
+| `TitledLinkFeature.ts` | Feature 入口 | 集中注册上下文菜单（`open-menu-link` 过滤 `isHttpUrl` / `click-blockicon` 块级批量）、`PasteLinkCapture`、`destroy-protyle`（按 `wysiwyg?.element` 清理）并在 `onEnable` 遍历 `getAllEditor()` 补登已打开编辑器；在目标编辑器上以捕获阶段管理输入法状态（`attachCompositionTracking`）；所有监听句柄由 `FeatureScope` 集中托管与注销 |
+| `services/PasteLinkCapture.ts` & `policy/paste-range.ts` | 粘贴链接范围捕获 | 挂载原生捕获阶段 `paste` 监听（`{ capture: true }`）；非空选区且 `text/plain` 为单个裸 URL 时跳过且不创建捕获资源；创建 `trackRange` 首尾句柄并对原始选区所属 `[data-node-id]` 块记录既有链接 `WeakSet<HTMLElement>`；静默评估先过上传与 IME 门禁，再无副作用直检 `createRangeFromResolved` 内新增合格链接（无效/空范围或无候选立即释放句柄且零 flush），仅检出候选时调用一次 `flushPendingTransactions()` 确认落盘后复检交付；收敛至幂等 `finishCapture(reason)` |
+| `TitledLinkController.ts`、`policy/types.ts` & `policy/batchSummary.ts` | 业务控制器与批量守恒统计 | `policy/types.ts` 定义 `LinkActionResult` 与配置模型；`batchSummary.ts` 按 7 桶守恒统计 `updated`、`unchanged`、`conflict`、`failed`、`imeTimeout`、`unknown` 与 `skipped = superseded + aborted`（相加等于 `total`）；同块任务去重、最大并发 3 请求、按块合并提交；全 `skipped` 时静默返回，汇总通知必显总数并动态拼接非零分项 |
+| `services/static-file.ts` | 非网页文件识别 | 提取 URL `pathname` 末段并先尝试 `decodeURIComponent`（失败时回退原始字符串），匹配归档、文档、媒体与图片扩展名，命中后直接返回文件名且零网页请求 |
+| `services/dual-track-fetcher.ts` | 双轨网络驱动 | 桌面客户端原生 `fetch` 直连分块读取；浏览器与移动端通过 `/api/network/forwardProxy` 代理转发，并在 `decodeBase64` 中绑定 `maxBytes` 上限执行单遍 $O(\text{maxChars})$ 扫描与校验；复用 Core `general.userAgent`；输出 `http` / `timeout` / `network` / `aborted` 失败分类 |
+| `services/stream-parser.ts` & `services/title-normalizer.ts` | 流式解析与标题净化 | 单实例 `LATIN1_DECODER` 增量分块解码、尾部 64 字符重叠窗口检测 `</head\s*>` 闭合标签与 64KB 上限截断（不提前在 `</title>` 截断）；GBK/Big5/Shift-JIS/UTF-8 字符集识别与解码；引号感知 `<meta>` 正则提取；`window.Lute.UnEscapeHTMLStr` 实体还原；空白与控制字符净化并按固定常量 `80` 字素截断 |
+| `services/safe-writer.ts` | 原生受控事务与后台安全写回 | 分离 `isActiveEditor`（以触发任务的原编辑器为准）与 `isLiveOccurrenceValid`；活跃编辑器路径执行输入法等待（5 秒超时、500ms 轮询）、`applyLinkTitle` 保护链接内折叠光标并调用 `updateTransactionElement`；原编辑器不可用时通过 Core `withBlockWriteLease` 队列校验块归属、整块基线与 `ordinal` 后调用 `updateBlock`，仅在传输结果 `"unknown"` 时重读 `getBlockDOM` 并剥离易变属性核实结果 |
+| `services/title-cache.ts` | 短期内存缓存 | 100 条 / 5 分钟 TTL 内存 LRU 结构；`epoch * EPOCH_SHIFT + urlGeneration` 代际保护；不缓存静态文件与 `fallback: true` 降级域名；零磁盘持久化 |
+| `ui/TitledLinkSettingsPanel.svelte` & `ui/autoPasteHelp.ts` | 设置界面与运行期词典适配 | 接入平台 `DraftParticipant` 全局保存栏；通过纯函数 `resolveAutoPasteHelp(t, languages?)` 动态读取思源运行期语言词典（`configGroupBehavior` 与 `pasteURLAutoConvert`），缺失时回退 `feature.titledLink.settings.autoHelp` |
+
+### 1.2 异步处理与原生受控事务写回全流程时序
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as 用户
+    participant Protyle as 活动 Protyle 编辑器
+    participant Feature as TitledLinkFeature
+    participant Controller as TitledLinkController
+    participant Parser as stream-parser & dual-track-fetcher
+    participant SafeWriter as safe-writer
+    participant Host as 思源内核 (Kernel)
+
+    rect rgb(240, 248, 255)
+    Note over User,Feature: 步骤一：事件触发与粘贴范围捕获
+    alt 自动粘贴 URL (PasteLinkCapture 捕获阶段拦截判定与范围跟踪)
+        User->>Protyle: 粘贴内容 (原生粘贴立即插入)
+        Protyle->>Feature: capture paste 监听 (校验选区非空+单裸URL早跳过 / 捕获 trackRange 端点与块级 WeakSet)
+        Feature->>Controller: 过上传/IME 门禁并直检出候选后条件 flush 并收集范围内新链接
+    else 右键菜单触发 (单链或块级批量)
+        User->>Feature: 触发上下文菜单动作
+        Feature->>Controller: 提取链接与块上下文并派发
+    end
+    end
+
+    rect rgb(255, 250, 240)
+    Note over Controller,Parser: 步骤二：文件免抓取判定与双轨流式解析
+    alt 命中非网页扩展名 (.zip/.pdf/.exe/.mp4/图片等)
+        Controller->>Controller: 提取 pathname 末段并尝试 decodeURIComponent 作为标题 (零网络)
+    else 网页超链接
+        Controller->>Parser: 发起双轨网络请求 (携带 Core 统一 UA)
+        alt 桌面客户端 (desktop / desktop-window)
+            Parser->>Host: 原生 fetch 流式分块读取 (Chunk Stream)
+            Parser->>Parser: 64 字符重叠窗口检测 </head> 闭合标签
+            Parser->>Parser: 触发 64KB 上限截断或 </head> 截断，主动取消底层网络流
+        else 浏览器与移动端
+            Parser->>Host: POST /api/network/forwardProxy (代理转发)
+            Host-->>Parser: 返回 Base64 数据
+            Parser->>Parser: 按 maxBytes 上限单遍扫描解码前 64KB 并识别字符集
+        end
+        Parser->>Controller: 返回净化与截断后的标准标题 (含 http/timeout/network 失败分类)
+    end
+    end
+
+    rect rgb(240, 255, 240)
+    Note over Controller,SafeWriter: 步骤三：内存 DOM 实时状态核验、共享写入队列与事务提交
+    Controller->>SafeWriter: 提交标题写回请求
+    alt 触发任务的原编辑器存活 (isActiveEditor 优先)
+        SafeWriter->>SafeWriter: 核验 isLiveOccurrenceValid 与目标编辑器级 IME 状态 (500ms 轮询/5s 超时)
+        SafeWriter->>Protyle: 调用 applyLinkTitle 更新内存 DOM 并仅在链接内折叠光标时恢复末尾位置
+        SafeWriter->>Protyle: 调用 protyle.updateTransactionElement(blockElement, oldHTML)
+        Note over Protyle: 原生受控事务: 支持 Ctrl+Z 撤销/重做并自动保存；异常回滚返回 failed
+    else 原编辑器已关闭或不可用时的后台更新 (!isActiveEditor)
+        SafeWriter->>SafeWriter: 获取 Core 共享块写入租约 (notebook/blockID)
+        SafeWriter->>Host: POST /api/block/getBlockInfo & getBlockDOM (读取异常返回 failed)
+        SafeWriter->>SafeWriter: 校验身份、去只读渲染属性整块基线与 ordinal
+        SafeWriter->>Host: POST /api/block/updateBlock (dataType: "dom", expectedHTML)
+        alt 内核返回 code: 0
+            Host-->>SafeWriter: 视为已保存（不额外重读）
+        else 发前中止 (not-sent)
+            Host-->>SafeWriter: 直接返回 aborted（不重读 DOM）
+        else 内核返回 code !== 0 (rejected)
+            Host-->>SafeWriter: 直接返回 failed（不重读 DOM）
+        else 超时/断连/等待响应阶段中止 (unknown)
+            SafeWriter->>Host: 重读 getBlockDOM 并以 stripKernelVolatileAttributes 对比副本核实（不重发写请求）
+        end
+    end
+    end
 ```
 
 ---
