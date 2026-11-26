@@ -18,8 +18,8 @@
     "zh-CN": "OmniKit"
   },
   "description": {
-    "default": "A modular personal toolkit for SiYuan, supporting automatic hyperlink titles, image compression, and remote image localization",
-    "zh-CN": "思源笔记个人工具箱插件，支持自动标题链接、图片压缩与外链图片转存等功能"
+    "default": "A modular personal toolkit for SiYuan, supporting automatic hyperlink titles, image compression, remote image localization, and side-by-side document diff",
+    "zh-CN": "思源笔记个人工具箱插件，支持自动标题链接、图片压缩、外链图片转存与差异文档比较等功能"
   },
   "readme": {
     "default": "README.md",
@@ -41,6 +41,9 @@
     "自动标题",
     "超链接",
     "link title",
+    "document diff",
+    "差异对比",
+    "冲突对比",
     "Svelte"
   ]
 }

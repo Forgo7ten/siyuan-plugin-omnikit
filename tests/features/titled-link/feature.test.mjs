@@ -122,7 +122,7 @@ test("feature registration and both locales include titled-link settings", async
     read("../../../src/i18n/zh-CN.json"),
     read("../../../src/i18n/en.json"),
   ]);
-  assert.match(plugin, /registrations = \[imageCompressorRegistration, titledLinkRegistration\]/);
+  assert.match(plugin, /registrations = \[[^\]]*\btitledLinkRegistration\b[^\]]*\]/);
   assert.match(registration, /id: "titled-link"/);
   assert.match(registration, /settingsView: TitledLinkSettingsPanel/);
   for (const key of ["feature.titledLink.title", "titledLink.menuSingle", "titledLink.menuBatch", "titledLink.updated"]) {

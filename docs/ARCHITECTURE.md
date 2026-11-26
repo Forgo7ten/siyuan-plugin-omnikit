@@ -71,6 +71,7 @@ flowchart TD
         FeatContract["FeatureRegistration<T> & BaseFeature 统一接入契约"]
         FeatImg["image-compressor (详见 features/image-compressor/DESIGN.md)"]
         FeatTL["titled-link (详见 features/titled-link/DESIGN.md)"]
+        FeatDiff["document-diff (详见 features/document-diff/DESIGN.md)"]
         FeatNext["其他扩展 Feature (独立业务逻辑与存储)"]
     end
 
@@ -89,6 +90,7 @@ flowchart TD
     Manager --> FeatContract
     FeatContract --> FeatImg
     FeatContract --> FeatTL
+    FeatContract --> FeatDiff
     FeatContract --> FeatNext
 
     FeatContract --> CoreInfra
@@ -296,7 +298,8 @@ SiYuan 工作区目录：data/storage/petal/siyuan-plugin-omnikit/
 ├── omnikit-core.json                      <-- Core 平台配置
 ├── feature-image-compressor-settings.json <-- Feature 用户设置 (ID: imageCompressor，按 kebab-case 派生)
 ├── feature-image-compressor-records.json  <-- Feature 业务数据 (不受设置重置影响)
-└── feature-titled-link-settings.json      <-- Feature 用户设置 (ID: titled-link)
+├── feature-titled-link-settings.json      <-- Feature 用户设置 (ID: titled-link)
+└── feature-document-diff-settings.json    <-- Feature 用户设置 (ID: document-diff)
 ```
 
 | 存储分类 | 文件命名规则 | 包含内容 | 重置操作影响边界 |
@@ -312,6 +315,7 @@ SiYuan 工作区目录：data/storage/petal/siyuan-plugin-omnikit/
 各已接入特性的详细技术设计见各自独立文档：
 - **图片压缩 (`imageCompressor`)**：[PRD](features/image-compressor/PRD.md) · [DESIGN](features/image-compressor/DESIGN.md)
 - **自动标题链接 (`titled-link`)**：[PRD](features/titled-link/PRD.md) · [DESIGN](features/titled-link/DESIGN.md)
+- **差异文档比较 (`document-diff`)**：[PRD](features/document-diff/PRD.md) · [DESIGN](features/document-diff/DESIGN.md)
 
 ### 5.1 标准接入步骤
 1. **文档先行**：在 `docs/features/<feature-name>/` 下分别建立 `PRD.md`（产品需求与验收边界，须经用户确认）与 `DESIGN.md`（模块拆分、接口时序、数据结构与容错细节），并在 [CORE-PRD.md](CORE-PRD.md) 第 7 节补充索引；

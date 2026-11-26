@@ -28,7 +28,7 @@
 
 # Overview
 
-**OmniKit** is a modular toolkit plugin for [SiYuan Note](https://b3log.org/siyuan/) providing automatic hyperlink titles, image compression, and remote image localization. Each module operates independently and can be toggled on or off in the settings panel.
+**OmniKit** is a modular toolkit plugin for [SiYuan Note](https://b3log.org/siyuan/) providing automatic hyperlink titles, image compression, remote image localization, and side-by-side document diff comparison. Each module operates independently and can be toggled on or off in the settings panel.
 
 ---
 
@@ -61,6 +61,17 @@ Converts images into WebP format and downloads remote image URLs into local work
   - Jump to and highlight corresponding image blocks in the editor;
   - Revert document references back to original images at any time.
 
+## 3. Document Diff
+
+Compares content and semantic differences between any two distinct documents side-by-side in SiYuan's native split editors while keeping both panes natively editable (supported on desktop client, detached desktop windows, and desktop browser).
+
+- **Three Launch Entry Points**:
+  - **Conflict Copy Comparison**: For documents ending with SiYuan's conflict suffix ` (Conflicted YYYY-MM-DD HH:mm:ss)`, choose `[OmniKit] Compare with original document` (matches the unique sibling with the exact base title in the same notebook and parent folder, or opens a document picker when ambiguous/absent) or `[OmniKit] Choose document to compare…` from the document title menu or single-selection file tree menu;
+  - **Visible Split Panes**: Select **Compare visible left/right documents** from the OmniKit top-bar menu to compare two side-by-side editors already open in the workspace;
+  - **File Tree Dual Selection**: Select two distinct documents in the file tree and right-click `[OmniKit] Compare document differences` to open them in a native left/right split and start comparison.
+- **Block-ID-Neutral Full-Block Highlighting**: Aligns blocks across text, headings/lists/tasks/mindmaps/tabs/superblocks/callouts, images, code and diagram blocks (Mermaid / ECharts, etc.), tables, math, audio/video/IFrame/widgets, HTML blocks, query embeds, AttributeView databases, and normalized internal block references rather than block IDs. Uses `CSS.highlights` and external read-only overlays with SiYuan's native diff theme variables without mutating document DOM or undo history.
+- **Live Editing & Assisted Navigation**: Provides a draggable floating toolbar with document identity labels, credibility status, category filter chips (All / Left-only / Right-only / Modified / Needs review), previous/next navigation across virtualized sections, content-anchored synchronized scrolling, in-place left/right pane swapping, and debounced recomputation (~400 ms) after edits.
+
 ---
 
 # Usage & Settings
@@ -70,7 +81,8 @@ Converts images into WebP format and downloads remote image URLs into local work
 3. Available options:
    - **General**: console debug logging and shared network `User-Agent`;
    - **Image Compressor**: global automatic compression toggle, document allowlist, smart compression toggle (adaptive search based on MS-SSIM and local detail patches; shows a performance notice when enabled on mobile and disables automatically on hosts without WebP encoding support), target similarity, default compression quality (used when smart compression is off), and manual maximum edge limit;
-   - **Titled Link**: fetch link titles on paste, sync hover title attribute (`data-title`), and fallback to hostname on fetch failure (title truncation is fixed at 80 graphemes).
+   - **Titled Link**: fetch link titles on paste, sync hover title attribute (`data-title`), and fallback to hostname on fetch failure (title truncation is fixed at 80 graphemes);
+   - **Document Diff**: enable synchronized scrolling by default for new comparison sessions (desktop layouts only).
 
 ---
 

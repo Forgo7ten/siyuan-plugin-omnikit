@@ -222,6 +222,7 @@ OmniKit 在思源侧边栏仅注册 1 个统一图标与面板容器：
 |---|---|---|---|---|---|
 | `imageCompressor` | 图片压缩 | 全端通用 (`all`) | [PRD](features/image-compressor/PRD.md) · [DESIGN](features/image-compressor/DESIGN.md) | 开启 (`true`) | 针对思源中新插入的图片和当前文档中的图片进行 WebP 压缩，并提供统一的 Dock 记录和引用管理 |
 | `titled-link` | 自动标题链接 | 全端通用 (`all`) | [PRD](features/titled-link/PRD.md) · [DESIGN](features/titled-link/DESIGN.md) | 开启 (`true`) | 针对思源行内超链接异步获取并填充网页标题，支持非网页文件免抓取、单链右键菜单与块级批量提取，具备双轨网络、流式截断、多字符集编码识别与并发冲突保护 |
+| `document-diff` | 差异文档比较 | 桌面布局端 (`desktop` / `desktop-window` / `browser-desktop`) | [PRD](features/document-diff/PRD.md) · [DESIGN](features/document-diff/DESIGN.md) | 开启 (`true`) | 在思源原生左右分屏编辑器中对两篇文档进行块 ID 中立的逻辑行与行内差异比对，支持冲突副本同目录原文档自动匹配、手动指定对象、边编辑边动态重算、分类筛选导航、跨视口定位、内容锚点同步滚动与左右分屏对调 |
 
 *(后续新增 Feature 需在完成需求规范编写与定稿后，补充更新至本索引表)*
 
