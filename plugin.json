@@ -28,22 +28,26 @@
   "icon": "icon.png",
   "preview": "preview.png",
   "keywords": [
-    "toolkit",
     "工具箱",
-    "image compression",
+    "toolkit",
     "图片压缩",
-    "webp",
     "图片优化",
+    "webp",
     "外链转存",
-    "titled link",
+    "image compression",
     "链接标题",
     "网页标题",
     "自动标题",
     "超链接",
     "link title",
-    "document diff",
+    "titled link",
+    "文档差异",
+    "文档对比",
+    "差异",
+    "对比",
     "差异对比",
     "冲突对比",
-    "Svelte"
+    "diff",
+    "document diff"
   ]
 }
