@@ -1,9 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync, execFile } from "node:child_process";
+import http from "node:http";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 import {
   calculateNextVersion,
@@ -134,5 +140,189 @@ test("verifyVersions validates manifest and package version synchronization", as
     await assert.rejects(() => verifyVersions(root), /does not conform to SemVer X\.Y\.Z/);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+const generateNotesScript = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../../scripts/release/generate-notes.sh",
+);
+
+function git(cwd, ...args) {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_AUTHOR_NAME: "OmniKit Test",
+      GIT_AUTHOR_EMAIL: "test@example.com",
+      GIT_COMMITTER_NAME: "OmniKit Test",
+      GIT_COMMITTER_EMAIL: "test@example.com",
+    },
+  });
+}
+
+async function withMockGitHubApi(handler, fn) {
+  const server = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks).toString("utf8");
+    const result = handler({ method: req.method, url: req.url, body: body ? JSON.parse(body) : null });
+    res.writeHead(result.status ?? 200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(result.json));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  try {
+    return await fn(`http://127.0.0.1:${port}`);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+}
+
+test("generate-notes.sh appends ## Commits after GitHub native release notes", async () => {
+  const repo = await mkdtemp(path.join(os.tmpdir(), "omnikit-release-notes-"));
+  try {
+    git(repo, "init", "-b", "main");
+    await writeFile(path.join(repo, "file.txt"), "1\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "feat: initial release");
+    git(repo, "tag", "v0.1.0");
+
+    await writeFile(path.join(repo, "file.txt"), "2\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "fix: first change after v0.1.0");
+
+    await writeFile(path.join(repo, "file.txt"), "3\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "feat: newest change for v0.2.0");
+    const headSha = git(repo, "rev-parse", "HEAD").trim();
+
+    const requests = [];
+    await withMockGitHubApi(req => {
+      requests.push(req);
+      return {
+        status: 200,
+        json: {
+          body: "**Full Changelog**: https://github.com/owner/repo/compare/v0.1.0...v0.2.0",
+        },
+      };
+    }, async apiUrl => {
+      // 1) workflow_dispatch case: RELEASE_TAG does not exist yet
+      const outManual = path.join(repo, "notes-manual.md");
+      const ghOutput = path.join(repo, "github-output.txt");
+      await execFileAsync("bash", [generateNotesScript], {
+        cwd: repo,
+        env: {
+          ...process.env,
+          GH_TOKEN: "test-token",
+          GH_REPO: "owner/repo",
+          RELEASE_TAG: "v0.2.0",
+          GITHUB_SHA: headSha,
+          GITHUB_API_URL: apiUrl,
+          OUTPUT_FILE: outManual,
+          GITHUB_OUTPUT: ghOutput,
+        },
+      });
+
+      const expected = [
+        "**Full Changelog**: https://github.com/owner/repo/compare/v0.1.0...v0.2.0",
+        "",
+        "## Commits",
+        "",
+        "- feat: newest change for v0.2.0",
+        "- fix: first change after v0.1.0",
+        "",
+      ].join("\n");
+      assert.equal(await readFile(outManual, "utf8"), expected);
+      assert.equal(await readFile(ghOutput, "utf8"), `notes_file=${outManual}\n`);
+      assert.deepEqual(requests[0], {
+        method: "POST",
+        url: "/repos/owner/repo/releases/generate-notes",
+        body: { tag_name: "v0.2.0", target_commitish: headSha, previous_tag_name: "v0.1.0" },
+      });
+
+      // 2) push.tags case: RELEASE_TAG already points to HEAD
+      git(repo, "tag", "v0.2.0");
+      const outTag = path.join(repo, "notes-tag.md");
+      await execFileAsync("bash", [generateNotesScript], {
+        cwd: repo,
+        env: {
+          ...process.env,
+          GH_TOKEN: "test-token",
+          GH_REPO: "owner/repo",
+          RELEASE_TAG: "v0.2.0",
+          GITHUB_SHA: headSha,
+          GITHUB_API_URL: apiUrl,
+          OUTPUT_FILE: outTag,
+        },
+      });
+      assert.equal(await readFile(outTag, "utf8"), expected);
+    });
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("generate-notes.sh omits previous_tag_name on first release and preserves GitHub PR body", async () => {
+  const repo = await mkdtemp(path.join(os.tmpdir(), "omnikit-release-notes-first-"));
+  try {
+    git(repo, "init", "-b", "main");
+    await writeFile(path.join(repo, "a.txt"), "a\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "feat: first commit");
+
+    await writeFile(path.join(repo, "a.txt"), "b\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "docs: second commit");
+    const headSha = git(repo, "rev-parse", "HEAD").trim();
+
+    const requests = [];
+    await withMockGitHubApi(req => {
+      requests.push(req);
+      return {
+        status: 200,
+        json: {
+          body: "## What's Changed\n* Add docs by @dev in https://github.com/owner/repo/pull/1\n\n**Full Changelog**: https://github.com/owner/repo/commits/v0.1.0",
+        },
+      };
+    }, async apiUrl => {
+      const outFirst = path.join(repo, "notes-first.md");
+      await execFileAsync("bash", [generateNotesScript], {
+        cwd: repo,
+        env: {
+          ...process.env,
+          GH_TOKEN: "test-token",
+          GH_REPO: "owner/repo",
+          RELEASE_TAG: "v0.1.0",
+          GITHUB_SHA: headSha,
+          GITHUB_API_URL: apiUrl,
+          OUTPUT_FILE: outFirst,
+        },
+      });
+      assert.deepEqual(requests[0].body, {
+        tag_name: "v0.1.0",
+        target_commitish: headSha,
+      });
+      assert.equal(
+        await readFile(outFirst, "utf8"),
+        [
+          "## What's Changed",
+          "* Add docs by @dev in https://github.com/owner/repo/pull/1",
+          "",
+          "**Full Changelog**: https://github.com/owner/repo/commits/v0.1.0",
+          "",
+          "## Commits",
+          "",
+          "- docs: second commit",
+          "- feat: first commit",
+          "",
+        ].join("\n"),
+      );
+    });
+  } finally {
+    await rm(repo, { recursive: true, force: true });
   }
 });

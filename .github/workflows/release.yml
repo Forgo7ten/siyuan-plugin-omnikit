@@ -23,6 +23,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -66,6 +68,15 @@ jobs:
           pnpm package:verify
           unzip -t package.zip
 
+      # 生成本次发布说明（GitHub 原生内容后追加 ## Commits 倒序列表）。
+      - name: Generate release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag || github.ref_name }}
+        run: bash scripts/release/generate-notes.sh
+
       # 手动发布：构建成功后处理已有 Tag / Release。
       - name: Reconcile release tag
         if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -81,11 +92,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          NOTES_FILE: ${{ steps.notes.outputs.notes_file }}
         run: |
           gh release create "${RELEASE_TAG}" package.zip \
             --target "${GITHUB_SHA}" \
             --title "OmniKit ${RELEASE_TAG}" \
-            --generate-notes
+            --notes-file "${NOTES_FILE}"
 
       # Tag 自动发布。
       - name: Publish tag release
@@ -93,6 +105,7 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           artifacts: package.zip
+          bodyFile: ${{ steps.notes.outputs.notes_file }}
           allowUpdates: true
           artifactErrorsFailBuild: true
           token: ${{ secrets.GITHUB_TOKEN }}

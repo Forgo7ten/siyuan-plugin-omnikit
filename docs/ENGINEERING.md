@@ -33,6 +33,7 @@ scripts/
 ├── dev/
 │   └── install-workspace.mjs  # 开发态向思源工作区安全安装与原子备份回滚
 ├── release/
+│   ├── generate-notes.sh      # 基于上一 Tag 至 HEAD 提交历史生成 Release Notes
 │   ├── read-version.sh        # CI 手动发版从 plugin.json 提取版本并校验 X.Y.Z
 │   ├── reconcile-tag.sh       # 处理已有同名 Tag 与 GitHub Release 的状态协调
 │   ├── update-version.mjs     # plugin.json 与 package.json 双清单原子版本同步
@@ -47,6 +48,7 @@ scripts/
 |---|---|---|---|
 | `scripts/build/render-icons.mjs` | `pnpm render:icons` | `dev`、`build:app` 构建前 | 基于 `@resvg/resvg-js` 分别从 `assets/omnikit-plugin.svg` 与 `assets/omnikit-banner.svg` 渲染 `.generated/icon.png`（$160 \times 160$，$\le 64\text{ KiB}$）与 `.generated/preview.png`（$1024 \times 768$，$\le 512\text{ KiB}$） |
 | `scripts/dev/install-workspace.mjs` | `pnpm install:workspace` | 本地开发调试（传入工作区路径） | 先执行 `pnpm build`，再向指定思源工作区 `data/plugins/siyuan-plugin-omnikit` 安全安装产物，实施软链接拒绝、路径越界检查、清单归属校验、暂存部署与原子备份回滚 |
+| `scripts/release/generate-notes.sh` | CI 内部调用 | `release.yml` 构建校验通过后 | 调用 GitHub `releases/generate-notes` API 获取原生发布说明，并在末尾追加 `## Commits`（`HEAD` 可达的上一 `v*` Tag 至 `HEAD` 的倒序非合并提交无序列表），输出 `notes_file` 至 `$GITHUB_OUTPUT` |
 | `scripts/release/read-version.sh` | CI 内部调用 | GitHub Actions `workflow_dispatch` | 校验触发分支等于默认分支（`main`），使用 `jq` 读取 `plugin.json.version`，校验 `X.Y.Z` 格式并输出 `release_tag=v${version}` 至 `$GITHUB_OUTPUT` |
 | `scripts/release/reconcile-tag.sh` | CI 内部调用 | 手动发版构建与校验通过后 | 通过 GitHub REST API 查询目标 Tag 与 Release 状态，递归解析 Annotated Tag 至 commit SHA，按状态矩阵执行 Tag 复用、重复发布拦截或旧提交覆盖清理 |
 | `scripts/release/update-version.mjs` | `pnpm version:bump [patch\|minor\|major\|X.Y.Z]` | 本地版本升级 | 校验初始双清单版本一致后计算新版本号（未传参且在 TTY 下提供交互式选择），同步写回 `package.json` 与 `plugin.json` |
@@ -105,6 +107,7 @@ flowchart TD
         BuildApp["pnpm build:app (图标渲染与生产打包)"]
         VerifyPkg["pnpm package:verify (清单/图标/ZIP结构静态校验)"]
         ZipTest["unzip -t package.zip (压缩完整性测试)"]
+        GenNotes["scripts/release/generate-notes.sh<br/>拉取 GitHub 原生说明并追加 ## Commits"]
     end
 
     subgraph ReconcileTag["Tag 与 Release 状态协调 (reconcile-tag.sh)"]
@@ -136,9 +139,10 @@ flowchart TD
     UnitTests --> BuildApp
     BuildApp --> VerifyPkg
     VerifyPkg --> ZipTest
+    ZipTest --> GenNotes
 
-    ZipTest -->|workflow_dispatch 分支| ReconcileTag
-    ZipTest -->|push.tags 分支| NcipolloAction
+    GenNotes -->|workflow_dispatch 分支| ReconcileTag
+    GenNotes -->|push.tags 分支| NcipolloAction
 
     ReconcileTag --> QueryState
     QueryState --> ResolveCommit
