@@ -18,7 +18,7 @@
    - 内联 Web Worker 通过 Vite `?worker&inline` 打包为自包含 Blob Worker，不生成独立外部 worker 脚本，也不构建 `kernel.js`；
 3. **静态资源拷贝 (`vite-plugin-static-copy`)**：
    - 将 `plugin.json`、`README*.md`、`.generated/icon.png`、`.generated/preview.png` 拷贝至输出根目录；
-   - 将 `src/i18n/*.json` 拷贝至输出目录 `i18n/`，将 `assets/omnikit-*.svg` 拷贝至输出目录 `assets/`。
+   - 将 `src/i18n/*.json` 拷贝至输出目录 `i18n/`，将 `assets/omnikit-*.svg`（含 `omnikit-banner.svg`）拷贝至输出目录 `assets/`。
 
 ---
 
@@ -45,7 +45,7 @@ scripts/
 
 | 脚本路径 | 对应 NPM 指令 | 触发时机 | 核心技术职责 |
 |---|---|---|---|
-| `scripts/build/render-icons.mjs` | `pnpm render:icons` | `dev`、`build:app` 构建前 | 基于 `@resvg/resvg-js` 从 `assets/omnikit-plugin.svg` 渲染 `.generated/icon.png`（$160 \times 160$，$\le 64\text{ KiB}$）与 `.generated/preview.png`（$512 \times 512$，$\le 256\text{ KiB}$） |
+| `scripts/build/render-icons.mjs` | `pnpm render:icons` | `dev`、`build:app` 构建前 | 基于 `@resvg/resvg-js` 分别从 `assets/omnikit-plugin.svg` 与 `assets/omnikit-banner.svg` 渲染 `.generated/icon.png`（$160 \times 160$，$\le 64\text{ KiB}$）与 `.generated/preview.png`（$1024 \times 768$，$\le 512\text{ KiB}$） |
 | `scripts/dev/install-workspace.mjs` | `pnpm install:workspace` | 本地开发调试（传入工作区路径） | 先执行 `pnpm build`，再向指定思源工作区 `data/plugins/siyuan-plugin-omnikit` 安全安装产物，实施软链接拒绝、路径越界检查、清单归属校验、暂存部署与原子备份回滚 |
 | `scripts/release/read-version.sh` | CI 内部调用 | GitHub Actions `workflow_dispatch` | 校验触发分支等于默认分支（`main`），使用 `jq` 读取 `plugin.json.version`，校验 `X.Y.Z` 格式并输出 `release_tag=v${version}` 至 `$GITHUB_OUTPUT` |
 | `scripts/release/reconcile-tag.sh` | CI 内部调用 | 手动发版构建与校验通过后 | 通过 GitHub REST API 查询目标 Tag 与 Release 状态，递归解析 Annotated Tag 至 commit SHA，按状态矩阵执行 Tag 复用、重复发布拦截或旧提交覆盖清理 |
@@ -64,16 +64,16 @@ scripts/
 ### 2.2 核心脚本实现规范
 
 1. **高精图标与预览图渲染 (`scripts/build/render-icons.mjs`)**：
-   - 使用 `@resvg/resvg-js` 读取 `assets/omnikit-plugin.svg`，配置 `font: { loadSystemFonts: false }` 禁用系统字体探测以保证跨平台输出一致；
-   - 输出至 `.generated/icon.png`（`160×160`，断言宽高精确匹配且 $\le 64\text{ KiB}$）与 `.generated/preview.png`（`512×512`，断言宽高精确匹配且 $\le 256\text{ KiB}$）；仓库根目录不留存或追踪静态 `icon.png` / `preview.png`。
+   - 使用 `@resvg/resvg-js` 分别读取 `assets/omnikit-plugin.svg`（纯矢量图形，配置 `font: { loadSystemFonts: false }`）与 `assets/omnikit-banner.svg`（含 SVG `<text>` 文案，启用 `font: { loadSystemFonts: true, sansSerifFamily: "Liberation Sans", defaultFontFamily: "Liberation Sans" }` 以保证文字完整渲染并在 Linux 环境下与 Arial 字体度量一致）；
+   - 输出至 `.generated/icon.png`（`160×160`，断言宽高精确匹配且 $\le 64\text{ KiB}$）与 `.generated/preview.png`（`1024×768`，断言宽高精确匹配且 $\le 512\text{ KiB}$）；仓库根目录不留存或追踪静态 `icon.png` / `preview.png`。
 2. **开发态工作区安全安装 (`scripts/dev/install-workspace.mjs`)**：
    - **路径与结构核验**：调用 `lstat` 与 `realpath` 验证工作区根目录及 `conf/`、`data/`、`data/.siyuan/`、`data/plugins/` 均为真实物理目录（遇到软链接或解析出工作区外部路径立即拒绝）；
    - **目标目录归属保护**：若 `data/plugins/siyuan-plugin-omnikit` 已存在，必须非软链接且其 `plugin.json` 的 `name === "siyuan-plugin-omnikit"`（仅 `ENOENT` 允许继续，JSON 损坏或归属不匹配立即终止）；
-   - **产物前置校验与两阶段原子替换**：校验 `dist/` 下 7 个核心文件与 4 个 `assets/`、`i18n/` 资源齐全且 `dist/plugin.json` 名称匹配后，先拷贝至同目录暂存区 `.siyuan-plugin-omnikit.install-${Date.now()}-${uuid}`；随后将旧目录重命名为 `siyuan-plugin-omnikit.backup-${Date.now()}-${uuid}`，再将暂存区原子重命名为正式目录；若中途失败则清理暂存区并将备份恢复为正式目录。
+   - **产物前置校验与两阶段原子替换**：校验 `dist/` 下 7 个核心文件与 5 个 `assets/`、`i18n/` 资源齐全且 `dist/plugin.json` 名称匹配后，先拷贝至同目录暂存区 `.siyuan-plugin-omnikit.install-${Date.now()}-${uuid}`；随后将旧目录重命名为 `siyuan-plugin-omnikit.backup-${Date.now()}-${uuid}`，再将暂存区原子重命名为正式目录；若中途失败则清理暂存区并将备份恢复为正式目录。
 3. **产物包结构静态核验 (`scripts/release/verify-package.mjs`)**：
-   - **物理文件与非空断言**：核验 `dist/index.js`、`dist/index.css`、`dist/plugin.json`、`dist/README.md`、`dist/README.zh-CN.md`、`dist/i18n/en.json`、`dist/i18n/zh-CN.json`、`dist/icon.png`、`dist/preview.png`、`dist/assets/omnikit-menu.svg`、`dist/assets/omnikit-plugin.svg` 及 `package.zip` 均存在且大小 $> 0$；断言仓库根目录下不存在 `icon.png` 与 `preview.png`；
+   - **物理文件与非空断言**：核验 `dist/index.js`、`dist/index.css`、`dist/plugin.json`、`dist/README.md`、`dist/README.zh-CN.md`、`dist/i18n/en.json`、`dist/i18n/zh-CN.json`、`dist/icon.png`、`dist/preview.png`、`dist/assets/omnikit-menu.svg`、`dist/assets/omnikit-plugin.svg`、`dist/assets/omnikit-banner.svg` 及 `package.zip` 均存在且大小 $> 0$；断言仓库根目录下不存在 `icon.png` 与 `preview.png`；
    - **PNG 标头与元数据核验**：校验 `dist/icon.png` 与 `dist/preview.png` 前 8 字节 PNG 魔数 `[137, 80, 78, 71, 13, 10, 26, 10]` 及 IHDR 块第 16~23 字节宽高与体积上限；校验 `README.md` 与 `README.zh-CN.md` 引用 `assets/omnikit-plugin.svg`；校验 `package.json.version === dist/plugin.json.version`、`manifest.name === "siyuan-plugin-omnikit"`、`manifest.minAppVersion === "3.8.4"`、`manifest.icon === "icon.png"`、`manifest.preview === "preview.png"` 及双语 JSON 可正常解析；
-   - **零依赖 ZIP Central Directory 审查**：从 `package.zip` 尾部定位 EOCD 签名 `0x06054b50`，遍历 Central Directory Header `0x02014b50` 提取全部条目名，断言包含 9 项必需分发文件，且**不包含 `kernel.js`**、**不包含任何 `node_modules/` 前缀条目**。
+   - **零依赖 ZIP Central Directory 审查**：从 `package.zip` 尾部定位 EOCD 签名 `0x06054b50`，遍历 Central Directory Header `0x02014b50` 提取全部条目名，断言包含 12 项必需分发文件，且**不包含 `kernel.js`**、**不包含任何 `node_modules/` 前缀条目**。
 
 ---
 
@@ -189,7 +189,7 @@ flowchart TD
 ## 5. 工程与发版核验清单
 
 - [ ] 所有工程脚本是否集中于 `scripts/` 目录体系，根目录下无散落的 `icon.png`、`preview.png` 或临时脚本？
-- [ ] `scripts/build/render-icons.mjs` 是否生成 $160 \times 160$（$\le 64\text{ KiB}$）的 `.generated/icon.png` 与 $512 \times 512$（$\le 256\text{ KiB}$）的 `.generated/preview.png`？
+- [ ] `scripts/build/render-icons.mjs` 是否生成 $160 \times 160$（$\le 64\text{ KiB}$）的 `.generated/icon.png` 与 $1024 \times 768$（$\le 512\text{ KiB}$）的 `.generated/preview.png`？
 - [ ] `scripts/dev/install-workspace.mjs` 是否实施了软链接拒绝、路径越界检查、目标 `plugin.json.name` 校验与暂存/备份原子回滚？
 - [ ] `scripts/release/verify-package.mjs` 是否核验了 12 项必需产物、PNG 魔数与尺寸、README 图标引用、双清单版本一致、`minAppVersion === "3.8.4"` 以及 `package.zip` Central Directory（无 `kernel.js` 与 `node_modules/`）？
 - [ ] `.github/workflows/release.yml` 是否保持 `push.tags: ["v*"]` 与免参数 `workflow_dispatch` 双入口、8 道前置质量门禁、`reconcile-tag.sh` 状态协调、`GITHUB_TOKEN` 防递归及 `concurrency` 互斥控制？

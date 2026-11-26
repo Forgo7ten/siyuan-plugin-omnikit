@@ -1,6 +1,6 @@
 {
   "name": "siyuan-plugin-omnikit",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Modular personal tools for SiYuan built with TypeScript, Vite and Svelte 5",
   "main": "index.js",
   "scripts": {

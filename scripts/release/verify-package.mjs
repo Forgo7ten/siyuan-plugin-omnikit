@@ -11,7 +11,7 @@ const required = [
   "dist/README.md", "dist/README.zh-CN.md",
   "dist/i18n/en.json", "dist/i18n/zh-CN.json",
   "dist/icon.png", "dist/preview.png",
-  "dist/assets/omnikit-menu.svg", "dist/assets/omnikit-plugin.svg", "package.zip",
+  "dist/assets/omnikit-banner.svg", "dist/assets/omnikit-menu.svg", "dist/assets/omnikit-plugin.svg", "package.zip",
 ];
 for (const relPath of required) {
   const fullPath = resolveRoot(relPath);
@@ -28,9 +28,9 @@ assert.equal(icon.readUInt32BE(20), 160, "marketplace icon height");
 assert.ok(icon.byteLength <= 64 * 1024, "marketplace icon must be at most 64 KiB");
 const preview = readFileSync(resolveRoot("dist/preview.png"));
 assert.deepEqual(preview.subarray(0, 8), pngMagic);
-assert.equal(preview.readUInt32BE(16), 512, "marketplace preview width");
-assert.equal(preview.readUInt32BE(20), 512, "marketplace preview height");
-assert.ok(preview.byteLength <= 256 * 1024, "marketplace preview must be at most 256 KiB");
+assert.equal(preview.readUInt32BE(16), 1024, "marketplace preview width");
+assert.equal(preview.readUInt32BE(20), 768, "marketplace preview height");
+assert.ok(preview.byteLength <= 512 * 1024, "marketplace preview must be at most 512 KiB");
 for (const readme of ["README.md", "README.zh-CN.md"]) {
   assert.match(readFileSync(resolveRoot(readme), "utf8"), /assets\/omnikit-plugin\.svg/);
 }
@@ -64,9 +64,10 @@ for (let index = 0; index < entryCount; index++) {
   cursor += 46 + nameLength + extraLength + commentLength;
 }
 for (const entry of [
-  "index.js", "index.css", "plugin.json", "i18n/en.json", "i18n/zh-CN.json",
+  "index.js", "index.css", "plugin.json", "README.md", "README.zh-CN.md",
+  "i18n/en.json", "i18n/zh-CN.json",
   "icon.png", "preview.png",
-  "assets/omnikit-menu.svg", "assets/omnikit-plugin.svg",
+  "assets/omnikit-banner.svg", "assets/omnikit-menu.svg", "assets/omnikit-plugin.svg",
 ]) {
   assert.ok(zipEntries.includes(entry), `Missing package.zip entry: ${entry}`);
 }

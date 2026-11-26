@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="768" viewBox="0 0 1024 768" role="img" aria-labelledby="title desc">
+  <title id="title">OmniKit — Toolbox Universe</title>
+  <desc id="desc">An abstract, dimensional toolkit universe with layered floating modules orbiting the OmniKit symbol, using the project's navy, cyan, blue, and mint identity.</desc>
+  <defs>
+    <linearGradient id="c-bg" x1="0" y1="0" x2="1024" y2="768" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#07152F"/>
+      <stop offset=".52" stop-color="#101B42"/>
+      <stop offset="1" stop-color="#062E52"/>
+    </linearGradient>
+    <linearGradient id="c-title" x1="82" y1="115" x2="460" y2="190" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#9DEFE8"/>
+    </linearGradient>
+    <linearGradient id="c-cyan" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#63F0D7"/><stop offset="1" stop-color="#1A9FEF"/></linearGradient>
+    <linearGradient id="c-blue" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#438BFF"/><stop offset="1" stop-color="#615CEB"/></linearGradient>
+    <linearGradient id="c-mint" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#C6FFE9"/><stop offset="1" stop-color="#42DDBD"/></linearGradient>
+    <linearGradient id="c-panel" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#263E68"/><stop offset="1" stop-color="#122849"/></linearGradient>
+    <filter id="c-shadow" x="-35%" y="-35%" width="170%" height="180%"><feDropShadow dx="0" dy="18" stdDeviation="19" flood-color="#020817" flood-opacity=".42"/></filter>
+    <filter id="c-glow" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="20"/></filter>
+  </defs>
+
+  <rect width="1024" height="768" fill="url(#c-bg)"/>
+  <circle cx="680" cy="400" r="290" fill="#1688D8" opacity=".13" filter="url(#c-glow)"/>
+  <circle cx="895" cy="130" r="170" fill="#635CEB" opacity=".10" filter="url(#c-glow)"/>
+  <path d="M0 560C215 480 286 720 512 644S821 470 1024 548" fill="none" stroke="#3D7AB0" stroke-opacity=".18" stroke-width="2"/>
+  <g fill="#7ADFD9" opacity=".65"><circle cx="488" cy="144" r="2.5"/><circle cx="936" cy="303" r="3"/><circle cx="535" cy="646" r="2"/><circle cx="963" cy="626" r="2.5"/><circle cx="439" cy="395" r="2"/></g>
+
+  <g transform="translate(80 67)">
+    <rect width="48" height="48" rx="15" fill="#0C2C50" stroke="#286E8D"/>
+    <circle cx="24" cy="24" r="14" fill="none" stroke="url(#c-cyan)" stroke-width="3.5"/>
+    <path d="M24 14V34M24 24L35 14M24 24L35 34" fill="none" stroke="#FFFFFF" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M40 4C41 10 43 12 49 13C43 14 41 16 40 22C39 16 37 14 31 13C37 12 39 10 40 4Z" fill="url(#c-mint)"/>
+  </g>
+  <text x="145" y="99" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="800" letter-spacing="2.5" fill="#D8F5F5">OMNIKIT</text>
+  <text x="80" y="220" font-family="Arial, Helvetica, sans-serif" font-size="83" font-weight="800" letter-spacing="-4" fill="url(#c-title)">Your toolkit,</text>
+  <text x="80" y="305" font-family="Arial, Helvetica, sans-serif" font-size="83" font-weight="800" letter-spacing="-4" fill="url(#c-title)">in orbit.</text>
+  <text x="85" y="350" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="500" fill="#9EB7D5">A growing collection of modular tools for SiYuan.</text>
+
+  <!-- Dimensional modular constellation -->
+  <g>
+    <!-- rear floating tile -->
+    <g transform="translate(555 166) rotate(-9 84 55)">
+      <rect width="168" height="110" rx="18" fill="#1A3156" stroke="#4775A3" stroke-opacity=".8"/>
+      <rect x="18" y="18" width="42" height="42" rx="12" fill="#214E70"/>
+      <path d="M29 31H49M29 39H49M29 47H43" stroke="#70E8D6" stroke-width="3" stroke-linecap="round"/>
+      <rect x="73" y="23" width="75" height="7" rx="3.5" fill="#A5C4E5" opacity=".8"/>
+      <rect x="73" y="39" width="56" height="6" rx="3" fill="#698CB7" opacity=".75"/>
+      <rect x="18" y="78" width="130" height="6" rx="3" fill="#4B6B95" opacity=".8"/>
+    </g>
+    <!-- upper right tile -->
+    <g transform="translate(793 256) rotate(8 74 52)">
+      <rect width="148" height="104" rx="18" fill="#1C315A" stroke="#5473B7" stroke-opacity=".85"/>
+      <g fill="#64DCCF"><circle cx="27" cy="30" r="6"/><circle cx="47" cy="30" r="6"/><circle cx="67" cy="30" r="6"/></g>
+      <g fill="#668FFF"><circle cx="27" cy="51" r="6"/><circle cx="47" cy="51" r="6"/><circle cx="67" cy="51" r="6"/></g>
+      <rect x="87" y="27" width="40" height="6" rx="3" fill="#A8B8E1"/>
+      <rect x="87" y="43" width="30" height="6" rx="3" fill="#7188B8"/>
+      <rect x="22" y="78" width="104" height="6" rx="3" fill="#536F9F"/>
+    </g>
+    <!-- lower left tile -->
+    <g transform="translate(520 506) rotate(7 82 55)">
+      <rect width="164" height="110" rx="18" fill="#1B355A" stroke="#397D92" stroke-opacity=".8"/>
+      <circle cx="42" cy="43" r="19" fill="none" stroke="#55E3D0" stroke-width="6"/>
+      <circle cx="42" cy="43" r="6" fill="#55E3D0"/>
+      <rect x="75" y="28" width="66" height="7" rx="3.5" fill="#B3CBE7" opacity=".8"/>
+      <rect x="75" y="45" width="48" height="6" rx="3" fill="#6E93B9"/>
+      <rect x="20" y="82" width="121" height="6" rx="3" fill="#55759B"/>
+    </g>
+    <!-- lower right tile -->
+    <g transform="translate(810 500) rotate(-7 67 48)">
+      <rect width="134" height="96" rx="17" fill="#1C3159" stroke="#5D6DB0" stroke-opacity=".85"/>
+      <path d="M25 28L42 45L25 62M55 28L72 45L55 62" fill="none" stroke="#9B9AFF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+      <rect x="83" y="29" width="30" height="6" rx="3" fill="#A9BCE1"/>
+      <rect x="83" y="45" width="23" height="6" rx="3" fill="#6B85B6"/>
+      <rect x="22" y="78" width="91" height="5" rx="2.5" fill="#58749D"/>
+    </g>
+  </g>
+
+  <!-- Central orbital hub -->
+  <circle cx="758" cy="416" r="168" fill="#18BEEB" opacity=".10" filter="url(#c-glow)"/>
+  <ellipse cx="758" cy="416" rx="205" ry="112" transform="rotate(-27 758 416)" fill="none" stroke="#3D8DE0" stroke-width="2" stroke-opacity=".28" stroke-dasharray="5 11"/>
+  <circle cx="758" cy="416" r="117" fill="#0B2042" stroke="#294B77" stroke-width="2"/>
+  <circle cx="758" cy="416" r="101" fill="none" stroke="url(#c-cyan)" stroke-width="24"/>
+  <path d="M758 348V484M758 416L836 348M758 416L836 484" fill="none" stroke="#FFFFFF" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M585 478C550 515 568 550 612 555C665 561 724 534 785 496" fill="none" stroke="url(#c-cyan)" stroke-width="5" stroke-linecap="round"/>
+  <path d="M925 105C930 134 937 141 966 146C937 151 930 158 925 187C920 158 913 151 884 146C913 141 920 134 925 105Z" fill="url(#c-mint)"/>
+  <circle cx="570" cy="392" r="5" fill="#70F0D9"/>
+  <circle cx="936" cy="431" r="4" fill="#65A4FF"/>
+
+  <g transform="translate(80 590)">
+    <rect width="380" height="75" rx="18" fill="#10294B" stroke="#31577B" stroke-opacity=".8"/>
+    <circle cx="34" cy="37.5" r="12" fill="none" stroke="#56E6D1" stroke-width="3"/>
+    <path d="M34 29V46M34 37.5L43 29M34 37.5L43 46" stroke="#FFFFFF" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="62" y="34" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="800" letter-spacing="1.2" fill="#E4F3FF">MODULAR TOOLKIT</text>
+    <text x="62" y="55" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#8EA9C9">Independent pieces. One flexible home.</text>
+  </g>
+  <text x="80" y="722" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="700" letter-spacing="1.8" fill="#718FB7">OMNIKIT  /  SIYUAN NOTE</text>
+</svg>

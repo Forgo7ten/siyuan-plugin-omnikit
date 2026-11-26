@@ -14,6 +14,7 @@ const files = [
   "README.md",
   "README.zh-CN.md",
   "assets/omnikit-plugin.svg",
+  "assets/omnikit-banner.svg",
   "assets/omnikit-menu.svg",
   "i18n/en.json",
   "i18n/zh-CN.json",
