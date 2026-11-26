@@ -40,11 +40,11 @@
 | `TitledLinkFeature.ts` | Feature 入口 | 集中注册上下文菜单（`open-menu-link` 过滤 `isHttpUrl` / `click-blockicon` 块级批量）、`PasteLinkCapture`、`destroy-protyle`（按 `wysiwyg?.element` 清理）并在 `onEnable` 遍历 `getAllEditor()` 补登已打开编辑器；在目标编辑器上以捕获阶段管理输入法状态（`attachCompositionTracking`）；所有监听句柄由 `FeatureScope` 集中托管与注销 |
 | `services/PasteLinkCapture.ts` & `policy/paste-range.ts` | 粘贴链接范围捕获 | 挂载原生捕获阶段 `paste` 监听（`{ capture: true }`）；非空选区且 `text/plain` 为单个裸 URL 时跳过且不创建捕获资源；创建 `trackRange` 首尾句柄并对原始选区所属 `[data-node-id]` 块记录既有链接 `WeakSet<HTMLElement>`；静默评估先过上传与 IME 门禁，再无副作用直检 `createRangeFromResolved` 内新增合格链接（无效/空范围或无候选立即释放句柄且零 flush），仅检出候选时调用一次 `flushPendingTransactions()` 确认落盘后复检交付；收敛至幂等 `finishCapture(reason)` |
 | `TitledLinkController.ts`、`policy/types.ts` & `policy/batchSummary.ts` | 业务控制器与批量守恒统计 | `policy/types.ts` 定义 `LinkActionResult` 与配置模型；`batchSummary.ts` 按 7 桶守恒统计 `updated`、`unchanged`、`conflict`、`failed`、`imeTimeout`、`unknown` 与 `skipped = superseded + aborted`（相加等于 `total`）；同块任务去重、最大并发 3 请求、按块合并提交；全 `skipped` 时静默返回，汇总通知必显总数并动态拼接非零分项 |
-| `services/static-file.ts` | 非网页文件识别 | 提取 URL `pathname` 末段并先尝试 `decodeURIComponent`（失败时回退原始字符串），匹配归档、文档、媒体与图片扩展名，命中后直接返回文件名且零网页请求 |
+| `services/static-file.ts` | 非网页文件识别 | 提取 URL `pathname` 末段并先尝试 `decodeURIComponent`（失败时回退原始字符串），匹配归档、文档、媒体与图片扩展名，命中后直接返回文件名且不发起网页请求 |
 | `services/dual-track-fetcher.ts` | 双轨网络驱动 | 桌面客户端原生 `fetch` 直连分块读取；浏览器与移动端通过 `/api/network/forwardProxy` 代理转发，并在 `decodeBase64` 中绑定 `maxBytes` 上限执行单遍 $O(\text{maxChars})$ 扫描与校验；复用 Core `general.userAgent`；输出 `http` / `timeout` / `network` / `aborted` 失败分类 |
 | `services/stream-parser.ts` & `services/title-normalizer.ts` | 流式解析与标题净化 | 单实例 `LATIN1_DECODER` 增量分块解码、尾部 64 字符重叠窗口检测 `</head\s*>` 闭合标签与 64KB 上限截断（不提前在 `</title>` 截断）；GBK/Big5/Shift-JIS/UTF-8 字符集识别与解码；引号感知 `<meta>` 正则提取；`window.Lute.UnEscapeHTMLStr` 实体还原；空白与控制字符净化并按固定常量 `80` 字素截断 |
 | `services/safe-writer.ts` | 原生受控事务与后台安全写回 | 分离 `isActiveEditor`（以触发任务的原编辑器为准）与 `isLiveOccurrenceValid`；活跃编辑器路径执行输入法等待（5 秒超时、500ms 轮询）、`applyLinkTitle` 保护链接内折叠光标并调用 `updateTransactionElement`；原编辑器不可用时通过 Core `withBlockWriteLease` 队列校验块归属、整块基线与 `ordinal` 后调用 `updateBlock`，仅在传输结果 `"unknown"` 时重读 `getBlockDOM` 并剥离易变属性核实结果 |
-| `services/title-cache.ts` | 短期内存缓存 | 100 条 / 5 分钟 TTL 内存 LRU 结构；`epoch * EPOCH_SHIFT + urlGeneration` 代际保护；不缓存静态文件与 `fallback: true` 降级域名；零磁盘持久化 |
+| `services/title-cache.ts` | 短期内存缓存 | 100 条 / 5 分钟 TTL 内存 LRU 结构；`epoch * EPOCH_SHIFT + urlGeneration` 代际保护；不缓存静态文件与 `fallback: true` 降级域名；不写入磁盘 |
 | `ui/TitledLinkSettingsPanel.svelte` & `ui/autoPasteHelp.ts` | 设置界面与运行期词典适配 | 接入平台 `DraftParticipant` 全局保存栏；通过纯函数 `resolveAutoPasteHelp(t, languages?)` 动态读取思源运行期语言词典（`configGroupBehavior` 与 `pasteURLAutoConvert`），缺失时回退 `feature.titledLink.settings.autoHelp` |
 
 ### 1.2 异步处理与原生受控事务写回全流程时序
@@ -75,7 +75,7 @@ sequenceDiagram
     rect rgb(255, 250, 240)
     Note over Controller,Parser: 步骤二：文件免抓取判定与双轨流式解析
     alt 命中非网页扩展名 (.zip/.pdf/.exe/.mp4/图片等)
-        Controller->>Controller: 提取 pathname 末段并尝试 decodeURIComponent 作为标题 (零网络)
+        Controller->>Controller: 提取 pathname 末段并尝试 decodeURIComponent 作为标题 (不发起网络请求)
     else 网页超链接
         Controller->>Parser: 发起双轨网络请求 (携带 Core 统一 UA)
         alt 桌面客户端 (desktop / desktop-window)
@@ -188,7 +188,7 @@ sequenceDiagram
     1. 先过上传态（`isProtyleUploading`）与目标编辑器 IME 组合态（`isComposing`）门禁，命中时延后 500ms 复检且不调用 `flushPendingTransactions()`；
     2. 无副作用直检当前解析范围：通过 `resolveTrackedRange` 解析起止锚点并调用 `createRangeFromResolved(editor, start, end)`（基于 `start.start*`、`end.end*` 与 `Range.START_TO_END` 校验区间有效性），遍历候选链接并由 `isNodeFullyInsideRange` 校验节点完全落在本次粘贴区间内，排除 `beforeElements` 中同块既有链接与受保护容器内链接，仅保留锚文本为空或等于 `href`（`text === "" || text === href`）的合格 `http(s)://` 链接；若范围无效（`invalid-range`）、为空（`empty-range`）或无候选链接（`no-candidate`），立即释放句柄且零次调用 `flushPendingTransactions()`；
     3. 仅在非上传、非 IME 且检出候选链接时调用一次 `flushPendingTransactions()` 确认事务落盘，随后再次复检有效范围与候选链接并交付调度；
-  - **单一幂等收敛**：所有退出路径（候选交付、无效/空范围、无候选、超时兜底、编辑器销毁或作用域停用）收敛至单一幂等 `finishCapture(reason)`，统一释放 `observer`、定时器以及 `startHandle`/`endHandle`（`releaseTrackedRange`）；
+  - **单一幂等收敛**：所有退出路径（候选交付、无效/空范围、无候选、超时终止、编辑器销毁或作用域停用）收敛至单一幂等 `finishCapture(reason)`，统一释放 `observer`、定时器以及 `startHandle`/`endHandle`（`releaseTrackedRange`）；
 - **按块合并提交、批量终态统计守恒与静默规则 (`TitledLinkController.ts` & `policy/batchSummary.ts`)**：
   - `LinkActionResult` 定义于 `policy/types.ts`（`"updated" | "unchanged" | "conflict" | "failed" | "unknown" | "aborted" | "superseded" | "ime-timeout"`）；
   - 自动粘贴与块级批量提取均按 `notebook/blockID` 将同块合格链接分组，经并发池（最多 3 个并发网络请求）取回标题后，在单次 `commitLinkTitles` 中按块合并提交；`BatchCandidate` 与 `BatchOutcome` 保留 `fallback` 字段；

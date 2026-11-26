@@ -6,7 +6,7 @@
   <p>思源笔记模块化工具箱插件</p>
 
   <p>
-    <a href="https://github.com/Forgo7ten/siyuan-plugin-omnikit/releases"><img src="https://img.shields.io/badge/Release-v0.1.0-blue.svg?style=flat-square" alt="Release" /></a>
+    <a href="https://github.com/Forgo7ten/siyuan-plugin-omnikit/releases"><img src="https://img.shields.io/badge/Release-v0.2.0-blue.svg?style=flat-square" alt="Release" /></a>
     <a href="https://b3log.org/siyuan/"><img src="https://img.shields.io/badge/SiYuan-%E2%89%A53.8.4-6c5ce7.svg?style=flat-square" alt="SiYuan Support" /></a>
   </p>
 
@@ -89,7 +89,7 @@
 # 安全机制
 
 - **原始图片保留**：转换生成的 WebP 图片作为新资源保存至 `assets/`，插件不执行物理删除用户原始附件的操作；
-- **零工作区垃圾文件**：不在思源工作区内写入临时日志、队列缓存或 `.tmp` 临时文件；
+- **不生成工作区临时文件**：不在思源工作区内写入临时日志、队列缓存或 `.tmp` 临时文件；
 - **写前一致性核验**：执行正文内容替换前校验目标块与节点状态，若检测到并发编辑冲突则放弃改写，保障文档内容安全。
 
 ---

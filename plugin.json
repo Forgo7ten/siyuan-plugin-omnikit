@@ -2,7 +2,7 @@
   "name": "siyuan-plugin-omnikit",
   "author": "Forgo7ten",
   "url": "https://github.com/Forgo7ten/siyuan-plugin-omnikit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "minAppVersion": "3.8.4",
   "settingsWindow": true,
   "frontends": [

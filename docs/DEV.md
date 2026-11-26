@@ -98,7 +98,7 @@ pnpm install:workspace "$HOME/siyuan"
 1. 若系统未安装系统级 Chrome，可复用本机已有的 Chrome / Puppeteer 缓存二进制（如 `$HOME/.cache/puppeteer/chrome/.../chrome`）软链接至 `$HOME/.local/bin/google-chrome`：
 
    ```bash
-   ln -sf "$HOME/.cache/puppeteer/chrome/linux-150.0.7871.24/chrome-linux64/chrome" "$HOME/.local/bin/google-chrome"
+   ln -sf "$HOME/.cache/puppeteer/chrome/linux-<version>/chrome-linux64/chrome" "$HOME/.local/bin/google-chrome"
    ```
 
 2. 启动无头 Chrome 时**必须传入 `--remote-debugging-port=0`**（配合 `--user-data-dir="$HOME/.config/google-chrome"`），由 Chrome 主动写出 `DevToolsActivePort` 文件；直接指定固定非零端口（如 `9222`）在无头模式下可能只打印 WebSocket 地址而不生成 `DevToolsActivePort`：

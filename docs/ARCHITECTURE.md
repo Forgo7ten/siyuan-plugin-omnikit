@@ -246,7 +246,7 @@ export interface FeatureContext {
     - **唯一缺失判定**：仅当 HTTP 状态码为 `202` 且响应 JSON `code === 404` 时判定为文件未创建，采用内存 `codec.defaults()` 且不立即写盘；
     - **损坏与异常只读保护 (`needsRecovery`)**：当 HTTP `200` 返回空串/纯空白、JSON 语法解析失败、`codec.parse` 结构校验失败，或遭遇网络错误、超时、非 `202+404` 的 HTTP 错误时，调用 `enterReadOnly(reason, backup)` 进入只读保护模式（拒绝后续 `update()` 写入）；
     - **备份与恢复 (`recoverWithBackup`)**：仅当 `rawToBackup !== undefined`（即读取到了物理损坏内容而非网络/读取传输失败）时允许恢复；若损坏内容为非空白字符串或对象，先保存为 `${file}.backup-${Date.now()}.json`（纯空白文件不生成空备份），再将默认配置写回原文件并解除只读状态；
-  - **并发容错加载与默认 `User-Agent` 补全**：`SettingsManager.load()` 使用 `Promise.allSettled` 并发加载全部 Store，单个文件损坏仅使该 Store 进入只读保护，不阻断插件启动与设置恢复界面挂载；加载后若 `omnikit-core.json` 可写且 `general.userAgent.trim() === ""`，自动回填 `DEFAULT_USER_AGENT` 并落盘（`getUserAgent()` 同时保留 `.trim() || DEFAULT_USER_AGENT` 兜底）。
+  - **并发容错加载与默认 `User-Agent` 补全**：`SettingsManager.load()` 使用 `Promise.allSettled` 并发加载全部 Store，单个文件损坏仅使该 Store 进入只读保护，不阻断插件启动与设置恢复界面挂载；加载后若 `omnikit-core.json` 可写且 `general.userAgent.trim() === ""`，自动回填 `DEFAULT_USER_AGENT` 并落盘（`getUserAgent()` 同时保留 `.trim() || DEFAULT_USER_AGENT` 回退）。
 
 ### 3.5 `KernelClient` 与宿主适配基础设施 (`src/core/host/`)
 - **`KernelClient` & `kernelOutcome` (`KernelClient.ts`、`kernelOutcome.ts`)**：
@@ -266,7 +266,7 @@ export interface FeatureContext {
   - `id.ts`：导出 `createRuntimeId(prefix)`，使用时间戳与进程内单调计数器生成唯一 ID，兼容非 HTTPS（`window.isSecureContext === false`）无 `crypto.randomUUID()` 的局域网环境；
   - `describeError.ts`：将 `Error`、思源 `{ msg, code }` 响应或字符串格式化为可读文本，消除 `[object Object]`；
   - `Platform.ts`：通过注入的 `getFrontend()` 探测前端环境（回退 DOM `#sidebar` 与 UA 推断），导出与思源内核 `IsTargetSupported` 逻辑一致的 `isFrontendSupported(declared, current)` 及 `isMobileFrontend()`；
-  - `Logger.ts`：全局共享 `Logger.shared`，输出格式 `[OmniKit][{level}] {message}`；`info` / `warn` / `error` 始终输出至控制台，仅 `debug` 受 `general.debugLog` 动态控制，零工作区文件写入。
+  - `Logger.ts`：全局共享 `Logger.shared`，输出格式 `[OmniKit][{level}] {message}`；`info` / `warn` / `error` 始终输出至控制台，仅 `debug` 受 `general.debugLog` 动态控制，不向工作区写入文件。
 
 ### 3.6 统一 UI 容器与反馈服务 (`src/ui/` & `src/core/feedback/`)
 - **统一侧边栏容器 (`src/ui/dock/registerDock.ts`)**：
@@ -333,7 +333,7 @@ SiYuan 工作区目录：data/storage/petal/siyuan-plugin-omnikit/
 ### 5.3 Feature 扩展通用自查清单
 - [ ] 是否严格面向 `BaseFeature` 与 `FeatureContext` 编程，且不存在任何跨 Feature 的代码 `import` 或 Core 层针对 Feature ID 的硬编码分支？
 - [ ] 是否通过 `defineFeature` 声明了 `featureConfigFile(id)`，业务数据文件是否符合 `featureDataFile(id, dataName)` 命名且与设置重置隔离？
-- [ ] 是否正确声明了 `frontends`（5+1 取值集合），在不支持的平台上保持 `unsupported` 零副作用且不篡改跨端同步的启用偏好？
+- [ ] 是否正确声明了 `frontends`（5+1 取值集合），在不支持的平台上保持 `unsupported`、不执行初始化与注册，且不篡改跨端同步的启用偏好？
 - [ ] 所有事件监听、DOM 观察器、定时器与菜单项是否均绑定至 `FeatureScope`（`scope.own`），异步任务是否感知 `scope.signal` 并由 `UiFeedback` 静默处理 `AbortError`？
 - [ ] 菜单项是否全部通过 `MenuRegistry.contribute` 注册（不在 Feature 内硬编码 `[OmniKit]` 前缀，复选框菜单使用声明式 `checked` 属性）？
 - [ ] 设置面板是否实现 `DraftParticipant` 协议接入全局浮动保存栏（卡片内不自建独立保存/重置按钮），且中英文语言包键名与占位符完全一致？

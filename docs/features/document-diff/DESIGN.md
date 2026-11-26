@@ -106,7 +106,9 @@ src/features/document-diff/
 │   ├── ManualPicker.ts              # 基于 /api/filetree/searchDocs 的跨目录手动比较对象选择弹窗
 │   └── DocumentDiffSession.ts       # 会话主状态机、分类筛选、跨视口导航、工具栏挂载与全量资源回收
 └── ui/
-    ├── DiffToolbar.svelte           # Svelte 5 可拖拽浮动工具栏（身份展示、分类胶囊、导航与控制动作）
+    ├── DiffToolbar.svelte               # Svelte 5 可拖拽浮动工具栏（身份展示、分类胶囊、导航与控制动作）
+    ├── ToolbarStateBridge.svelte        # Svelte 5 工具栏响应式状态桥接组件
+    ├── mountDiffToolbar.ts              # 工具栏容器挂载、状态更新与卸载工厂
     └── DocumentDiffSettingsPanel.svelte # Svelte 5 设置卡片（实现 DraftParticipant 协议）
 ```
 
@@ -207,10 +209,10 @@ src/features/document-diff/
 
 ## 5. 非侵入式双通道渲染 (`runtime/DiffPainter.ts`)
 
-为保证编辑器 `outerHTML -> /api/transactions` 保存链路不受污染，禁止向 `.protyle-wysiwyg [data-node-id]` 节点写入任何属性、类名、内联样式或包裹标签。绘制分为两个与正文树隔离的只读通道，视觉规则对齐思源 `app/src/assets/scss/business/_history.scss:603-703`：
+为保证编辑器 `outerHTML -> /api/transactions` 保存流程不受污染，禁止向 `.protyle-wysiwyg [data-node-id]` 节点写入任何属性、类名、内联样式或包裹标签。绘制分为两个与正文树隔离的只读通道，视觉规则对齐思源 `app/src/assets/scss/business/_history.scss:603-703`：
 
 1. **通道一：CSS Custom Highlight API（文本级精确着色）**：
-   - 每个比较侧注册会话私有唯一键 `omnikit-diff-${sessionId}-${side}`（与思源自带的 `search-mark-*` 隔离）；
+   - 每个比较侧注册由 `createRuntimeId(\`omnikit-diff-${side}\`)` 生成的会话私有唯一键（与思源自带的 `search-mark-*` 隔离）；
    - 在 `.protyle` 根节点下挂载会话私有 `<style>`：
      - 左侧：`color-mix(in srgb, var(--b3-theme-error) 18%, transparent)`；
      - 右侧：`color-mix(in srgb, var(--b3-theme-success) 18%, transparent)`；
@@ -310,5 +312,5 @@ export interface DocumentDiffConfig {
 1. 中止 `ComputeCoordinator`（清除防抖定时器、触发在途请求 `AbortController.abort()`）与核验重试定时器；
 2. 断开双侧 `MutationObserver`、`ResizeObserver` 与 `ScrollSync` 监听；
 3. 按逆序卸载全部浏览器捕获期事件（`input` / `compositionstart` / `compositionend` / `scroll`）与思源 `eventBus` 监听（`ws-main` / `loaded-protyle-dynamic` / `loaded-protyle-static` / `switch-protyle` / `destroy-protyle` / `sync-end`）；
-4. 调用双侧 `DiffPainter.dispose()`：清空 `Highlight` Range、从 `CSS.highlights` 删除私有键、移除注入的 `<style>` 与 `.omnikit-diff-overlay` 节点；
+4. 调用双侧 `DiffPainter.dispose()`：清空 `Highlight` Range、从 `CSS.highlights` 删除私有键、移除注入的 `<style>` 与 `.omnikit-document-diff-overlay` 节点；
 5. 调用 Svelte 5 `unmount` 卸载并移除 `DiffToolbar.svelte` 挂载容器，保留宿主原有的双分屏编辑器与文档标签页不变。

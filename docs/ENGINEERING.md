@@ -37,7 +37,7 @@ scripts/
 │   ├── reconcile-tag.sh       # 处理已有同名 Tag 与 GitHub Release 的状态协调
 │   ├── update-version.mjs     # plugin.json 与 package.json 双清单原子版本同步
 │   ├── verify-package.mjs     # 产物包清单、PNG 标头、版本一致与 ZIP 结构静态校验
-│   └── release.mjs            # 本地发版准备与全链路校验入口
+│   └── release.mjs            # 本地发版准备与完整校验入口
 └── clean.mjs                  # 构建产物清理工具
 ```
 
@@ -173,7 +173,7 @@ flowchart TD
 | 不存在 | 已存在 | 报错终止发布 | 拦截无对应 Tag 的异常 Release 状态 |
 
 4. **防递归触发与并发互斥控制**：
-   - 手动发版使用内置 `GH_TOKEN: ${{ github.token }}` 调用 `gh release create`，GitHub Actions 对内置 `GITHUB_TOKEN` 创建的 Tag 不会二次触发 `push.tags` 工作流，从而天然阻断递归发版循环；
+   - 手动发版使用内置 `GH_TOKEN: ${{ github.token }}` 调用 `gh release create`，GitHub Actions 对内置 `GITHUB_TOKEN` 创建的 Tag 不会二次触发 `push.tags` 工作流，避免递归触发发版循环；
    - `release.yml` 声明 `concurrency: { group: "release", cancel-in-progress: false }`，保证同一时间仅运行一个发版任务且排队不强杀进行中的发布。
 
 ---
