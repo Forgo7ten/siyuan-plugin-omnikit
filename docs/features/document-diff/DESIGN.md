@@ -45,7 +45,7 @@ flowchart TD
             Types["types.ts & settings.ts (数据结构 / 筛选器 / 配置 Codec)"]
             Conflict["conflict.ts (冲突后缀解析 / 公历时间校验 / 同父目录精确配对)"]
             Extractor["BlockDomExtractor.ts (离屏 BlockDOM 语义抽取 & 内部引用指纹归一化)"]
-            Align["DiffEngine.ts & InlineDiff.ts (带预算唯一锚点 LIS+LCS & 块内行内二级 LCS)"]
+            Align["DiffEngine.ts & InlineDiff.ts (块组单调配对 + 块内加权行对齐 & 行内二级 LCS)"]
             Anchors["anchors.ts (滚动单调锚点链与有界外推计算)"]
         end
 
@@ -89,10 +89,10 @@ src/features/document-diff/
 │   └── SiyuanBridge.ts              # 唯一导入 siyuan 运行时值（getAllModels / openTab / Dialog）的薄适配器
 ├── model/
 │   ├── settings.ts                  # DocumentDiffConfig 类型与 StoreCodec 校验器
-│   ├── types.ts                     # SemanticUnit、DiffHunk、DiffFilter、SessionStatus 等领域模型
+│   ├── types.ts                     # SemanticUnit、DiffHunk、DiffUnitPair、DiffFilter、SessionStatus 等领域模型
 │   ├── conflict.ts                  # 冲突后缀正则/UTC 日历校验、父路径计算、同父目录唯一原文档解析
 │   ├── BlockDomExtractor.ts         # 离屏 BlockDOM 解析、语义签名构建、内部块引用唯一指纹归一化
-│   ├── DiffEngine.ts                # 前后缀剥离 + 唯一锚点 LIS + 带预算 LCS 逻辑行对齐与游标保持
+│   ├── DiffEngine.ts                # 块组单调配对 + 块内防缩进错位加权行对齐与游标保持
 │   ├── InlineDiff.ts                # 配对修改块内的二级行内 Token LCS 区间计算与 UTF-16 偏移验证
 │   └── anchors.ts                   # 匹配块几何投影、严格单调锚点链筛选与分段线性插值
 ├── runtime/
@@ -193,17 +193,21 @@ src/features/document-diff/
      - `NodeAttributeView` 由 `KernelSnapshot` 并发调用只读 `/api/av/getAttributeView` 提取有效属性视图对象（须含 `keyValues` 或 `views` 数组）的名称、列定义、视图配置与行单元格语义值构建签名（读取成功时 `reliable = true`，接口返回空 `av` 或读取失败时 `reliable = false` 归入 `unresolved` 待核对）；
    - **顶层根子块序号映射 (`rootBlockIndexByBlockID`)**：在遍历完整 BlockDOM 时，按思源内核 `GetBlockIndex` 的顶层直接子块计数口径（`1 .. rootBlockCount`），为每个块（含容器内嵌套子块）记录其所属顶层根子块的 1 基序号，供长文档虚拟滚动分片判断与跨分片同步滚动定位使用。
 
-### 4.3 带预算逻辑行对齐与块内二级行内 Diff (`DiffEngine.ts` & `InlineDiff.ts`)
-1. **一级逻辑行对齐 (`alignUnits`)**：
-   - 沿用思源 `history_diff.go` 预算参数：单段 LCS 上限 `maxCells = 2_000_000`，整篇总预算 `totalCells = 8_000_000`，单侧最大逻辑行数 `10,000`；
-   - 比较键 `semanticKey(unit)` 由 `[kind, context, text, format, target]` 序列化构成，不含 `blockID`；仅当双侧 `unit.reliable === true` 且 `semanticKey` 相同时才判为相等（`=`）；
-   - 对任意区间 `[a..b]` vs `[c..d]`：先剥离严格相等的公共前缀与公共后缀；若剩余矩阵体积在预算内则执行 `Uint32Array` 动态规划求精确 LCS；若超出预算，提取区间内双侧仅出现 1 次的唯一可靠单元，对右侧下标求最长递增子序列（LIS）作为有序锚点切分子问题递归求解；无唯一锚点且超预算的子区间产出 `kind: "unresolved"` 差异组；
-   - 相邻的删除（`-`）与新增（`+`）步骤合并为单个差异组：双侧非空且均可靠时为 `"modified"`，仅左侧非空为 `"left-only"`，仅右侧非空为 `"right-only"`，含不可靠单元时归为 `"unresolved"`；
+### 4.3 双层块组单调配对、块内加权行对齐与行内二级 Diff (`DiffEngine.ts` & `InlineDiff.ts`)
+1. **一级同侧块组单调配对与块内加权逻辑行对齐 (`alignUnits`)**：
+   - 沿用思源 `history_diff.go` 预算参数：单段动态规划上限 `maxCells = 2_000_000`，整篇总预算 `totalCells = 8_000_000`，单侧最大逻辑行数 `10,000`；
+   - 比较键 `semanticKey(unit)` 由 `[kind, context, text, format, target]` 序列化构成，不含 `blockID`；仅当双侧 `unit.reliable === true` 且 `semanticKey` 相同时才判为严格相等（`=`）；
+   - **同侧块组聚合（保持块 ID 中立）**：按本侧连续非空且相同的 `blockID` 将 `SemanticUnit[]` 还原为 `BlockGroup`（`blockID` 仅作同侧块边界定位与分组键，跨侧块组签名仅由块类型、容器上下文及组内单元 `semanticKey` 序列构成）；
+   - **块组级带预算单调配对**：对块组区间先剥离严格相等的公共前后缀；若剩余矩阵体积超出预算，则提取双侧仅出现 1 次的唯一可靠精确块组，按右侧下标最长递增子序列（LIS）作为有序锚点递归切分子区间，无唯一锚点且超预算的子区间产出 `kind: "unresolved"` 差异组；在预算内的未匹配块组子区间求最大权单调配对：
+     - 严格等价的可靠块组直接产出逐行匹配（`=`），禁止跨不同块组边界产生逻辑行匹配锚点；
+     - 块类型一致、容器结构层级兼容且内容特征对应的同位置变更块组建立一对一修改配对（普通代码块要求非纯括号且非空的高信息量代码行具备实质重合度，标题块要求标题文本相似或同槽位唯一对应，避免无关函数跨块错配或跨章节搬移块误判为同位置修改）；
+     - 无对应关系的单侧整块保持未配对状态，按连续区间独立产出 `"left-only"`（左侧独有/删除）或 `"right-only"`（右侧新增）差异组，不并入相邻 `"modified"` 差异组；连续含不可靠单元的区间合并产出 `"unresolved"` 差异组；
+   - **已配对块组内的加权逻辑行对齐**：在确认对应的修改块组内部共享剩余预算执行加权动态规划（超预算时回退块内唯一行 LIS 切分）：严格相等行优先产出 `=`，且高信息量代码/文本行的精确匹配与空白归一化相似行配对权重高于独立闭合括号行与空行，避免整体缩进级差下局部括号跨嵌套层级错位抢配；确认对应的变更行在所属 `"modified"` 差异组中记录显式行对索引 `pairedUnits: Array<{ leftIndex: number; rightIndex: number }>`，相邻已配对修改块之间未被 `=` 分隔的变更单元合并为单个 `"modified"` 差异组；
 2. **二级块内行内精细 Diff (`computeInlineDiffRanges`)**：
-   - 对 `kind === "modified"` 的差异组，当左右单元配对且存在可见文本变化时，仿照思源 `history_diff.go:799-838` 按字符/词段执行带预算二级 LCS（单对上限 `200,000` 单元）；
+   - 对 `kind === "modified"` 差异组中由 `pairedUnits` 确认对应的逻辑行对，当存在可见文本变化时，仿照思源 `history_diff.go:799-838` 按字符码点执行带预算二级 LCS（单对上限 `200,000` 单元）；
    - 产出左右两侧在各自逻辑行内的变更 UTF-16 区间列表 `Array<{ start: number; end: number }>`：
-     - 若仅部分文字修改，仅高亮变更的字符区间（如把段落中的 `"2025"` 改为 `"2026"`，仅 `"2025"` 标红、`"2026"` 标绿，其余未变文字保持清晰可读）；
-     - 若文字完全相同而仅标题级别、任务勾选或行内加粗等格式变化，不产生误导的局部文字底色，交由块级修改指示条或格式作用区间标记呈现。
+     - 若仅部分文字或前导缩进修改，仅高亮变更的字符区间（如把段落中的 `"2025"` 改为 `"2026"`，仅 `"2025"` 标红、`"2026"` 标绿；代码缩进由 8 空格缩减为 4 空格时，仅左侧多出的 4 个空格标红，其余未变代码保持清晰可读）；
+     - 若文字完全相同而仅标题级别、任务勾选、代码语言或行内加粗等格式变化，不产生误导的局部文字底色，交由块级弱底色与修改指示条呈现。
 
 ---
 
@@ -221,7 +225,7 @@ src/features/document-diff/
    - 在 `.protyle` 根节点下（`.protyle-content` 同级，位于编辑区 DOM 树之外）挂载 `div.omnikit-document-diff-overlay`（`position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 2`）；
    - 按可视视口裁剪（`[viewport.top, viewport.bottom]`）绘制各可见差异块及块内变更图片（`span[data-type~="img"]`）的几何投影框：
      - **`left-only` / `right-only` 整块**：左侧 `3px solid` 错误红/成功绿边框 + `15%` 混合底色；
-     - **`modified` 块**：左侧 `3px solid var(--b3-theme-primary)` 指示条（对齐思源 `[data-history-diff~="modified"]`）；当配对逻辑行完成精确二级 LCS 比对时，仅对存在新增或删除字符的一侧绘制行内 `CSS.highlights`（单侧纯插入或纯删除时，未发生字符删改的对侧仅展示左侧 `3px` 主色指示条，不涂满整行或整块底色）；仅当该块无精确文本配对且无文本区间着色（如纯格式变更、独立图片块、图表渲染块、音视频、HTML、数据库块或超预算回退）时，补充 `12%` 左红/右绿弱底色，并对包含行内图片变化的段落中发生变更的 `.img[data-type~="img"]` 元素叠加对应侧边框与弱底色框；
+     - **`modified` 块**：左侧 `3px solid var(--b3-theme-primary)` 指示条（对齐思源 `[data-history-diff~="modified"]`）；绘制时按 `DiffHunk.pairedUnits` 解析显式配对单元（无 `pairedUnits` 的合成差异组仅在两侧长度相等且同下标单元 `kind` 相同时回退配对）：当成对逻辑行完成精确二级 LCS 比对且实时文本经核验一致时，仅对存在新增或删除字符的一侧绘制行内 `CSS.highlights`（单侧纯插入或纯删除时，未发生字符删改的对侧仅展示左侧 `3px` 主色指示条，不涂满整行或整块底色）；同一 `"modified"` 差异组内的单侧未配对非空行在文本核验通过时按该行范围绘制 `CSS.highlights` 并展示左侧 `3px` 主色指示条，单侧未配对空行（含代码块末尾空行或内部空行）在实时文本核验通过且支持 `CSS.highlights` 时同样仅展示左侧 `3px` 主色指示条而不升级整块底色；仅当文本完全相同而纯格式/属性变更、块属无可见文本节点的独立图片/图表渲染 `render-node`/音视频/HTML/数据库块、运行环境无 `CSS.highlights` 或实时文本偏移无法唯一证明时，补充 `12%` 左红/右绿弱底色，并对包含行内图片变化的段落中发生变更的 `.img[data-type~="img"]` 元素叠加对应侧边框与弱底色框；
      - **`title` 差异**：在 `protyle.title.element` 投影位置绘制 `3px solid var(--b3-theme-primary)` 与对应侧红/绿弱底色；
      - **`unresolved` 待核对块**：左侧 `3px dashed var(--b3-theme-warning)` + `10%` 警示弱底色；
      - **当前聚焦差异组 (`focusedHunkKey`)**：附加 `2px solid var(--b3-theme-primary)` 聚焦脉冲边框（复刻思源 `history-diff-focus` 关键帧动画）；

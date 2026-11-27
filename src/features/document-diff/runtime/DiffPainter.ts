@@ -334,6 +334,31 @@ export class DiffPainter {
 
       const sideUnits = this.side === "left" ? hunk.left : hunk.right;
       const oppositeUnits = this.side === "left" ? hunk.right : hunk.left;
+      const pairedByOwnIdx = new Map<number, SemanticUnit>();
+      if (hunk.pairedUnits) {
+        for (const pair of hunk.pairedUnits) {
+          const ownIdx = this.side === "left" ? pair.leftIndex : pair.rightIndex;
+          const peerIdx = this.side === "left" ? pair.rightIndex : pair.leftIndex;
+          const peer = oppositeUnits[peerIdx];
+          if (peer) pairedByOwnIdx.set(ownIdx, peer);
+        }
+      } else if (sideUnits.length === oppositeUnits.length) {
+        for (let k = 0; k < sideUnits.length; k++) {
+          if (sideUnits[k]!.kind === oppositeUnits[k]!.kind) {
+            pairedByOwnIdx.set(k, oppositeUnits[k]!);
+          }
+        }
+      }
+
+      const cleanTextCache = new Map<string, CleanBlockTextMap>();
+      const getCleanText = (blockID: string, blockEl: HTMLElement): CleanBlockTextMap => {
+        let cached = cleanTextCache.get(blockID);
+        if (!cached) {
+          cached = collectBlockCleanTextMap(blockEl);
+          cleanTextCache.set(blockID, cached);
+        }
+        return cached;
+      };
 
       sideUnits.forEach((unit, idx) => {
         if (!unit.blockID) return;
@@ -370,7 +395,7 @@ export class DiffPainter {
             let textVerified = false;
             const expectedLines = blockExpectedLines.get(unit.blockID);
             if (expectedLines) {
-              const { slots, text: visibleText } = collectBlockCleanTextMap(block);
+              const { slots, text: visibleText } = getCleanText(unit.blockID, block);
               textVerified = doesBlockTextMatchExpected(visibleText, expectedLines);
               if (this.highlightSet && unit.text.length > 0 && textVerified) {
                 const verified = verifiedLineSpans(visibleText, expectedLines, unit.line);
@@ -384,7 +409,9 @@ export class DiffPainter {
             }
             addOverlayTarget(
               block,
-              paintedOnlyLine || (textVerified && unit.text.length === 0) ? "modified" : "modified-fill",
+              paintedOnlyLine || (Boolean(this.highlightSet) && textVerified && unit.text.length === 0)
+                ? "modified"
+                : "modified-fill",
               hunk.key,
             );
             return;
@@ -404,14 +431,14 @@ export class DiffPainter {
           return;
         }
 
-        const pairedUnit: SemanticUnit | undefined =
-          sideUnits.length === oppositeUnits.length ? oppositeUnits[idx] : undefined;
+        const pairedUnit = pairedByOwnIdx.get(idx);
         let paintedInlineText = false;
         let hasExactInlinePairing = false;
+        let verifiedUnpairedEmptyLine = false;
 
         const expectedLines = blockExpectedLines.get(unit.blockID);
         if (expectedLines) {
-          const { slots, text: visibleText } = collectBlockCleanTextMap(block);
+          const { slots, text: visibleText } = getCleanText(unit.blockID, block);
           const textVerified = doesBlockTextMatchExpected(visibleText, expectedLines);
           let localSpans: TextSpan[] | undefined;
 
@@ -425,6 +452,10 @@ export class DiffPainter {
             if (textVerified && this.highlightSet && unit.text !== pairedUnit.text) {
               hasExactInlinePairing = true;
             }
+          } else if (!pairedUnit && textVerified && this.highlightSet && unit.text.length === 0) {
+            // Verified empty-line insertion/deletion inside a modified hunk (e.g. trailing or inner blank line
+            // in a code block): keep the `3px` modified bar without escalating the whole block to `modified-fill`.
+            verifiedUnpairedEmptyLine = true;
           }
 
           if (this.highlightSet && unit.text.length > 0 && (localSpans === undefined || localSpans.length > 0)) {
@@ -453,7 +484,7 @@ export class DiffPainter {
 
         addOverlayTarget(
           block,
-          paintedInlineText || hasExactInlinePairing ? "modified" : "modified-fill",
+          paintedInlineText || hasExactInlinePairing || verifiedUnpairedEmptyLine ? "modified" : "modified-fill",
           hunk.key,
         );
       });

@@ -28,10 +28,17 @@ export type DiffFilter = "all" | "removed" | "added" | "modified" | "unresolved"
 
 export type SessionStatusKind = "comparing" | "unconfirmed" | "equal" | "diff" | "unresolved" | "failed";
 
+export interface DiffUnitPair {
+  leftIndex: number;
+  rightIndex: number;
+}
+
 export interface DiffHunk {
   kind: HunkKind;
   left: SemanticUnit[];
   right: SemanticUnit[];
+  /** Explicit 1:1 paired unit indices into `left` and `right` for inline diffing. */
+  pairedUnits?: DiffUnitPair[];
   /** Logical unit indices in document order, independent of block IDs. */
   leftIndex: number;
   rightIndex: number;
