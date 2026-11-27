@@ -1,3 +1,5 @@
+import { summarizeDiffCounts, type DiffHunk, type DiffResult, type SemanticUnit } from "./types.ts";
+
 const CONFLICT_SUFFIX_RE = / \(Conflicted (\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\)$/;
 
 export interface ConflictTitleInfo {
@@ -235,4 +237,34 @@ export function comparableTitle(
     return rawTitle;
   }
   return parseConflictTitle(rawTitle)?.baseTitle ?? rawTitle;
+}
+
+export function applyComparableTitleHunk(
+  diff: DiffResult,
+  leftDoc: { id: string; title: string },
+  rightDoc: { id: string; title: string },
+  confirmedConflictID?: string,
+): void {
+  const cmpLeftTitle = comparableTitle(leftDoc.id, leftDoc.title, confirmedConflictID);
+  const cmpRightTitle = comparableTitle(rightDoc.id, rightDoc.title, confirmedConflictID);
+  if (cmpLeftTitle === cmpRightTitle) return;
+  const makeTitleUnit = (title: string): SemanticUnit => ({
+    kind: "Title",
+    context: "",
+    text: title,
+    format: "",
+    target: "",
+    line: 0,
+    reliable: true,
+  });
+  const titleHunk: DiffHunk = {
+    kind: "title",
+    left: [makeTitleUnit(cmpLeftTitle)],
+    right: [makeTitleUnit(cmpRightTitle)],
+    leftIndex: 0,
+    rightIndex: 0,
+    key: "title",
+  };
+  diff.hunks = [titleHunk, ...diff.hunks];
+  diff.counts = summarizeDiffCounts(diff.hunks);
 }

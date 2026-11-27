@@ -57,6 +57,70 @@ const SCROLL_INTENT_KEYS = new Set([
   "ArrowDown",
   " ",
 ]);
+const STATIC_SLICE_NAV_KEYS = new Set(["Home", "End", "PageUp", "PageDown"]);
+
+/**
+ * Registers capture-phase user scroll/slider gesture listeners on a `.protyle` root element
+ * (including `.protyle-scroll` slider and page buttons that stop propagation in bubble phase).
+ */
+export function bindProtyleScrollGestures(
+  protyleEl: HTMLElement,
+  side: Side,
+  onIntent: (side: Side, trigger: string, isStaticSliceTrigger: boolean) => void,
+): () => void {
+  const cleanups: Array<() => void> = [];
+  const add = (type: string, handler: EventListener, options?: AddEventListenerOptions) => {
+    protyleEl.addEventListener(type, handler, options);
+    cleanups.push(() => protyleEl.removeEventListener(type, handler, options));
+  };
+
+  for (const gestureEvent of ["wheel", "touchstart", "pointerdown"] as const) {
+    add(
+      gestureEvent,
+      (event: Event) => {
+        const target = event.target as HTMLElement | null;
+        onIntent(side, gestureEvent, Boolean(target?.closest?.(".protyle-scroll")));
+      },
+      { capture: true, passive: true },
+    );
+  }
+  add(
+    "keydown",
+    (event: Event) => {
+      const key = (event as KeyboardEvent).key;
+      if (typeof key === "string" && SCROLL_INTENT_KEYS.has(key)) {
+        onIntent(side, `keydown:${key}`, STATIC_SLICE_NAV_KEYS.has(key));
+      }
+    },
+    { capture: true, passive: true },
+  );
+  for (const sliderEvent of ["input", "change"] as const) {
+    add(
+      sliderEvent,
+      (event: Event) => {
+        const target = event.target as HTMLElement | null;
+        if (target?.classList?.contains("b3-slider")) {
+          onIntent(side, `slider-${sliderEvent}`, true);
+        }
+      },
+      { capture: true },
+    );
+  }
+  add(
+    "click",
+    (event: Event) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest?.(".protyle-scroll")) {
+        onIntent(side, "protyle-scroll-click", true);
+      }
+    },
+    { capture: true },
+  );
+
+  return () => {
+    for (let i = cleanups.length - 1; i >= 0; i--) cleanups[i]!();
+  };
+}
 
 /**
  * Bidirectional content-anchored scroll synchronization with target-offset tolerance,

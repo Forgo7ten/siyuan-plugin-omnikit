@@ -114,6 +114,28 @@ export function withinScrollExtent(value: number, scrollHeight: number, clientHe
   return Math.max(0, Math.min(maxScroll, value));
 }
 
+export function computeAlignedScrollTop(
+  scrollTop: number,
+  scrollHeight: number,
+  clientHeight: number,
+  scrollerRect: { top: number; height: number },
+  targetRect: { top: number; height: number },
+  alignMode: "reading" | "center",
+  sourceProgress: number,
+): number {
+  if (alignMode === "center") {
+    const desired =
+      scrollTop +
+      (targetRect.top - scrollerRect.top) -
+      Math.max(24, (scrollerRect.height - Math.min(targetRect.height, scrollerRect.height)) / 2);
+    return withinScrollExtent(desired, scrollHeight, clientHeight);
+  }
+  const readingOffset = Math.min(48, Math.max(0, clientHeight * 0.15));
+  const targetContentTop = targetRect.top - scrollerRect.top + scrollTop;
+  const desired = targetContentTop + sourceProgress * Math.max(1, targetRect.height) - readingOffset;
+  return withinScrollExtent(desired, scrollHeight, clientHeight);
+}
+
 export function positionAnchors(
   matches: readonly MatchAnchor[],
   lookupPosition: (side: Side, blockID: string) => number | null,

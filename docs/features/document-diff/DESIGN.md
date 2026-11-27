@@ -35,18 +35,18 @@ flowchart TD
             Snapshot["KernelSnapshot.ts (事务刷新 + getBlockDOM 快照读取)"]
             Parity["VisibleParity.ts (实时已加载块与内核快照同构一致性核验)"]
             Gate["DirtyGate.ts & ComputeCoordinator.ts (修订代次 / 分侧 IME / 400ms 防抖)"]
-            Painter["DiffPainter.ts (CSS.highlights 行内着色 + 外置绝对定位块级浮层)"]
-            Scroll["ScrollSync.ts (单调锚点链分段线性插值 + 手势代次防回弹)"]
+            Painter["DiffPainter.ts & domTextRanges.ts (CSS.highlights 行内着色 + 外置浮层)"]
+            Scroll["ScrollSync.ts & ViewportSliceSync.ts (锚点同步滚动 + 虚拟分片加载协同)"]
             Picker["ManualPicker.ts (手动搜索指定文档弹窗)"]
-            Session["DocumentDiffSession.ts (状态机 / 跨视口跳转 / 筛选 / 资源释放)"]
+            Session["DocumentDiffSession.ts (状态机 / 筛选 / 跨视口导航协调 / 资源释放)"]
         end
 
         subgraph Model["model/ (纯函数模型与对齐引擎)"]
             Types["types.ts & settings.ts (数据结构 / 筛选器 / 配置 Codec)"]
             Conflict["conflict.ts (冲突后缀解析 / 公历时间校验 / 同父目录精确配对)"]
-            Extractor["BlockDomExtractor.ts (离屏 BlockDOM 语义抽取 & 内部引用指纹归一化)"]
-            Align["DiffEngine.ts & InlineDiff.ts (块组单调配对 + 块内加权行对齐 & 行内二级 LCS)"]
-            Anchors["anchors.ts (滚动单调锚点链与有界外推计算)"]
+            Extractor["BlockDomExtractor.ts, domParser.ts & inlineRuns.ts (离屏 BlockDOM 语义抽取)"]
+            Align["DiffEngine.ts, blockSimilarity.ts, blockAlign.ts & InlineDiff.ts (双层对齐引擎)"]
+            Anchors["anchors.ts & blockMapping.ts (单调锚点链与跨侧块映射)"]
         end
 
         subgraph UI["ui/ (Svelte 5 视图组件)"]
@@ -91,10 +91,15 @@ src/features/document-diff/
 │   ├── settings.ts                  # DocumentDiffConfig 类型与 StoreCodec 校验器
 │   ├── types.ts                     # SemanticUnit、DiffHunk、DiffUnitPair、DiffFilter、SessionStatus 等领域模型
 │   ├── conflict.ts                  # 冲突后缀正则/UTC 日历校验、父路径计算、同父目录唯一原文档解析
-│   ├── BlockDomExtractor.ts         # 离屏 BlockDOM 解析、语义签名构建、内部块引用唯一指纹归一化
-│   ├── DiffEngine.ts                # 块组单调配对 + 块内防缩进错位加权行对齐与游标保持
+│   ├── domParser.ts                 # 离屏 BlockDOM 解析器、HTML 实体解码与轻量回退节点树
+│   ├── inlineRuns.ts                # 可编辑行内片段、引用标记、代码行、表格行与多媒体元数据提取
+│   ├── BlockDomExtractor.ts         # 块树上下文遍历、内部块引用两遍指纹归一化与同构校验签名
+│   ├── blockSimilarity.ts           # BlockGroup 聚合、代码语言解析、预计算有序 Uint32Array 特征草图与配对评分
+│   ├── blockAlign.ts                # 前置唯一锚点切分、小区间稠密 DP 与大区间倒排候选 + 树状数组稀疏单调配对
+│   ├── DiffEngine.ts                # 块内防缩进错位加权行对齐、差异组组装与导航游标保持
 │   ├── InlineDiff.ts                # 配对修改块内的二级行内 Token LCS 区间计算与 UTF-16 偏移验证
-│   └── anchors.ts                   # 匹配块几何投影、严格单调锚点链筛选与分段线性插值
+│   ├── anchors.ts                   # 匹配块几何投影、严格单调锚点链筛选与分段线性插值
+│   └── blockMapping.ts              # 基于匹配锚点、差异组与根块比例的跨侧目标块纯函数映射
 ├── runtime/
 │   ├── KernelSnapshot.ts            # 刷新编辑器待提交事务后并发读取 getDocInfo / getHPathByID / getBlockDOM
 │   ├── VisiblePair.ts               # 可见双栏几何判定、单栏/已有双栏无损展开、基于 Wnd 的原地交换左右
@@ -102,9 +107,11 @@ src/features/document-diff/
 │   ├── DirtyGate.ts                 # 分侧编辑修订号与已核实水位门控
 │   ├── ComputeCoordinator.ts        # 分侧 IME 组合挂起、400ms 防抖、代次票据与 AbortController 协调
 │   ├── ScrollSync.ts                # 双向内容锚点滚动跟随、期望位置容差过滤与用户手势抢占
+│   ├── ViewportSliceSync.ts         # 已挂载块扫描、长文档虚拟分片相邻/远端加载对齐与跨视口块聚焦
+│   ├── domTextRanges.ts             # 实时可编辑块净文本槽位构建、偏移核验与 DOM Range 转换
 │   ├── DiffPainter.ts               # 独立键 CSS.highlights 渲染 + 外置浮层绘制（对齐思源 _history.scss）
 │   ├── ManualPicker.ts              # 基于 /api/filetree/searchDocs 的跨目录手动比较对象选择弹窗
-│   └── DocumentDiffSession.ts       # 会话主状态机、分类筛选、跨视口导航、工具栏挂载与全量资源回收
+│   └── DocumentDiffSession.ts       # 会话主状态机、分类筛选、导航调度、工具栏挂载与全量资源回收
 └── ui/
     ├── DiffToolbar.svelte               # Svelte 5 可拖拽浮动工具栏（身份展示、分类胶囊、导航与控制动作）
     ├── ToolbarStateBridge.svelte        # Svelte 5 工具栏响应式状态桥接组件
@@ -193,16 +200,23 @@ src/features/document-diff/
      - `NodeAttributeView` 由 `KernelSnapshot` 并发调用只读 `/api/av/getAttributeView` 提取有效属性视图对象（须含 `keyValues` 或 `views` 数组）的名称、列定义、视图配置与行单元格语义值构建签名（读取成功时 `reliable = true`，接口返回空 `av` 或读取失败时 `reliable = false` 归入 `unresolved` 待核对）；
    - **顶层根子块序号映射 (`rootBlockIndexByBlockID`)**：在遍历完整 BlockDOM 时，按思源内核 `GetBlockIndex` 的顶层直接子块计数口径（`1 .. rootBlockCount`），为每个块（含容器内嵌套子块）记录其所属顶层根子块的 1 基序号，供长文档虚拟滚动分片判断与跨分片同步滚动定位使用。
 
-### 4.3 双层块组单调配对、块内加权行对齐与行内二级 Diff (`DiffEngine.ts` & `InlineDiff.ts`)
+### 4.3 双层块组单调配对、块内加权行对齐与行内二级 Diff (`blockSimilarity.ts`、`blockAlign.ts`、`DiffEngine.ts` & `InlineDiff.ts`)
 1. **一级同侧块组单调配对与块内加权逻辑行对齐 (`alignUnits`)**：
-   - 沿用思源 `history_diff.go` 预算参数：单段动态规划上限 `maxCells = 2_000_000`，整篇总预算 `totalCells = 8_000_000`，单侧最大逻辑行数 `10,000`；
-   - 比较键 `semanticKey(unit)` 由 `[kind, context, text, format, target]` 序列化构成，不含 `blockID`；仅当双侧 `unit.reliable === true` 且 `semanticKey` 相同时才判为严格相等（`=`）；
-   - **同侧块组聚合（保持块 ID 中立）**：按本侧连续非空且相同的 `blockID` 将 `SemanticUnit[]` 还原为 `BlockGroup`（`blockID` 仅作同侧块边界定位与分组键，跨侧块组签名仅由块类型、容器上下文及组内单元 `semanticKey` 序列构成）；
-   - **块组级带预算单调配对**：对块组区间先剥离严格相等的公共前后缀；若剩余矩阵体积超出预算，则提取双侧仅出现 1 次的唯一可靠精确块组，按右侧下标最长递增子序列（LIS）作为有序锚点递归切分子区间，无唯一锚点且超预算的子区间产出 `kind: "unresolved"` 差异组；在预算内的未匹配块组子区间求最大权单调配对：
-     - 严格等价的可靠块组直接产出逐行匹配（`=`），禁止跨不同块组边界产生逻辑行匹配锚点；
-     - 块类型一致、容器结构层级兼容且内容特征对应的同位置变更块组建立一对一修改配对（普通代码块要求非纯括号且非空的高信息量代码行具备实质重合度，标题块要求标题文本相似或同槽位唯一对应，避免无关函数跨块错配或跨章节搬移块误判为同位置修改）；
-     - 无对应关系的单侧整块保持未配对状态，按连续区间独立产出 `"left-only"`（左侧独有/删除）或 `"right-only"`（右侧新增）差异组，不并入相邻 `"modified"` 差异组；连续含不可靠单元的区间合并产出 `"unresolved"` 差异组；
-   - **已配对块组内的加权逻辑行对齐**：在确认对应的修改块组内部共享剩余预算执行加权动态规划（超预算时回退块内唯一行 LIS 切分）：严格相等行优先产出 `=`，且高信息量代码/文本行的精确匹配与空白归一化相似行配对权重高于独立闭合括号行与空行，避免整体缩进级差下局部括号跨嵌套层级错位抢配；确认对应的变更行在所属 `"modified"` 差异组中记录显式行对索引 `pairedUnits: Array<{ leftIndex: number; rightIndex: number }>`，相邻已配对修改块之间未被 `=` 分隔的变更单元合并为单个 `"modified"` 差异组；
+   - 沿用思源 `history_diff.go` 预算参数：单段计算预算上限 `maxCells = 2_000_000`，整篇总预算 `totalCells = 8_000_000`，单侧最大逻辑行数 `10,000`；
+   - 比较键 `semanticKey(unit)` 由 `[kind, context, text, format, target]` 序列化构成，不含 `blockID`；仅当双侧 `unit.reliable === true` 且 `semanticKey` 相同时才判为严格相等（`=`），预计算特征草图与空白归一化仅用于修改候选配对评分，不参与相等判定；
+   - **同侧块组聚合与特征草图预提取（`blockSimilarity.ts`）**：
+     - 按本侧连续非空且相同的 `blockID` 将 `SemanticUnit[]` 还原为 `BlockGroup`（跨侧签名不含 `blockID`），独立解析 `format` 中的子类型 `subtype`（如标题级别、图表渲染类型）与代码块语言 `codeLang`；
+     - 在构造每个 `BlockGroup` 时一次性提取有序 `Uint32Array` 多重集合特征草图（超长块按固定上限等距抽样）：普通文本/标题/表格块使用双字符紧凑哈希草图，普通代码块在剔除空行与纯括号行的高信息量代码上提取 4 字符滚动哈希草图，消除配对循环内的重复字符串切分与哈希表分配；
+   - **前置唯一锚点切分与稠密/稀疏自适应块组配对（`blockAlign.ts`）**：
+     - 对任意块组区间先剥离严格相等的公共前后缀；当剩余区间规模大于 `1 × 1` 时，先提取双侧仅出现 1 次的非空高信息量精确匹配块组，经右侧下标最长递增子序列（LIS）切分为独立子区间（使被相同锚点隔开的局部改写各自精确落入 `1 × 1` 同槽位区间，同时避免长文档首尾小改触发全量区间比对）；
+     - 切分后的无唯一锚点子区间按规模自适应求解最大权单调配对：
+       - 小规模子区间（`n * m <= 1024`）：直接运行基于预计算草图的稠密动态规划，求完整候选矩阵的精确最优配对；
+       - 大规模无锚点子区间（`n * m > 1024`）：生成稀疏正权候选边后通过树状数组（Fenwick Tree）求解二维最大权严格递增子序列（同一左块的全部候选边先统一查询前驱、计算完成后再批量更新树状态并记录回溯链，保证左右下标严格递增）：候选集合同时纳入完整签名相同的重复精确块、右侧非高频特征倒排表命中的 `Top-K` 相似块，以及相对于当前子区间比例对角线的局部邻域块；倒排表遍历步数与特征归并步数统一计入 `maxCells` / `remainingCells` 预算，超预算时回退全量唯一可靠块锚点切分或产出 `kind: "unresolved"` 差异组；
+     - 块组配对分类规则：
+       - 严格等价的可靠块组直接产出逐行匹配（`=`），禁止跨不同块组边界产生逻辑行匹配锚点；
+       - 同位置变更块组按类型、容器层级与特征重合度建立一对一修改配对：普通代码块在整行重合度 `>= 0.25` 或 4 字符草图重合度 `>= 0.30` 时配对（覆盖任意行数的变量重命名与表达式批量替换，同时排斥仅共享语法样板的无关函数），段落与单行原子块在特征重合度 `>= 0.15` 时配对；在锚点切分后的 `1 × 1` 同容器槽位（代码块须同时满足相同代码语言或任一侧未标语言，标题须同级）上保留基础修改配对权重，多块变更区间内低重合度的无关块不强行配对；
+       - 无对应关系的单侧整块保持未配对状态，按连续区间独立产出 `"left-only"`（左侧独有/删除）或 `"right-only"`（右侧新增）差异组，不并入相邻 `"modified"` 差异组；连续含不可靠单元的区间合并产出 `"unresolved"` 差异组；
+   - **已配对块组内的加权逻辑行对齐（`DiffEngine.ts`）**：在确认对应的多行修改块组内部，剥离相等前后缀后先对中大区间执行非空非纯括号唯一精确行 LIS 切分，再共享剩余预算执行无临时对象分配的加权动态规划（超预算时产出 `unresolved`）：严格相等行优先产出 `=`，高信息量代码/文本行的精确匹配与空白归一化相似权重高于独立闭合括号行与空行，且禁止不同括号分隔符模糊互配；确认对应的变更行在所属 `"modified"` 差异组中记录显式行对索引 `pairedUnits: Array<{ leftIndex: number; rightIndex: number }>`，相邻已配对修改块之间未被 `=` 分隔的变更单元合并为单个 `"modified"` 差异组；
 2. **二级块内行内精细 Diff (`computeInlineDiffRanges`)**：
    - 对 `kind === "modified"` 差异组中由 `pairedUnits` 确认对应的逻辑行对，当存在可见文本变化时，仿照思源 `history_diff.go:799-838` 按字符码点执行带预算二级 LCS（单对上限 `200,000` 单元）；
    - 产出左右两侧在各自逻辑行内的变更 UTF-16 区间列表 `Array<{ start: number; end: number }>`：
@@ -270,9 +284,9 @@ sequenceDiagram
 
 ---
 
-## 7. 双向内容锚点同步滚动与跨视口跳转 (`ScrollSync.ts` & `DocumentDiffSession.ts`)
+## 7. 双向内容锚点同步滚动与跨视口跳转 (`ScrollSync.ts`、`ViewportSliceSync.ts` & `DocumentDiffSession.ts`)
 
-### 7.1 单遍挂载映射、锚点链插值与长文档跨分片同步 (`ScrollSync.ts` & `anchors.ts` & `DocumentDiffSession.ts`)
+### 7.1 单遍挂载映射、锚点链插值与长文档跨分片同步 (`ScrollSync.ts`、`anchors.ts`、`blockMapping.ts` & `ViewportSliceSync.ts`)
 1. **单遍挂载块扫描与严格单调锚点链**：
    - 每次滚动同步计算时，对左右两侧 `protyle.wysiwyg.element` 各执行一次非嵌入 `[data-node-id]` 挂载块扫描，构建 `Map<string, HTMLElement>` 及当前已挂载的顶层根子块序号区间 `[minRootIndex, maxRootIndex]`，每侧仅读取一次 `contentElement.getBoundingClientRect()`；
    - 从已确认的 `DiffResult.matches` 与成对 `modified` / `unresolved` 差异组首块中提取双侧同时挂载在 DOM 中的块对，计算各自相对于 `protyle.contentElement` 内容顶部的纵向偏移，经 `monotoneAnchors`（LIS）生成 `leftY` 与 `rightY` 同时严格递增的单调锚点链；
