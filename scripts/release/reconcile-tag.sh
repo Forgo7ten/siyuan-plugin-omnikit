@@ -119,6 +119,7 @@ elif [[ -n "${existing_commit}" ]]; then
       --method DELETE \
       "repos/${GH_REPO}/git/refs/tags/${RELEASE_TAG}"
   fi
+  git tag -d "${RELEASE_TAG}" >/dev/null 2>&1 || true
 
 elif [[ "${release_exists}" == "true" ]]; then
   echo "::error::${RELEASE_TAG} Release 存在，但找不到对应 Tag" >&2

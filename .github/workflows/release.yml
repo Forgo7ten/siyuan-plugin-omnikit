@@ -68,6 +68,15 @@ jobs:
           pnpm package:verify
           unzip -t package.zip
 
+      # 手动发布：在全部构建与安装包门禁通过后、生成发布说明前，先协调已有 Tag / Release。
+      - name: Reconcile release tag
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        run: bash scripts/release/reconcile-tag.sh
+
       # 生成本次发布说明（GitHub 原生内容后追加 ## Commits 倒序列表）。
       - name: Generate release notes
         id: notes
@@ -76,15 +85,6 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ steps.version.outputs.release_tag || github.ref_name }}
         run: bash scripts/release/generate-notes.sh
-
-      # 手动发布：构建成功后处理已有 Tag / Release。
-      - name: Reconcile release tag
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
-        run: bash scripts/release/reconcile-tag.sh
 
       # 手动发布：创建 Tag 和 Release，上传 package.zip。
       - name: Publish manual release

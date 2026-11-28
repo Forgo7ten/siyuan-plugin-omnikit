@@ -48,9 +48,9 @@ scripts/
 |---|---|---|---|
 | `scripts/build/render-icons.mjs` | `pnpm render:icons` | `dev`、`build:app` 构建前 | 基于 `@resvg/resvg-js` 分别从 `assets/omnikit-plugin.svg` 与 `assets/omnikit-banner.svg` 渲染 `.generated/icon.png`（$160 \times 160$，$\le 64\text{ KiB}$）与 `.generated/preview.png`（$1024 \times 768$，$\le 512\text{ KiB}$） |
 | `scripts/dev/install-workspace.mjs` | `pnpm install:workspace` | 本地开发调试（传入工作区路径） | 先执行 `pnpm build`，再向指定思源工作区 `data/plugins/siyuan-plugin-omnikit` 安全安装产物，实施软链接拒绝、路径越界检查、清单归属校验、暂存部署与原子备份回滚 |
-| `scripts/release/generate-notes.sh` | CI 内部调用 | `release.yml` 构建校验通过后 | 调用 GitHub `releases/generate-notes` API 获取原生发布说明，并在末尾追加 `## Commits`（`HEAD` 可达的上一 `v*` Tag 至 `HEAD` 的倒序非合并提交无序列表），输出 `notes_file` 至 `$GITHUB_OUTPUT` |
+| `scripts/release/generate-notes.sh` | CI 内部调用 | 质量门禁与 Tag 协调通过后 | 调用 GitHub `releases/generate-notes` API 获取原生发布说明，并在末尾追加 `## Commits`（`HEAD` 可达的上一 `v*` Tag 至 `HEAD` 的倒序非合并提交无序列表），输出 `notes_file` 至 `$GITHUB_OUTPUT` |
 | `scripts/release/read-version.sh` | CI 内部调用 | GitHub Actions `workflow_dispatch` | 校验触发分支等于默认分支（`main`），使用 `jq` 读取 `plugin.json.version`，校验 `X.Y.Z` 格式并输出 `release_tag=v${version}` 至 `$GITHUB_OUTPUT` |
-| `scripts/release/reconcile-tag.sh` | CI 内部调用 | 手动发版构建与校验通过后 | 通过 GitHub REST API 查询目标 Tag 与 Release 状态，递归解析 Annotated Tag 至 commit SHA，按状态矩阵执行 Tag 复用、重复发布拦截或旧提交覆盖清理 |
+| `scripts/release/reconcile-tag.sh` | CI 内部调用 | 手动发版质量门禁通过后、生成说明前 | 通过 GitHub REST API 查询目标 Tag 与 Release 状态，递归解析 Annotated Tag 至 commit SHA，按状态矩阵执行 Tag 复用、重复发布拦截或远端/本地旧 Tag 覆盖清理 |
 | `scripts/release/update-version.mjs` | `pnpm version:bump [patch\|minor\|major\|X.Y.Z]` | 本地版本升级 | 校验初始双清单版本一致后计算新版本号（未传参且在 TTY 下提供交互式选择），同步写回 `package.json` 与 `plugin.json` |
 | `scripts/release/verify-package.mjs` | `pnpm package:verify` | 本地测试与 CI 构建后 | 校验 `dist/` 物理清单、根目录无散落图标、PNG 魔数与 IHDR 尺寸、README 资源引用、双清单版本一致、`minAppVersion === "3.8.4"`、JSON 语言包语法及 `package.zip` Central Directory 条目与排除项 |
 | `scripts/release/release.mjs` | `pnpm release` | 本地发版准备 | 串行执行版本一致性校验、`pnpm check`、`pnpm test`、`pnpm build:app`、`verify-package.mjs` 与 `unzip -t package.zip`，通过后输出发版指引 |
@@ -139,10 +139,8 @@ flowchart TD
     UnitTests --> BuildApp
     BuildApp --> VerifyPkg
     VerifyPkg --> ZipTest
-    ZipTest --> GenNotes
-
-    GenNotes -->|workflow_dispatch 分支| ReconcileTag
-    GenNotes -->|push.tags 分支| NcipolloAction
+    ZipTest -->|workflow_dispatch 分支| ReconcileTag
+    ZipTest -->|push.tags 分支| GenNotes
 
     ReconcileTag --> QueryState
     QueryState --> ResolveCommit
@@ -150,10 +148,13 @@ flowchart TD
     DecideAction -->|未发布且指向当前提交| ReuseTag
     DecideAction -->|已发布且指向当前提交| AbortDup
     DecideAction -->|指向旧提交| DeleteOld
-    DecideAction -->|Tag与Release均不存在| GhRelease
+    DecideAction -->|Tag与Release均不存在| GenNotes
 
-    ReuseTag --> GhRelease
-    DeleteOld --> GhRelease
+    ReuseTag --> GenNotes
+    DeleteOld --> GenNotes
+
+    GenNotes -->|workflow_dispatch 分支| GhRelease
+    GenNotes -->|push.tags 分支| NcipolloAction
 
     GhRelease --> Finish
     NcipolloAction --> Finish

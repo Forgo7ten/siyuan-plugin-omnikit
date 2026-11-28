@@ -326,3 +326,21 @@ test("generate-notes.sh omits previous_tag_name on first release and preserves G
     await rm(repo, { recursive: true, force: true });
   }
 });
+
+
+test("release.yml reconciles existing tag before generating release notes on manual dispatch", async () => {
+  const workflowPath = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../../.github/workflows/release.yml",
+  );
+  const reconcileScript = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../../scripts/release/reconcile-tag.sh",
+  );
+  const workflow = await readFile(workflowPath, "utf8");
+  const reconcile = await readFile(reconcileScript, "utf8");
+  const reconcileIdx = workflow.indexOf("name: Reconcile release tag");
+  const notesIdx = workflow.indexOf("name: Generate release notes");
+  assert.ok(reconcileIdx > 0 && notesIdx > 0 && reconcileIdx < notesIdx, "Reconcile release tag must run before Generate release notes");
+  assert.match(reconcile, /git tag -d "\$\{RELEASE_TAG\}"/);
+});
