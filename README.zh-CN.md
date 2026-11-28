@@ -6,7 +6,7 @@
   <p>思源笔记模块化工具箱插件</p>
 
   <p>
-    <a href="https://github.com/Forgo7ten/siyuan-plugin-omnikit/releases"><img src="https://img.shields.io/badge/Release-v0.2.1-blue.svg?style=flat-square" alt="Release" /></a>
+    <a href="https://github.com/Forgo7ten/siyuan-plugin-omnikit/releases"><img src="https://img.shields.io/badge/Release-v0.2.2-blue.svg?style=flat-square" alt="Release" /></a>
     <a href="https://b3log.org/siyuan/"><img src="https://img.shields.io/badge/SiYuan-%E2%89%A53.8.4-6c5ce7.svg?style=flat-square" alt="SiYuan Support" /></a>
   </p>
 
