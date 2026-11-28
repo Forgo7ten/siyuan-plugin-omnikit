@@ -1,4 +1,4 @@
-import type { TextSpan } from "../model/types.ts";
+import { isValidBlockID, type TextSpan } from "../model/types.ts";
 
 export interface CleanCharSlot {
   node: Text | null;
@@ -11,7 +11,6 @@ export interface CleanBlockTextMap {
   slots: CleanCharSlot[];
 }
 
-const VALID_BLOCK_ID_RE = /^\d{14}-[a-zA-Z0-9]{7}$/;
 const SKIPPED_SUBTREE_SELECTOR =
   '[contenteditable="false"], [data-type~="inline-math"], .protyle-attr, .protyle-action, .protyle-attr--drag, .protyle-linenumber__rows, .protyle-icons, .callout-info, .tab-item-info';
 
@@ -19,7 +18,7 @@ export function findEditableBlock(
   protyle: { wysiwyg: { element: HTMLElement } },
   blockID: string,
 ): HTMLElement | null {
-  if (!VALID_BLOCK_ID_RE.test(blockID)) return null;
+  if (!isValidBlockID(blockID)) return null;
   const matches = protyle.wysiwyg.element.querySelectorAll<HTMLElement>(`[data-node-id="${blockID}"]`);
   for (let i = 0; i < matches.length; i++) {
     const candidate = matches[i]!;
@@ -139,12 +138,56 @@ export function extractImageTokens(format: string): string[] {
   return out;
 }
 
-export function findDirectBlockImageElements(block: HTMLElement): HTMLElement[] {
-  const candidates = block.querySelectorAll<HTMLElement>('[data-type~="img"], img');
+export function computeChangedTokenIndices(
+  ownTokens: readonly string[],
+  peerTokens: readonly string[],
+): number[] {
+  const n = ownTokens.length;
+  if (n === 0) return [];
+  const m = peerTokens.length;
+  if (m === 0) {
+    return Array.from({ length: n }, (_, idx) => idx);
+  }
+  const width = m + 1;
+  const dp = new Uint16Array((n + 1) * width);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      const idx = i * width + j;
+      if (ownTokens[i] === peerTokens[j]) {
+        dp[idx] = dp[(i + 1) * width + j + 1]! + 1;
+      } else {
+        const down = dp[(i + 1) * width + j]!;
+        const right = dp[i * width + j + 1]!;
+        dp[idx] = down >= right ? down : right;
+      }
+    }
+  }
+  const changed: number[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (ownTokens[i] === peerTokens[j]) {
+      i++;
+      j++;
+    } else if (dp[(i + 1) * width + j]! >= dp[i * width + j + 1]!) {
+      changed.push(i++);
+    } else {
+      j++;
+    }
+  }
+  while (i < n) {
+    changed.push(i++);
+  }
+  return changed;
+}
+
+export function findDirectBlockImageElements(rootEl: HTMLElement): HTMLElement[] {
+  const ownerBlock = rootEl.closest<HTMLElement>("[data-node-id]") ?? rootEl;
+  const candidates = rootEl.querySelectorAll<HTMLElement>('[data-type~="img"], img');
   const out: HTMLElement[] = [];
   for (let i = 0; i < candidates.length; i++) {
     const el = candidates[i]!;
-    if (el.closest("[data-node-id]") !== block) continue;
+    if (el.closest("[data-node-id]") !== ownerBlock) continue;
     // Prefer the outer `span[data-type~="img"]` wrapper over its inner `<img>` child when wrapped.
     if (el.tagName === "IMG" && el.closest('[data-type~="img"]')) continue;
     out.push(el);

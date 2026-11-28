@@ -70,6 +70,7 @@ export function visibleMainEditors(bridge: HostBridge): VisibleDoc[] {
       !head?.classList?.contains("item--focus") ||
       !isElementVisible(panel) ||
       !isElementVisible(protyle.element) ||
+      !isElementVisible(protyle.wysiwyg.element) ||
       !isElementVisible(wndElement)
     ) {
       continue;
@@ -95,7 +96,7 @@ export type InspectVisiblePairResult =
   | { ok: true; pair: readonly [VisibleDoc, VisibleDoc] }
   | { ok: false; code: PairLayoutErrorCode };
 
-export function inspectVisiblePair(bridge: HostBridge): InspectVisiblePairResult {
+export function findSideBySidePanes(bridge: HostBridge): InspectVisiblePairResult {
   const editors = visibleMainEditors(bridge);
   if (editors.length !== 2) {
     return { ok: false, code: editors.length === 0 ? "no-visible-pair" : "not-two-panes" };
@@ -109,10 +110,16 @@ export function inspectVisiblePair(bridge: HostBridge): InspectVisiblePairResult
   if (verticalOverlap <= 0 || left.rect.left >= right.rect.left || left.rect.right > right.rect.left + 24) {
     return { ok: false, code: "not-side-by-side" };
   }
-  if (left.id === right.id) {
+  return { ok: true, pair: [left, right] };
+}
+
+export function inspectVisiblePair(bridge: HostBridge): InspectVisiblePairResult {
+  const panes = findSideBySidePanes(bridge);
+  if (!panes.ok) return panes;
+  if (panes.pair[0].id === panes.pair[1].id) {
     return { ok: false, code: "same-document" };
   }
-  return { ok: true, pair: [left, right] };
+  return panes;
 }
 
 export function findVisiblePair(bridge: HostBridge): readonly [VisibleDoc, VisibleDoc] | null {
@@ -260,8 +267,9 @@ export async function openAndVerifyPair(
     throw new PairLayoutError("complex-layout", "Workspace has more than two visible editor panes");
   }
 
-  const existingPair = findVisiblePair(bridge);
-  if (existingPair) {
+  const sideBySide = findSideBySidePanes(bridge);
+  if (sideBySide.ok) {
+    const existingPair = sideBySide.pair;
     if (existingPair[0].id === leftID && existingPair[1].id === rightID) {
       return existingPair;
     }
@@ -298,10 +306,10 @@ export async function openAndVerifyPair(
 
       // Step 2: Re-inspect panes and ensure `rightID` is active in the right pane.
       if (!rightAlreadyOpened) {
-        const midPair = findVisiblePair(bridge);
-        if (midPair) {
-          const curLeftWnd = midPair[0].wndInstance;
-          const curRightWnd = midPair[1].wndInstance;
+        const midPanes = findSideBySidePanes(bridge);
+        if (midPanes.ok) {
+          const curLeftWnd = midPanes.pair[0].wndInstance;
+          const curRightWnd = midPanes.pair[1].wndInstance;
           const rightInRight = findTabInWnd(curRightWnd, rightID);
           const rightInLeft = findTabInWnd(curLeftWnd, rightID);
           if (rightInRight?.headElement && typeof curRightWnd?.switchTab === "function") {

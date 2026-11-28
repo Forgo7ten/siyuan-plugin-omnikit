@@ -6,10 +6,15 @@ import type { HostBridge } from "../host/SiyuanBridge.ts";
 import { applyComparableTitleHunk } from "../model/conflict.ts";
 import { alignUnits, retainHunkCursor } from "../model/DiffEngine.ts";
 import {
-  EMPTY_DIFF_COUNTS,
+  buildToolbarViewState,
+  type ToolbarActions,
+  type ToolbarFactory,
+  type ToolbarHandle,
+  type ToolbarViewState,
+} from "../model/toolbarState.ts";
+import {
   EMPTY_DIFF_RESULT,
   matchesDiffFilter,
-  type DiffCounts,
   type DiffFilter,
   type DiffHunk,
   type DiffResult,
@@ -22,45 +27,14 @@ import { ComputeCoordinator } from "./ComputeCoordinator.ts";
 import { DiffPainter } from "./DiffPainter.ts";
 import { DirtyGate } from "./DirtyGate.ts";
 import { KernelSnapshot } from "./KernelSnapshot.ts";
+import { getScroller } from "./mountedDomIndex.ts";
 import { bindProtyleScrollGestures, ScrollSync } from "./ScrollSync.ts";
-import { getScroller, ViewportSliceSync, type ViewportSliceSyncHost } from "./ViewportSliceSync.ts";
+import { ViewportSliceSync, type ViewportSliceSyncHost } from "./ViewportSliceSync.ts";
 import { canSwapVisiblePair, findVisiblePair, swapVisiblePair, type VisibleDoc } from "./VisiblePair.ts";
 import { verifyVisibleParity } from "./VisibleParity.ts";
+import { classifyWsMainDiffEvent, type ComparableDocRef } from "./wsMainFilter.ts";
 
-export interface ToolbarViewState {
-  statusKind: SessionStatusKind;
-  statusText: string;
-  leftDoc: DocumentIdentityLabel;
-  rightDoc: DocumentIdentityLabel;
-  counts: DiffCounts;
-  filter: DiffFilter;
-  cursorIndex: number;
-  filteredTotal: number;
-  syncEnabled: boolean;
-  canSwap: boolean;
-  canNavigate: boolean;
-}
-
-export interface ToolbarActions {
-  onPrev: () => void;
-  onNext: () => void;
-  onToggleFilter: (filter: DiffFilter) => void;
-  onToggleSync: () => void;
-  onSwap: () => void;
-  onRefresh: () => void;
-  onClose: () => void;
-}
-
-export interface ToolbarHandle {
-  update(state: ToolbarViewState): void;
-  dispose(): void;
-}
-
-export type ToolbarFactory = (
-  initialState: ToolbarViewState,
-  actions: ToolbarActions,
-  t: (key: string, values?: Record<string, string | number>) => string,
-) => ToolbarHandle;
+export type { ToolbarActions, ToolbarFactory, ToolbarHandle, ToolbarViewState };
 
 export interface DocumentDiffSessionOptions {
   plugin: Plugin;
@@ -75,6 +49,7 @@ export interface DocumentDiffSessionOptions {
   mountToolbar: ToolbarFactory;
   notify: (message: string, type?: "info" | "error") => void;
   t: (key: string, values?: Record<string, string | number>) => string;
+  onDestroyedByProtyle?: (left: ComparableDocRef, right: ComparableDocRef) => void;
   onClosed: () => void;
 }
 
@@ -122,6 +97,7 @@ export class DocumentDiffSession implements ViewportSliceSyncHost {
   private readonly hostCleanup: Array<() => void> = [];
   private paneCleanups: Array<() => void> = [];
   private mutationObserver?: MutationObserver;
+  private visibilityObserver?: MutationObserver;
   private resizeObserver?: ResizeObserver;
   private rafHandle?: number;
   private retryTimer?: ReturnType<typeof setTimeout>;
@@ -171,6 +147,8 @@ export class DocumentDiffSession implements ViewportSliceSyncHost {
       () => this.sliceSync.computeScrollAnchors(),
       () => performance.now(),
       {
+        bindGestureListeners: false,
+        shouldSuppressSync: () => this.sliceSync.hasActiveNavigationPending(),
         onUnmappedScroll: (fromSide, readingContentY, own, other, anchorCount) =>
           this.sliceSync.handleUnmappedScroll(fromSide, readingContentY, own, other, anchorCount),
         onBeforeApplyScroll: (targetSide, targetScrollTop, previousScrollTop, sourceSide) =>
@@ -220,18 +198,10 @@ export class DocumentDiffSession implements ViewportSliceSyncHost {
     this.coordinator.immediate();
   }
 
-  withSwappingGuard<T>(fn: () => T): T {
-    this.swapping = true;
-    try {
-      return fn();
-    } finally {
-      this.swapping = false;
-    }
-  }
-
   private bindPaneListeners(): void {
     this.paneCleanups.splice(0).forEach(off => off());
     this.mutationObserver?.disconnect();
+    this.visibilityObserver?.disconnect();
     this.resizeObserver?.disconnect();
 
     const addListener = (target: EventTarget, type: string, handler: EventListener, options?: AddEventListenerOptions) => {
@@ -276,6 +246,24 @@ export class DocumentDiffSession implements ViewportSliceSyncHost {
       });
       this.mutationObserver.observe(this.leftDoc.protyle.wysiwyg.element, { childList: true, subtree: true });
       this.mutationObserver.observe(this.rightDoc.protyle.wysiwyg.element, { childList: true, subtree: true });
+
+      this.visibilityObserver = new MutationObserver(() => {
+        if (!this.closed && !this.swapping && !this.isPairStillLive()) {
+          this.disposeByPairLoss();
+        }
+      });
+      for (const doc of [this.leftDoc, this.rightDoc]) {
+        for (const target of [
+          doc.panel,
+          doc.tab?.headElement as HTMLElement | undefined,
+          doc.protyle.contentElement as HTMLElement | undefined,
+          doc.protyle.element as HTMLElement | undefined,
+        ]) {
+          if (target && typeof (target as Node).nodeType === "number") {
+            this.visibilityObserver.observe(target, { attributes: true, attributeFilter: ["class"] });
+          }
+        }
+      }
     }
 
     if (typeof ResizeObserver !== "undefined") {
@@ -295,18 +283,27 @@ export class DocumentDiffSession implements ViewportSliceSyncHost {
   }
 
   private bindHostEvents(): void {
-    const RECOMPUTE_CMDS = new Set(["transactions", "reload", "reloaddoc", "syncMergeResult", "rename", "removeDoc"]);
     const onWsMain = (event: CustomEvent<any>) => {
       if (this.closed) return;
-      const cmd = event.detail?.cmd ?? event.detail?.data?.cmd;
-      if (!RECOMPUTE_CMDS.has(cmd)) return;
-      if (cmd === "removeDoc") {
-        const removedIds: unknown = event.detail?.data?.ids;
-        if (Array.isArray(removedIds) && (removedIds.includes(this.leftDoc.id) || removedIds.includes(this.rightDoc.id))) {
-          this.cfg.notify(this.cfg.t("diff.notice.docRemoved"), "error");
-          this.dispose();
+      const action = classifyWsMainDiffEvent(
+        event.detail,
+        this.leftDoc,
+        this.rightDoc,
+        this.leftRootIndexByBlockID,
+        this.rightRootIndexByBlockID,
+      );
+      if (action === "ignore") return;
+      if (action === "doc-removed") {
+        this.cfg.notify(this.cfg.t("diff.notice.docRemoved"), "error");
+        this.dispose();
+        return;
+      }
+      if (action === "transactions") {
+        if (this.dirty.pending && this.coordinator.isScheduledOrRunning) {
           return;
         }
+        this.requestCompute(!this.dirty.pending);
+        return;
       }
       this.requestCompute(false);
     };
@@ -324,7 +321,7 @@ export class DocumentDiffSession implements ViewportSliceSyncHost {
       const side = this.resolveEventSide(event);
       if (!side) return;
       if (!this.isPairStillLive()) {
-        this.dispose();
+        this.disposeByPairLoss();
         return;
       }
       if (this.dirty.pending || this.statusKind === "comparing" || this.statusKind === "failed") {
@@ -336,13 +333,15 @@ export class DocumentDiffSession implements ViewportSliceSyncHost {
     };
 
     const onSwitchProtyle = () => {
-      if (!this.closed && !this.swapping && !this.isPairStillLive()) this.dispose();
+      if (!this.closed && !this.swapping && !this.isPairStillLive()) this.disposeByPairLoss();
     };
     const onSyncEnd = () => {
       if (!this.closed) this.requestCompute(false);
     };
     const onDestroyProtyle = (event: CustomEvent<any>) => {
-      if (this.resolveEventSide(event)) this.dispose();
+      if (!this.closed && this.resolveEventSide(event)) {
+        this.disposeByPairLoss();
+      }
     };
 
     const bus = this.cfg.plugin.eventBus;
@@ -351,6 +350,7 @@ export class DocumentDiffSession implements ViewportSliceSyncHost {
       ["loaded-protyle-dynamic", onDynamicLoad],
       ["loaded-protyle-static", onStaticLoad],
       ["switch-protyle", onSwitchProtyle],
+      ["switch-protyle-mode", onSwitchProtyle],
       ["sync-end", onSyncEnd],
       ["destroy-protyle", onDestroyProtyle],
     ];
@@ -396,45 +396,23 @@ export class DocumentDiffSession implements ViewportSliceSyncHost {
     return this.currentDiff.hunks.filter(hunk => matchesDiffFilter(hunk, this.filter));
   }
 
-  private formatStatusText(filteredLen: number): string {
-    const { t } = this.cfg;
-    switch (this.statusKind) {
-      case "comparing": return t("diff.status.comparing");
-      case "unconfirmed": return t("diff.status.unconfirmed");
-      case "equal": return t("diff.status.equal");
-      case "failed": return t("diff.status.failed", { reason: this.errorReason || t("diff.error.unknown") });
-      case "unresolved":
-        return t("diff.status.unresolved", {
-          confirmed: this.currentDiff.counts.confirmedDiff,
-          unresolved: this.currentDiff.counts.unresolved,
-        });
-      case "diff":
-        return filteredLen === 0
-          ? t("diff.status.filterEmpty")
-          : t("diff.status.diff", { current: this.hasNavigated ? this.cursor + 1 : 0, total: filteredLen });
-    }
-  }
-
   private buildToolbarState(): ToolbarViewState {
     const visibleHunks = this.filteredHunks();
-    const canNavigate =
-      !this.dirty.pending &&
-      (this.statusKind === "diff" || this.statusKind === "unresolved") &&
-      visibleHunks.length > 0;
-
-    return {
+    return buildToolbarViewState({
       statusKind: this.statusKind,
-      statusText: this.formatStatusText(visibleHunks.length),
+      errorReason: this.errorReason,
+      pending: this.dirty.pending,
       leftDoc: this.leftIdentity,
       rightDoc: this.rightIdentity,
-      counts: this.dirty.pending || this.statusKind === "failed" ? { ...EMPTY_DIFF_COUNTS } : this.currentDiff.counts,
+      counts: this.currentDiff.counts,
       filter: this.filter,
-      cursorIndex: this.hasNavigated && visibleHunks.length > 0 ? this.cursor + 1 : 0,
       filteredTotal: visibleHunks.length,
+      hasNavigated: this.hasNavigated,
+      cursor: this.cursor,
       syncEnabled: this.userSyncEnabled,
       canSwap: canSwapVisiblePair(this.leftDoc, this.rightDoc),
-      canNavigate,
-    };
+      t: this.cfg.t,
+    });
   }
 
   private pushToolbarState(): void {
@@ -579,7 +557,7 @@ export class DocumentDiffSession implements ViewportSliceSyncHost {
     this.scrollSync.setEnabled(this.userSyncEnabled);
     this.pushToolbarState();
 
-    if (this.isDebugActive()) {
+    if (this.logger.isDebugEnabled) {
       const leftMounted = this.sliceSync.inspectMountedDom("left");
       const rightMounted = this.sliceSync.inspectMountedDom("right");
       this.debugLog("snapshot-applied", {
@@ -654,25 +632,14 @@ export class DocumentDiffSession implements ViewportSliceSyncHost {
     this.requestCompute(true);
   }
 
-  private isDebugActive(): boolean {
-    return (
-      this.logger.isDebugEnabled ||
-      (globalThis as { __OMNIKIT_DIFF_DEBUG__?: boolean }).__OMNIKIT_DIFF_DEBUG__ === true
-    );
-  }
-
   debugLog(stage: string, detail: Record<string, unknown>, throttleKey?: string, throttleMs = 220): void {
-    if (!this.isDebugActive()) return;
+    if (!this.logger.isDebugEnabled) return;
     if (throttleKey) {
       const now = Date.now();
       if (now - (this.debugThrottleAt.get(throttleKey) ?? 0) < throttleMs) return;
       this.debugThrottleAt.set(throttleKey, now);
     }
-    if (this.logger.isDebugEnabled) {
-      this.logger.debug(`[document-diff] ${stage}`, detail);
-    } else {
-      console.debug(`[OmniKit][debug][document-diff] ${stage}`, detail);
-    }
+    this.logger.debug(`[document-diff] ${stage}`, detail);
   }
 
   private navigate(delta: number): void {
@@ -701,6 +668,15 @@ export class DocumentDiffSession implements ViewportSliceSyncHost {
     this.pushToolbarState();
   }
 
+  private disposeByPairLoss(): void {
+    if (this.closed) return;
+    this.cfg.onDestroyedByProtyle?.(
+      { id: this.leftDoc.id, notebook: this.leftDoc.notebook },
+      { id: this.rightDoc.id, notebook: this.rightDoc.notebook },
+    );
+    this.dispose();
+  }
+
   dispose(): void {
     if (this.closed) return;
     this.closed = true;
@@ -716,13 +692,10 @@ export class DocumentDiffSession implements ViewportSliceSyncHost {
     this.sliceSync.clearTimers();
     this.coordinator.dispose();
     this.mutationObserver?.disconnect();
+    this.visibilityObserver?.disconnect();
     this.resizeObserver?.disconnect();
-    this.paneCleanups.splice(0).reverse().forEach(off => {
-      try { off(); } catch { /* ignore */ }
-    });
-    this.hostCleanup.splice(0).reverse().forEach(off => {
-      try { off(); } catch { /* ignore */ }
-    });
+    for (const off of this.paneCleanups.splice(0).reverse()) off();
+    for (const off of this.hostCleanup.splice(0).reverse()) off();
     this.scrollSync.dispose();
     this.leftPainter.dispose();
     this.rightPainter.dispose();

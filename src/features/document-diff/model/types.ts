@@ -92,6 +92,12 @@ export const EMPTY_DIFF_RESULT: DiffResult = {
   counts: { ...EMPTY_DIFF_COUNTS },
 };
 
+const VALID_BLOCK_ID_RE = /^\d{14}-[a-zA-Z0-9]{7}$/;
+
+export function isValidBlockID(id: string | undefined | null): id is string {
+  return typeof id === "string" && VALID_BLOCK_ID_RE.test(id);
+}
+
 export function semanticKey(unit: SemanticUnit): string {
   return JSON.stringify([
     unit.kind,

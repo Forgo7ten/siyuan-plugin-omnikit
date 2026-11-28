@@ -1,5 +1,34 @@
-import { findNearestMatchedBlockID } from "./DiffEngine.ts";
-import type { DiffHunk, DiffResult, SemanticUnit, Side } from "./types.ts";
+import type { DiffHunk, DiffResult, MatchAnchor, SemanticUnit, Side } from "./types.ts";
+
+/**
+ * Finds the nearest matched block ID on `side` around a hunk when that side has no units of its own
+ * (e.g., jumping to context on the left side when navigating to a `right-only` insertion).
+ */
+export function findNearestMatchedBlockID(
+  matches: readonly MatchAnchor[],
+  hunk: DiffHunk,
+  side: Side,
+): string | undefined {
+  if (matches.length === 0) return undefined;
+  const targetIndex = side === "left" ? hunk.leftIndex : hunk.rightIndex;
+  let bestBefore: MatchAnchor | undefined;
+  let bestAfter: MatchAnchor | undefined;
+
+  for (const match of matches) {
+    const blockID = side === "left" ? match.leftBlockID : match.rightBlockID;
+    if (!blockID) continue;
+    const pos = side === "left" ? match.leftIndex : match.rightIndex;
+    if (pos <= targetIndex) {
+      if (!bestBefore || pos > (side === "left" ? bestBefore.leftIndex : bestBefore.rightIndex)) {
+        bestBefore = match;
+      }
+    } else if (!bestAfter || pos < (side === "left" ? bestAfter.leftIndex : bestAfter.rightIndex)) {
+      bestAfter = match;
+    }
+  }
+  const chosen = bestBefore ?? bestAfter;
+  return chosen ? (side === "left" ? chosen.leftBlockID : chosen.rightBlockID) : undefined;
+}
 
 export interface CrossDiffMappingContext {
   readonly diff: DiffResult;

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack, type Component } from "svelte";
-  import type { ToolbarActions, ToolbarViewState } from "../runtime/DocumentDiffSession.ts";
+  import type { ToolbarActions, ToolbarViewState } from "../model/toolbarState.ts";
 
   interface Props {
     initialState: ToolbarViewState;

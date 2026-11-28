@@ -15,10 +15,8 @@ import {
   type ConflictManualReasonCode,
 } from "./model/conflict.ts";
 import type { DocumentDiffConfig } from "./model/settings.ts";
-import {
-  DocumentDiffSession,
-  type ToolbarFactory,
-} from "./runtime/DocumentDiffSession.ts";
+import type { ToolbarFactory } from "./model/toolbarState.ts";
+import { DocumentDiffSession } from "./runtime/DocumentDiffSession.ts";
 import { KernelSnapshot } from "./runtime/KernelSnapshot.ts";
 import { chooseComparisonDocument } from "./runtime/ManualPicker.ts";
 import {
@@ -28,6 +26,7 @@ import {
   type PairLayoutErrorCode,
   type VisibleDoc,
 } from "./runtime/VisiblePair.ts";
+import { classifyWsMainDiffEvent, type ComparableDocRef } from "./runtime/wsMainFilter.ts";
 
 export const DOCUMENT_DIFF_FRONTENDS: readonly SiyuanFrontend[] = [
   "desktop",
@@ -40,6 +39,14 @@ export interface DocumentDiffFeatureDeps {
   mountToolbar: ToolbarFactory;
   kernel: KernelClient;
 }
+
+interface RecentlyDestroyedPair {
+  left: ComparableDocRef;
+  right: ComparableDocRef;
+  at: number;
+}
+
+const DESTROYED_DOC_REMOVAL_WINDOW_MS = 1000;
 
 function extractTitleFromDocTitleMenu(menu: MenuContext): string | undefined {
   const fromDocInfo = menu.detail?.data?.name;
@@ -103,6 +110,7 @@ export class DocumentDiffFeature extends BaseFeature {
   private readonly mountToolbar: ToolbarFactory;
   private session?: DocumentDiffSession;
   private launchAborter?: AbortController;
+  private recentlyDestroyedPair?: RecentlyDestroyedPair;
 
   constructor(
     plugin: FeatureContext["plugin"],
@@ -164,7 +172,7 @@ export class DocumentDiffFeature extends BaseFeature {
             id: "compare-two-docs",
             label: this.t(ctx, "diff.menuCompareTwo"),
             icon: "iconScrollHoriz",
-            run: () => this.launchPairComparison(lockedPair[0], lockedPair[1], ctx, scope, true),
+            run: () => this.launchPairComparison(lockedPair[0], lockedPair[1], ctx, scope),
           },
         ];
       }
@@ -187,6 +195,23 @@ export class DocumentDiffFeature extends BaseFeature {
       },
     ]);
 
+    // Reconcile `destroy-protyle` racing ahead of `ws-main (removeDoc / removeBox / closeBox)` without timers.
+    const bus = ctx.plugin.eventBus;
+    const onScopeWsMain = (event: CustomEvent<any>) => {
+      const recent = this.recentlyDestroyedPair;
+      if (!recent) return;
+      if (Date.now() - recent.at > DESTROYED_DOC_REMOVAL_WINDOW_MS) {
+        this.recentlyDestroyedPair = undefined;
+        return;
+      }
+      if (classifyWsMainDiffEvent(event.detail, recent.left, recent.right) === "doc-removed") {
+        this.recentlyDestroyedPair = undefined;
+        ctx.feedback.notify(this.t(ctx, "diff.notice.docRemoved"), "error", { timeout: 4000 });
+      }
+    };
+    bus.on("ws-main" as any, onScopeWsMain);
+    scope.own(() => bus.off("ws-main" as any, onScopeWsMain));
+
     scope.own(() => this.teardownActive());
   }
 
@@ -195,6 +220,7 @@ export class DocumentDiffFeature extends BaseFeature {
   }
 
   private teardownActive(): void {
+    this.recentlyDestroyedPair = undefined;
     this.launchAborter?.abort();
     this.launchAborter = undefined;
     this.session?.dispose();
@@ -243,16 +269,9 @@ export class DocumentDiffFeature extends BaseFeature {
 
     try {
       const reader = new KernelSnapshot(this.kernel, signal);
-      const conflictDoc = await reader.verifyDocumentReadable(conflictID);
-      if (signal.aborted) return;
-
-      const parsed = parseConflictTitle(conflictDoc.title);
-      if (!parsed) {
-        ctx.feedback.notify(this.t(ctx, "diff.conflictReason.not-conflict"), "error", { timeout: 4500 });
-        return;
-      }
-
+      let baseTitle = "";
       let leftID: string | undefined;
+
       if (!forceManual) {
         const outcome = await resolveOriginalDocument(conflictID, reader);
         if (signal.aborted) return;
@@ -263,12 +282,35 @@ export class DocumentDiffFeature extends BaseFeature {
         if (outcome.kind === "matched") {
           leftID = outcome.originalID;
         } else {
+          if (outcome.reasonCode === "conflict-unreadable") {
+            ctx.feedback.notify(this.formatConflictManualReason(ctx, outcome.reasonCode), "error", { timeout: 4500 });
+            return;
+          }
+          baseTitle = outcome.baseTitle ?? "";
           ctx.feedback.notify(
             this.formatConflictManualReason(ctx, outcome.reasonCode),
             "info",
             { timeout: 5000 },
           );
         }
+      } else {
+        let conflictTitle: string;
+        try {
+          const loc = await reader.location(conflictID);
+          conflictTitle = await reader.title(conflictID, loc.notebook);
+        } catch {
+          if (!signal.aborted && scope.active) {
+            ctx.feedback.notify(this.formatConflictManualReason(ctx, "conflict-unreadable"), "error", { timeout: 4500 });
+          }
+          return;
+        }
+        if (signal.aborted) return;
+        const parsed = parseConflictTitle(conflictTitle);
+        if (!parsed) {
+          ctx.feedback.notify(this.t(ctx, "diff.conflictReason.not-conflict"), "error", { timeout: 4500 });
+          return;
+        }
+        baseTitle = parsed.baseTitle;
       }
 
       if (!leftID) {
@@ -277,16 +319,11 @@ export class DocumentDiffFeature extends BaseFeature {
           bridge: this.bridge,
           signal,
           excludeDocID: conflictID,
-          initialQuery: parsed.baseTitle,
+          initialQuery: baseTitle,
           t: (key, values) => this.t(ctx, key, values),
         });
         if (!picked || signal.aborted) return;
         leftID = picked.id;
-      }
-
-      if (leftID === conflictID) {
-        ctx.feedback.notify(this.t(ctx, "diff.layoutError.same-document"), "error", { timeout: 4500 });
-        return;
       }
 
       const pair = await openAndVerifyPair(
@@ -310,20 +347,10 @@ export class DocumentDiffFeature extends BaseFeature {
     rightID: string,
     ctx: FeatureContext,
     scope: FeatureScope,
-    openIfNeeded: boolean,
   ): Promise<void> {
     const signal = this.beginLaunch(scope);
     if (!signal) return;
     try {
-      if (!openIfNeeded) {
-        const inspected = inspectVisiblePair(this.bridge);
-        if (!inspected.ok) {
-          ctx.feedback.notify(this.t(ctx, `diff.layoutError.${inspected.code}`), "error", { timeout: 4500 });
-          return;
-        }
-        this.mountSession(inspected.pair[0], inspected.pair[1], undefined, ctx, scope);
-        return;
-      }
       const pair = await openAndVerifyPair(
         ctx.plugin.app,
         leftID,
@@ -347,7 +374,8 @@ export class DocumentDiffFeature extends BaseFeature {
     ctx: FeatureContext,
     scope: FeatureScope,
   ): void {
-    if (!scope.active || !canStartSession(left, right)) return;
+    if (!scope.active) return;
+    this.recentlyDestroyedPair = undefined;
     this.session?.dispose();
     const config = ctx.settings.getFeature<DocumentDiffConfig>(this.meta.id);
     const created = new DocumentDiffSession({
@@ -363,6 +391,9 @@ export class DocumentDiffFeature extends BaseFeature {
       mountToolbar: this.mountToolbar,
       notify: (msg, type = "info") => ctx.feedback.notify(msg, type, { timeout: 4000 }),
       t: (key, values) => this.t(ctx, key, values),
+      onDestroyedByProtyle: (leftRef, rightRef) => {
+        this.recentlyDestroyedPair = { left: leftRef, right: rightRef, at: Date.now() };
+      },
       onClosed: () => {
         if (this.session === created) {
           this.session = undefined;
@@ -371,8 +402,4 @@ export class DocumentDiffFeature extends BaseFeature {
     });
     this.session = created;
   }
-}
-
-function canStartSession(left: { id: string }, right: { id: string }): boolean {
-  return Boolean(left?.id && right?.id && left.id !== right.id);
 }

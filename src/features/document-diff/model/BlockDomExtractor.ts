@@ -55,6 +55,56 @@ const QUERY_EMBED_BLOCK_TYPES = new Set([
   "NodeQueryEmbed",
 ]);
 
+const HANDLED_COMPLEX_BLOCK_TYPES = new Set([
+  ...CONTAINER_BLOCK_TYPES,
+  ...KNOWN_TEXT_LEAF_TYPES,
+  ...QUERY_EMBED_BLOCK_TYPES,
+  "NodeCodeBlock",
+  "NodeTable",
+  "NodeAttributeView",
+]);
+
+interface SimpleLeafPayload {
+  text: string;
+  extraFormat?: string;
+  parityParts: readonly unknown[];
+  bodyKey: string;
+  reliable: boolean;
+  unresolvedReason?: string;
+}
+
+function extractSimpleLeafPayload(el: DomElementLike, type: string): SimpleLeafPayload | null {
+  if (type === "NodeMathBlock" || type === "NodeThematicBreak" || type === "NodeCustomBlock") {
+    const content = stripZeroWidth(el.getAttribute("data-content") ?? "");
+    return { text: content, parityParts: [content], bodyKey: content, reliable: true };
+  }
+  if (type === "NodeHTMLBlock") {
+    const content = extractHtmlBlockContent(el);
+    return { text: content, parityParts: [content], bodyKey: content, reliable: true };
+  }
+  if (MEDIA_OR_FRAME_BLOCK_TYPES.has(type)) {
+    const media = extractMediaBlockDescriptor(el);
+    return {
+      text: media.src,
+      extraFormat: media.meta,
+      parityParts: [media.src, media.meta],
+      bodyKey: `${media.src}||${media.meta}`,
+      reliable: true,
+    };
+  }
+  if (!HANDLED_COMPLEX_BLOCK_TYPES.has(type)) {
+    const serialized = serializeConservativeSubtree(el);
+    return {
+      text: serialized,
+      parityParts: [serialized],
+      bodyKey: serialized,
+      reliable: false,
+      unresolvedReason: "Complex or unrecognized block type requires manual verification",
+    };
+  }
+  return null;
+}
+
 const CODE_BLOCK_RUNTIME_STYLE_PROPS = new Set(["line-height", "display"]);
 
 function customBlockAttributes(el: DomElementLike): string {
@@ -170,24 +220,15 @@ export function computeBlockParitySignature(el: DomElementLike, boundary: DomEle
     const rows = extractTableRows(el, false);
     return JSON.stringify([type, context, baseFormat, rows]);
   }
-  if (type === "NodeMathBlock" || type === "NodeThematicBreak" || type === "NodeCustomBlock") {
-    return JSON.stringify([type, context, baseFormat, stripZeroWidth(el.getAttribute("data-content") ?? "")]);
-  }
-  if (type === "NodeHTMLBlock") {
-    return JSON.stringify([type, context, baseFormat, extractHtmlBlockContent(el)]);
-  }
-  if (MEDIA_OR_FRAME_BLOCK_TYPES.has(type)) {
-    const media = extractMediaBlockDescriptor(el);
-    return JSON.stringify([type, context, baseFormat, media.src, media.meta]);
-  }
   if (QUERY_EMBED_BLOCK_TYPES.has(type)) {
     return JSON.stringify([type, context, baseFormat, stripZeroWidth(el.getAttribute("data-content") ?? "")]);
   }
   if (type === "NodeAttributeView") {
     return JSON.stringify([type, context, baseFormat, el.getAttribute("data-av-id") ?? ""]);
   }
-  if (!KNOWN_TEXT_LEAF_TYPES.has(type) && !CONTAINER_BLOCK_TYPES.has(type)) {
-    return JSON.stringify([type, context, baseFormat, serializeConservativeSubtree(el)]);
+  const simple = extractSimpleLeafPayload(el, type);
+  if (simple) {
+    return JSON.stringify([type, context, baseFormat, ...simple.parityParts]);
   }
 
   const parsed = collectEditableRuns(el, false);
@@ -328,15 +369,13 @@ export function extractBlockDomUnits(
     const context = ancestorContext(el, root);
     const header = extractBlockHeaderFormat(el);
     let bodyKey = "";
-    if (type === "NodeCodeBlock") {
+    const simple = extractSimpleLeafPayload(el, type);
+    if (simple) {
+      bodyKey = simple.bodyKey;
+    } else if (type === "NodeCodeBlock") {
       bodyKey = extractCodeBlockLines(el).join("\n");
     } else if (type === "NodeTable") {
       bodyKey = JSON.stringify(extractTableRows(el, true));
-    } else if (type === "NodeHTMLBlock") {
-      bodyKey = extractHtmlBlockContent(el);
-    } else if (MEDIA_OR_FRAME_BLOCK_TYPES.has(type)) {
-      const m = extractMediaBlockDescriptor(el);
-      bodyKey = `${m.src}||${m.meta}`;
     } else if (QUERY_EMBED_BLOCK_TYPES.has(type)) {
       bodyKey = normalizeQueryEmbedScript(
         el.getAttribute("data-content") ?? "",
@@ -347,14 +386,10 @@ export function extractBlockDomUnits(
     } else if (type === "NodeAttributeView") {
       const avID = el.getAttribute("data-av-id") ?? "";
       bodyKey = options?.avSignatures?.get(avID) ?? avID;
-    } else if (type === "NodeMathBlock" || type === "NodeThematicBreak" || type === "NodeCustomBlock") {
-      bodyKey = stripZeroWidth(el.getAttribute("data-content") ?? "");
     } else if (CONTAINER_BLOCK_TYPES.has(type)) {
       const childRun = collectEditableRuns(el, true);
       const childCount = findDescendants(el, c => Boolean(c.getAttribute("data-node-id"))).length;
       bodyKey = `${containerDescriptor(el)}#${childCount}#${childRun.text}`;
-    } else if (!KNOWN_TEXT_LEAF_TYPES.has(type)) {
-      bodyKey = serializeConservativeSubtree(el);
     } else {
       const run = collectEditableRuns(el, true);
       bodyKey = `${run.text}||${run.lineMarks.join("/")}`;
@@ -438,45 +473,18 @@ export function extractBlockDomUnits(
       continue;
     }
 
-    if (type === "NodeMathBlock" || type === "NodeThematicBreak" || type === "NodeCustomBlock") {
+    const simple = extractSimpleLeafPayload(el, type);
+    if (simple) {
       units.push({
         blockID: id,
         kind: type,
         context,
-        text: stripZeroWidth(el.getAttribute("data-content") ?? ""),
-        format: headerFormat,
+        text: simple.text,
+        format: simple.extraFormat !== undefined ? `${headerFormat}|${simple.extraFormat}` : headerFormat,
         target: "",
         line: 0,
-        reliable: true,
-      });
-      continue;
-    }
-
-    if (type === "NodeHTMLBlock") {
-      units.push({
-        blockID: id,
-        kind: type,
-        context,
-        text: extractHtmlBlockContent(el),
-        format: headerFormat,
-        target: "",
-        line: 0,
-        reliable: true,
-      });
-      continue;
-    }
-
-    if (MEDIA_OR_FRAME_BLOCK_TYPES.has(type)) {
-      const media = extractMediaBlockDescriptor(el);
-      units.push({
-        blockID: id,
-        kind: type,
-        context,
-        text: media.src,
-        format: `${headerFormat}|${media.meta}`,
-        target: "",
-        line: 0,
-        reliable: true,
+        reliable: simple.reliable,
+        ...(simple.unresolvedReason ? { unresolvedReason: simple.unresolvedReason } : {}),
       });
       continue;
     }
@@ -520,21 +528,6 @@ export function extractBlockDomUnits(
         ...(avSig === undefined
           ? { unresolvedReason: "Attribute view content requires verification" }
           : {}),
-      });
-      continue;
-    }
-
-    if (!KNOWN_TEXT_LEAF_TYPES.has(type) && !CONTAINER_BLOCK_TYPES.has(type)) {
-      units.push({
-        blockID: id,
-        kind: type,
-        context,
-        text: serializeConservativeSubtree(el),
-        format: headerFormat,
-        target: "",
-        line: 0,
-        reliable: false,
-        unresolvedReason: "Complex or unrecognized block type requires manual verification",
       });
       continue;
     }

@@ -4,7 +4,7 @@ import type {
   ToolbarFactory,
   ToolbarHandle,
   ToolbarViewState,
-} from "../runtime/DocumentDiffSession.ts";
+} from "../model/toolbarState.ts";
 import DiffToolbar from "./DiffToolbar.svelte";
 import ToolbarStateHolder from "./ToolbarStateBridge.svelte";
 

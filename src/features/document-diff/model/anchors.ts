@@ -53,7 +53,8 @@ export function monotoneAnchors(anchors: readonly ScrollAnchor[]): ScrollAnchor[
 }
 
 /**
- * Piecewise linear interpolation between matched content anchors with bounded edge extrapolation.
+ * O(log N) piecewise linear interpolation over a strictly monotone `ScrollAnchor` chain
+ * (as produced by `monotoneAnchors`) with bounded edge extrapolation.
  */
 export function linkedY(
   y: number,
@@ -65,44 +66,29 @@ export function linkedY(
   const src = (a: ScrollAnchor) => (from === "left" ? a.leftY : a.rightY);
   const dst = (a: ScrollAnchor) => (from === "left" ? a.rightY : a.leftY);
 
-  let ordered = anchors;
-  let needsSort = false;
-  for (let i = 1; i < ordered.length; i++) {
-    if (src(ordered[i]!) < src(ordered[i - 1]!)) {
-      needsSort = true;
-      break;
-    }
-  }
-  if (needsSort) {
-    ordered = [...anchors].sort((a, b) => src(a) - src(b));
-  }
-  for (let i = 1; i < ordered.length; i++) {
-    if (src(ordered[i]!) <= src(ordered[i - 1]!) || dst(ordered[i]!) <= dst(ordered[i - 1]!)) {
-      return null;
-    }
-  }
-
-  const first = ordered[0]!;
-  const last = ordered[ordered.length - 1]!;
-  if (y < src(first)) {
-    const delta = src(first) - y;
+  const first = anchors[0]!;
+  const last = anchors[anchors.length - 1]!;
+  const firstSrc = src(first);
+  if (y < firstSrc) {
+    const delta = firstSrc - y;
     return delta <= maxExtrapolation ? dst(first) - delta : null;
   }
-  if (y > src(last)) {
-    const delta = y - src(last);
+  const lastSrc = src(last);
+  if (y > lastSrc) {
+    const delta = y - lastSrc;
     return delta <= maxExtrapolation ? dst(last) + delta : null;
   }
 
   let lo = 0;
-  let hi = ordered.length - 1;
+  let hi = anchors.length - 1;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
-    if (src(ordered[mid]!) < y) lo = mid + 1;
+    if (src(anchors[mid]!) < y) lo = mid + 1;
     else hi = mid;
   }
   if (lo === 0) return dst(first);
-  const a = ordered[lo - 1]!;
-  const b = ordered[lo]!;
+  const a = anchors[lo - 1]!;
+  const b = anchors[lo]!;
   const span = src(b) - src(a);
   if (span <= 0) return dst(a);
   const ratio = (y - src(a)) / span;

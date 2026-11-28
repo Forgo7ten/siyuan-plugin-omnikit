@@ -8,6 +8,9 @@ import { SettingsManager } from "../../../src/core/store/SettingsManager.ts";
 import { setFrontendResolver } from "../../../src/core/host/Platform.ts";
 import { DocumentDiffFeature } from "../../../src/features/document-diff/DocumentDiffFeature.ts";
 import { documentDiffSettingsCodec } from "../../../src/features/document-diff/model/settings.ts";
+import { findMountedTargetElement, inspectMountedProtyleDom } from "../../../src/features/document-diff/runtime/mountedDomIndex.ts";
+import { openAndVerifyPair } from "../../../src/features/document-diff/runtime/VisiblePair.ts";
+import { classifyWsMainDiffEvent } from "../../../src/features/document-diff/runtime/wsMainFilter.ts";
 
 class MockDomNode {
   constructor(tagName = "DIV", attrs = {}) {
@@ -520,15 +523,14 @@ test("DocumentDiffFeature gates all 3 menus accurately, compares without mutatin
     assert.equal(leftEntry.tab.headElement.parentElement, newRightWnd.headersElement);
     assert.equal(newRightWnd.headersElement.parentElement.classList.contains("fn__none"), false);
 
-    // 5. Test cross-viewport navigation on unmounted block uses `["cb-get-hl", "cb-get-context"]`
-    // Make the first hunk target an unmounted block by removing mounted blocks temporarily
+    // 5. Test cross-viewport navigation fallback on unmounted block (when `protyle.scroll` is absent) uses `["cb-get-context"]` without `"cb-get-hl"`
     leftEntry.protyle.wysiwyg.element.replaceChildren();
     rightEntry.protyle.wysiwyg.element.replaceChildren();
     openedTabCalls.length = 0;
     toolbarActions.onNext();
     assert.equal(openedTabCalls.length, 2);
-    assert.deepEqual(openedTabCalls[0].action, ["cb-get-hl", "cb-get-context"]);
-    assert.deepEqual(openedTabCalls[1].action, ["cb-get-hl", "cb-get-context"]);
+    assert.deepEqual(openedTabCalls[0].action, ["cb-get-context"]);
+    assert.deepEqual(openedTabCalls[1].action, ["cb-get-context"]);
 
     // 5. Close comparison -> cleans up overlays, styles, listeners, and toolbar while keeping tabs open
     toolbarActions.onClose();
@@ -559,6 +561,7 @@ test("Svelte UI components for document-diff use SiYuan theme variables without 
     assert.doesNotMatch(styleBlock, /#[0-9a-fA-F]{3,8}\b/, `${name} must not hardcode hex colors`);
     assert.doesNotMatch(styleBlock, /rgba?\(/, `${name} must not hardcode rgb/rgba colors`);
   }
+  assert.match(toolbarSvelte, /<svelte:window\s+onresize=\{onWindowResize\}\s*\/>/, "DiffToolbar clamps position on window resize");
 });
 
 test("long-document disjoint virtualized block windows synchronize via protyle.scroll slice loading without redundant getBlockDOM refetches", async () => {
@@ -815,10 +818,449 @@ test("long-document disjoint virtualized block windows synchronize via protyle.s
     assert.equal(loadDynamicCalls, 1);
     assert.equal(rightSetIndexCalls.length, prevSetIndexCount, "In-flight loadDynamic must not fall through to setIndex");
 
+    // Cross-slice hunk navigation (B-BUG-02 + B-CLEAN-03):
+    // Clear `data-top` set by previous dynamic-load subtest, mount blocks 1..6 on both sides while the only modified hunk is at block 20 (unmounted!).
+    rightEntry.protyle.wysiwyg.element.attrs.delete("data-top");
+    mountSlice(leftEntry.protyle, "l", 1, 6, 0);
+    mountSlice(rightEntry.protyle, "r", 1, 6, 400);
+    leftEntry.protyle.block.blockCount = undefined;
+    let leftSetIndexCalls = 0;
+    leftEntry.protyle.scroll = {
+      lastScrollTop: 0,
+      inputElement: { value: "1" },
+      setCurrentIndex() {
+        this.inputElement.value = "NaN";
+      },
+      setIndex(protyle) {
+        const requestedIdx = Number.parseInt(this.inputElement.value, 10);
+        assert.equal(Number.isFinite(requestedIdx), true, "Slider value must be corrected from NaN before setIndex");
+        leftSetIndexCalls++;
+        mountSlice(protyle, "l", requestedIdx, Math.min(totalBlocks, requestedIdx + 7), 0);
+        for (const fn of bus.get("loaded-protyle-static") ?? []) {
+          fn({ detail: { protyle } });
+        }
+      },
+    };
+    let navOpenTabCalls = 0;
+    bridge.openDocTab = async () => {
+      navOpenTabCalls++;
+      return leftEntry.tab;
+    };
+
+    const prevRightSetIdx = rightSetIndexCalls.length;
+    toolbarActions.onNext();
+    assert.equal(navOpenTabCalls, 0, "Virtualized cross-slice hunk navigation must use in-place setIndex without openDocTab");
+    assert.equal(leftSetIndexCalls, 1);
+    assert.equal(rightSetIndexCalls.length, prevRightSetIdx + 1);
+
     toolbarActions.onClose();
     await feature.deactivate();
   } finally {
     globalThis.document = prevDoc;
     globalThis.getComputedStyle = prevStyle;
+  }
+});
+
+test("openAndVerifyPair reuses side-by-side panes even when both panes initially show the same document (B-BUG-01)", async () => {
+  const prevStyle = globalThis.getComputedStyle;
+  globalThis.getComputedStyle = () => ({ display: "block", visibility: "visible" });
+  try {
+    const docSame = "20260801000001-samedoc";
+    const docTargetA = "20260801000002-targeta";
+    const docTargetB = "20260801000003-targetb";
+    const layoutParent = { direction: "lr", children: [] };
+    const leftWnd = createWnd(0, layoutParent);
+    const rightWnd = createWnd(420, layoutParent);
+
+    // Both left and right panes currently display `docSame`!
+    createEditorModel({
+      id: docSame,
+      notebook: "box1",
+      title: "同文档",
+      blockID: "20260801000011-b000001",
+      text: "正文",
+      rectLeft: 0,
+      wnd: leftWnd,
+      layoutParent,
+    });
+    createEditorModel({
+      id: docSame,
+      notebook: "box1",
+      title: "同文档",
+      blockID: "20260801000011-b000001",
+      text: "正文",
+      rectLeft: 420,
+      wnd: rightWnd,
+      layoutParent,
+    });
+
+    let activeWnd = leftWnd;
+    const origLeftSwitch = leftWnd.switchTab.bind(leftWnd);
+    leftWnd.switchTab = head => {
+      activeWnd = leftWnd;
+      origLeftSwitch(head);
+    };
+    const origRightSwitch = rightWnd.switchTab.bind(rightWnd);
+    rightWnd.switchTab = head => {
+      activeWnd = rightWnd;
+      origRightSwitch(head);
+    };
+
+    const mockKernel = {
+      async post(url, body) {
+        if (url === "/api/filetree/getPathByID") return { data: { notebook: "box1", path: `/${body.id}.sy` } };
+        if (url === "/api/block/getDocInfo") return { data: { id: body.id, name: body.id } };
+        if (url === "/api/filetree/getHPathByID") return { data: `/${body.id}` };
+        throw new Error(`Unexpected ${url}`);
+      },
+    };
+
+    const bridge = {
+      getEditorModels: () => layoutParent.children.flatMap(w => w.children.map(t => t.model)),
+      async openDocTab(opts) {
+        const targetWnd = opts.position === "right" ? rightWnd : activeWnd;
+        const rectLeft = targetWnd === leftWnd ? 0 : 420;
+        const created = createEditorModel({
+          id: opts.id,
+          notebook: "box1",
+          title: opts.id,
+          blockID: "20260801000099-b000099",
+          text: "新开文档",
+          rectLeft,
+          wnd: targetWnd,
+          layoutParent,
+        });
+        targetWnd.switchTab(created.tab.headElement);
+        return created.tab;
+      },
+      createDialog: () => ({ element: new MockDomNode("DIV"), destroy() {} }),
+      getNotebookName: () => "笔记本",
+    };
+
+    // Subcase 1:Target left === `docSame` (already in both panes!), target right === `docTargetB`
+    const pair1 = await openAndVerifyPair(
+      {},
+      docSame,
+      docTargetB,
+      mockKernel,
+      bridge,
+      new AbortController().signal,
+    );
+    assert.equal(pair1[0].id, docSame);
+    assert.equal(pair1[1].id, docTargetB);
+
+    // Reset rightWnd back to `docSame` and test Subcase 2: two completely different docs `(docTargetA, docTargetB)`
+    rightWnd.switchTab(rightWnd.children[0].headElement);
+    const pair2 = await openAndVerifyPair(
+      {},
+      docTargetA,
+      docTargetB,
+      mockKernel,
+      bridge,
+      new AbortController().signal,
+    );
+    assert.equal(pair2[0].id, docTargetA);
+    assert.equal(pair2[1].id, docTargetB);
+  } finally {
+    globalThis.getComputedStyle = prevStyle;
+  }
+});
+
+test("classifyWsMainDiffEvent filters strictly by active pair and context.rootIDs (B-BUG-04)", () => {
+  const left = { id: "20260802000001-leftdoc", notebook: "box-left" };
+  const right = { id: "20260802000002-rghtdoc", notebook: "box-right" };
+  const other = "20260802000099-othrdoc";
+  const leftBlocks = new Map([["20260802000011-nested1", 2]]);
+
+  // 1. `transactions` prefers `context.rootIDs` (catches deep nested edits, ignores unrelated docs)
+  assert.equal(
+    classifyWsMainDiffEvent({ cmd: "transactions", context: { rootIDs: [other] }, data: [] }, left, right, leftBlocks),
+    "ignore",
+  );
+  assert.equal(
+    classifyWsMainDiffEvent({ cmd: "transactions", context: { rootIDs: [other, right.id] }, data: [] }, left, right, leftBlocks),
+    "transactions",
+  );
+
+  // 2. Fallback to `doOperations` + `leftBlocks` when `context.rootIDs` is absent
+  assert.equal(
+    classifyWsMainDiffEvent(
+      { cmd: "transactions", data: [{ doOperations: [{ id: "20260802000011-nested1" }] }] },
+      left,
+      right,
+      leftBlocks,
+    ),
+    "transactions",
+  );
+  assert.equal(
+    classifyWsMainDiffEvent(
+      { cmd: "transactions", data: [{ doOperations: [{ id: "20260802999999-unknown" }] }] },
+      left,
+      right,
+      leftBlocks,
+    ),
+    "ignore",
+  );
+
+  // 3. `removeDoc` on unrelated doc is ignored (does NOT fall through to recompute!), on compared doc returns `doc-removed`
+  assert.equal(classifyWsMainDiffEvent({ cmd: "removeDoc", data: { ids: [other] } }, left, right), "ignore");
+  assert.equal(classifyWsMainDiffEvent({ cmd: "removeDoc", data: { ids: [other, left.id] } }, left, right), "doc-removed");
+
+  // 4. `closeBox` / `removeBox` / `unmount` match `notebook`
+  assert.equal(classifyWsMainDiffEvent({ cmd: "closeBox", data: { box: "box-other" } }, left, right), "ignore");
+  assert.equal(classifyWsMainDiffEvent({ cmd: "closeBox", data: { box: "box-right" } }, left, right), "doc-removed");
+  assert.equal(classifyWsMainDiffEvent({ cmd: "removeBox", data: { box: "box-left" } }, left, right), "doc-removed");
+  assert.equal(classifyWsMainDiffEvent({ cmd: "unmount", data: { box: "box-left" } }, left, right), "doc-removed");
+
+  // 5. `rename`, `reloaddoc`, `syncMergeResult` filter by doc IDs
+  assert.equal(classifyWsMainDiffEvent({ cmd: "rename", data: { id: other, title: "x" } }, left, right), "ignore");
+  assert.equal(classifyWsMainDiffEvent({ cmd: "rename", data: { id: left.id, title: "y" } }, left, right), "recompute");
+  assert.equal(classifyWsMainDiffEvent({ cmd: "reloaddoc", data: other }, left, right), "ignore");
+  assert.equal(classifyWsMainDiffEvent({ cmd: "reloaddoc", data: right.id }, left, right), "recompute");
+  assert.equal(
+    classifyWsMainDiffEvent({ cmd: "syncMergeResult", data: { upsertRootIDs: [other], removeRootIDs: [] } }, left, right),
+    "ignore",
+  );
+  assert.equal(
+    classifyWsMainDiffEvent({ cmd: "syncMergeResult", data: { upsertRootIDs: [], removeRootIDs: [right.id] } }, left, right),
+    "doc-removed",
+  );
+});
+
+test("session handles preview/non-editor tab visibility (B-BUG-03), self-transaction debounce guard (B-BUG-04), destroy-protyle before removeDoc race (B-BUG-05), conflict-unreadable exit (B-CLEAN-01), and trailingFoldedHeading boundary (B-BUG-02)", async () => {
+  // Verify `findMountedTargetElement` only uses `trailingFoldedHeading` when `bottomBoundaryLoaded === true`
+  const wysiwygMock = new MockDomNode("DIV", { class: "protyle-wysiwyg" });
+  const foldedH2 = new MockDomNode("DIV", { "data-node-id": "20260803000005-foldhd1", "data-type": "NodeHeading", fold: "1" });
+  foldedH2._rect = { left: 0, top: 40, right: 300, bottom: 80, width: 300, height: 40 };
+  wysiwygMock.append(foldedH2);
+  const rootMap = new Map([["20260803000005-foldhd1", 5]]);
+
+  const unloadedBottomIdx = inspectMountedProtyleDom(
+    { protyle: { block: { scroll: true }, wysiwyg: { element: wysiwygMock }, element: wysiwygMock } },
+    rootMap,
+    40,
+  );
+  assert.equal(unloadedBottomIdx.bottomBoundaryLoaded, false);
+  assert.equal(
+    findMountedTargetElement(unloadedBottomIdx, wysiwygMock, "20260803000030-unmount", 30),
+    undefined,
+    "Must NOT treat trailing folded heading of an intermediate slice as containing block 30",
+  );
+
+  const loadedBottomIdx = inspectMountedProtyleDom(
+    { protyle: { block: { scroll: false }, wysiwyg: { element: wysiwygMock }, element: wysiwygMock } },
+    rootMap,
+    40,
+  );
+  assert.equal(loadedBottomIdx.bottomBoundaryLoaded, true);
+  assert.equal(findMountedTargetElement(loadedBottomIdx, wysiwygMock, "20260803000030-unmount", 30), foldedH2);
+
+  setFrontendResolver(() => "desktop");
+  const prevDoc = globalThis.document;
+  const prevStyle = globalThis.getComputedStyle;
+  const prevMO = globalThis.MutationObserver;
+  const mutationObservers = [];
+  globalThis.MutationObserver = class MockMutationObserver {
+    constructor(cb) {
+      this.cb = cb;
+      this.targets = [];
+      mutationObservers.push(this);
+    }
+    observe(target, opts) {
+      this.targets.push({ target, opts });
+    }
+    disconnect() {
+      this.targets = [];
+    }
+    trigger() {
+      if (this.targets.length > 0) this.cb([]);
+    }
+  };
+  globalThis.document = {
+    createElement: tag => new MockDomNode(tag),
+    body: new MockDomNode("BODY"),
+  };
+  globalThis.getComputedStyle = () => ({ display: "block", visibility: "visible" });
+
+  try {
+    const zh = JSON.parse(await readFile(new URL("../../../src/i18n/zh-CN.json", import.meta.url), "utf8"));
+    const bus = new Map();
+    const plugin = {
+      name: "siyuan-plugin-omnikit",
+      app: {},
+      i18n: zh,
+      saveData: async () => {},
+      eventBus: {
+        on(name, fn) {
+          if (!bus.has(name)) bus.set(name, new Set());
+          bus.get(name).add(fn);
+        },
+        off(name, fn) {
+          bus.get(name)?.delete(fn);
+        },
+        emit(name, detail) {
+          for (const fn of [...(bus.get(name) ?? [])]) fn({ detail });
+        },
+      },
+    };
+
+    const settings = new SettingsManager(
+      plugin,
+      [
+        {
+          id: "document-diff",
+          titleKey: "feature.documentDiff.title",
+          descriptionKey: "feature.documentDiff.description",
+          defaultEnabled: true,
+          file: "feature-document-diff-settings.json",
+          codec: documentDiffSettingsCodec,
+          create: () => ({}),
+          settingsView: () => null,
+        },
+      ],
+      async () => new Response(JSON.stringify({ code: 404 }), { status: 202 }),
+    );
+    await settings.load();
+
+    const layoutParent = { direction: "lr", children: [] };
+    const leftWnd = createWnd(0, layoutParent);
+    const rightWnd = createWnd(420, layoutParent);
+    const docL = "20260803000001-doclft1";
+    const docR = "20260803000002-docrgt1";
+    const unreadableConflictID = "20260803000099-badconf";
+
+    const leftEntry = createEditorModel({
+      id: docL,
+      notebook: "box1",
+      title: "左文档",
+      blockID: "20260803000011-blklft1",
+      text: "文本A",
+      rectLeft: 0,
+      wnd: leftWnd,
+      layoutParent,
+    });
+    const rightEntry = createEditorModel({
+      id: docR,
+      notebook: "box1",
+      title: "右文档",
+      blockID: "20260803000012-blkrgt1",
+      text: "文本B",
+      rectLeft: 420,
+      wnd: rightWnd,
+      layoutParent,
+    });
+
+    let getBlockDomCount = 0;
+    let pickerOpened = false;
+    const mockKernel = {
+      async post(url, body) {
+        if (body?.id === unreadableConflictID) {
+          throw new Error("Kernel 404: conflict doc removed");
+        }
+        if (url === "/api/block/getDocInfo") return { data: { id: body.id, name: body.id === docL ? "左文档" : "右文档" } };
+        if (url === "/api/filetree/getHPathByID") return { data: "/文档" };
+        if (url === "/api/block/getBlockDOM") {
+          getBlockDomCount++;
+          const bid = body.id === docL ? "20260803000011-blklft1" : "20260803000012-blkrgt1";
+          const txt = body.id === docL ? "文本A" : "文本B";
+          return { data: { id: body.id, dom: `<div data-node-id="${bid}" data-type="NodeParagraph"><div contenteditable="true">${txt}</div></div>` } };
+        }
+        throw new Error(`Unexpected ${url}`);
+      },
+    };
+
+    const bridge = {
+      getEditorModels: () => [leftEntry.model, rightEntry.model],
+      openDocTab: async () => undefined,
+      createDialog: () => {
+        pickerOpened = true;
+        return { element: new MockDomNode("DIV"), destroy() {} };
+      },
+      getNotebookName: () => "笔记",
+    };
+
+    let disposedCount = 0;
+    const feature = new DocumentDiffFeature(plugin, settings, {
+      bridge,
+      mountToolbar: () => ({ update() {}, dispose() { disposedCount++; } }),
+      kernel: mockKernel,
+    });
+    const menus = new MenuRegistry(() => true, err => { throw err; });
+    const notices = [];
+    const feedback = new UiFeedback(undefined, (msg, _t, type) => notices.push({ msg, type }));
+    await feature.activate({ plugin, settings, menus, logger: { info() {}, warn() {}, error() {}, debug() {} }, feedback });
+
+    // 1. B-CLEAN-01: `conflict-unreadable` reports error and exits WITHOUT opening manual picker dialog!
+    const conflictMenu = [];
+    menus.render("doc-title", { addItem: i => conflictMenu.push(i) }, {
+      location: "doc-title",
+      rootID: unreadableConflictID,
+      detail: { data: { name: "方案 (Conflicted 2026-11-15 10:20:30)" } },
+    });
+    await conflictMenu[0].click();
+    await new Promise(r => setTimeout(r, 20));
+    assert.equal(pickerOpened, false, "Unreadable conflict document must NOT open manual picker");
+    assert.equal(notices.at(-1)?.type, "error");
+    assert.ok(notices.at(-1)?.msg.includes(zh["diff.conflictReason.conflict-unreadable"]));
+
+    // 2. Start visible comparison
+    const topbarItems = [];
+    menus.render("topbar", { addItem: i => topbarItems.push(i) }, { location: "topbar" });
+    await topbarItems[0].click();
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(getBlockDomCount, 2);
+
+    // 3. B-BUG-04: Unrelated `ws-main` `transactions` is ignored; own local edit sets `dirty.pending` and ignores echoed `transactions`!
+    plugin.eventBus.emit("ws-main", { cmd: "transactions", context: { rootIDs: ["20260803999999-otherid"] }, data: [] });
+    await new Promise(r => setTimeout(r, 20));
+    assert.equal(getBlockDomCount, 2, "Unrelated doc transaction must not recompute");
+
+    // Non-input transaction (e.g. checkbox toggle / Ctrl+Z when `!dirty.pending`) triggers immediate recompute!
+    plugin.eventBus.emit("ws-main", { cmd: "transactions", context: { rootIDs: [docL] }, data: [] });
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(getBlockDomCount, 4, "Committed transaction on compared doc when !dirty.pending refreshes immediately");
+
+    // Local typing starts 400ms debounce; echoed `transactions` within debounce window does NOT trigger immediate fetch!
+    leftEntry.protyle.element.emit("input", { target: leftEntry.para });
+    plugin.eventBus.emit("ws-main", { cmd: "transactions", context: { rootIDs: [docL] }, data: [] });
+    await new Promise(r => setTimeout(r, 40));
+    assert.equal(getBlockDomCount, 4, "Self-transaction echo while debounce is scheduled must be ignored");
+
+    // 4. B-BUG-05: Real SiYuan deletion order `switch-protyle` (pair lost) -> `destroy-protyle` -> `ws-main (removeDoc)`
+    // disposes session immediately and still emits `diff.notice.docRemoved` once!
+    notices.length = 0;
+    rightEntry.tab.headElement.classList.remove("item--focus");
+    plugin.eventBus.emit("switch-protyle", {});
+    plugin.eventBus.emit("destroy-protyle", { protyle: rightEntry.protyle });
+    assert.equal(disposedCount, 1, "Session disposes immediately on pair loss during tab teardown");
+    assert.equal(notices.length, 0, "No notice before removeDoc arrives (handles manual tab switch/close cleanly)");
+    plugin.eventBus.emit("ws-main", { cmd: "removeDoc", data: { ids: [docR] } });
+    assert.equal(notices.length, 1, "Delayed ws-main removeDoc emits docRemoved notice once");
+    assert.ok(notices[0].msg.includes(zh["diff.notice.docRemoved"]));
+    // Duplicate removeDoc must not re-notify
+    plugin.eventBus.emit("ws-main", { cmd: "removeDoc", data: { ids: [docR] } });
+    assert.equal(notices.length, 1);
+    rightEntry.tab.headElement.classList.add("item--focus");
+
+    // 5. B-BUG-03: Export preview mode (`contentElement` hidden + `switch-protyle-mode`) and non-editor tab switch (`MutationObserver`) dispose session!
+    await topbarItems[0].click();
+    await new Promise(r => setTimeout(r, 20));
+    leftEntry.protyle.contentElement.classList.add("fn__none"); // SiYuan `setEditMode("preview")` hides `.protyle-content`
+    plugin.eventBus.emit("switch-protyle-mode", {});
+    assert.equal(disposedCount, 2, "Switching into preview mode immediately disposes diff session");
+
+    leftEntry.protyle.contentElement.classList.remove("fn__none");
+    await topbarItems[0].click();
+    await new Promise(r => setTimeout(r, 20));
+    // Simulate switching pane to a PDF/Graph tab (loses `item--focus` without firing `switch-protyle`)
+    rightEntry.tab.headElement.classList.remove("item--focus");
+    for (const obs of mutationObservers) obs.trigger();
+    assert.equal(disposedCount, 3, "Class MutationObserver on tab headElement disposes session when non-editor tab activates");
+
+    await feature.deactivate();
+  } finally {
+    globalThis.document = prevDoc;
+    globalThis.getComputedStyle = prevStyle;
+    globalThis.MutationObserver = prevMO;
   }
 });

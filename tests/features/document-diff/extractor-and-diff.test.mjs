@@ -16,6 +16,7 @@ import {
 } from "../../../src/features/document-diff/model/InlineDiff.ts";
 import { matchesDiffFilter } from "../../../src/features/document-diff/model/types.ts";
 import { canonicalizeAttributeViewData } from "../../../src/features/document-diff/runtime/KernelSnapshot.ts";
+import { computeChangedTokenIndices, extractImageTokens } from "../../../src/features/document-diff/runtime/domTextRanges.ts";
 import { verifyVisibleParity } from "../../../src/features/document-diff/runtime/VisibleParity.ts";
 
 test("conflict copy with completely rewritten block IDs, volatile attributes, and internal block refs compares as 0 diffs", () => {
@@ -439,4 +440,112 @@ test("detects inline image or inline formula position moves within the same text
   assert.equal(canonicalizeAttributeViewData(null), undefined);
   assert.equal(canonicalizeAttributeViewData({}), undefined);
   assert.equal(canonicalizeAttributeViewData({ av: null }), undefined);
+});
+
+test("verifyVisibleParity (B-BUG-06) rejects block drag-reordering and whole-block deletion while allowing folded items and virtualized slices", () => {
+  const docID = "20260405000000-par0001";
+  const b1 = "20260405000001-b000001";
+  const b2 = "20260405000002-b000002";
+  const b3 = "20260405000003-b000003";
+  const kernelHtml = [
+    `<div data-node-id="${b1}" data-type="NodeParagraph"><div contenteditable="true">第一段</div></div>`,
+    `<div data-node-id="${b2}" data-type="NodeParagraph"><div contenteditable="true">第二段</div></div>`,
+    `<div data-node-id="${b3}" data-type="NodeParagraph"><div contenteditable="true">第三段</div></div>`,
+  ].join("");
+
+  const extracted = extractBlockDomUnits(docID, kernelHtml);
+  const snapshot = {
+    id: docID,
+    title: "测试文档",
+    notebook: "box1",
+    units: extracted.units,
+    parityByBlockID: extracted.parityByBlockID,
+    rootBlockIndexByBlockID: extracted.rootBlockIndexByBlockID,
+    rootBlockIDs: extracted.rootBlockIDs,
+  };
+
+  const makeLiveView = (html, blockMeta = {}) => {
+    const root = parseHtmlFragmentFallback(html);
+    const collectWithNodeId = el => {
+      const out = [];
+      for (const child of el.children) {
+        if (child.getAttribute("data-node-id")) {
+          child.querySelector = sel => (sel === "[data-node-id]" ? collectWithNodeId(child)[0] ?? null : null);
+          out.push(child);
+        }
+        out.push(...collectWithNodeId(child));
+      }
+      return out;
+    };
+    const nodes = collectWithNodeId(root);
+    root.querySelectorAll = () => nodes;
+    return {
+      block: { rootID: docID, ...blockMeta },
+      title: { getText: () => "测试文档" },
+      wysiwyg: { element: root },
+    };
+  };
+
+  // 1. Exact order and count -> true
+  assert.equal(verifyVisibleParity(makeLiveView(kernelHtml), snapshot), true);
+
+  // 2. Dragged/reordered blocks (`b2` before `b1`) -> false!
+  const reorderedHtml = [
+    `<div data-node-id="${b2}" data-type="NodeParagraph"><div contenteditable="true">第二段</div></div>`,
+    `<div data-node-id="${b1}" data-type="NodeParagraph"><div contenteditable="true">第一段</div></div>`,
+    `<div data-node-id="${b3}" data-type="NodeParagraph"><div contenteditable="true">第三段</div></div>`,
+  ].join("");
+  assert.equal(verifyVisibleParity(makeLiveView(reorderedHtml), snapshot), false, "Must reject dragged block reordering");
+
+  // 3. Unflushed whole-block deletion in non-folded, non-virtualized view (`b2` deleted) -> false!
+  const deletedMiddleHtml = [
+    `<div data-node-id="${b1}" data-type="NodeParagraph"><div contenteditable="true">第一段</div></div>`,
+    `<div data-node-id="${b3}" data-type="NodeParagraph"><div contenteditable="true">第三段</div></div>`,
+  ].join("");
+  assert.equal(verifyVisibleParity(makeLiveView(deletedMiddleHtml), snapshot), false, "Must reject uncommitted whole-block deletion");
+
+  // 4. Same subset when `block.scroll === true` (virtualized slice) -> true!
+  assert.equal(
+    verifyVisibleParity(
+      makeLiveView(`<div data-node-id="${b2}" data-type="NodeParagraph"><div contenteditable="true">第二段</div></div>`, { scroll: true }),
+      snapshot,
+    ),
+    true,
+  );
+
+  // 5. Folded heading (`fold="1"`) hiding `b2` while keeping `b1` and `b3` in strictly increasing order -> true!
+  const foldedKernelHtml = [
+    `<div data-node-id="${b1}" data-type="NodeHeading" data-subtype="h2"><div contenteditable="true">折叠章节</div></div>`,
+    `<div data-node-id="${b2}" data-type="NodeParagraph"><div contenteditable="true">被折叠隐藏段</div></div>`,
+    `<div data-node-id="${b3}" data-type="NodeHeading" data-subtype="h2"><div contenteditable="true">下一章节</div></div>`,
+  ].join("");
+  const foldedExtracted = extractBlockDomUnits(docID, foldedKernelHtml);
+  const foldedSnap = {
+    id: docID,
+    title: "测试文档",
+    notebook: "box1",
+    units: foldedExtracted.units,
+    parityByBlockID: foldedExtracted.parityByBlockID,
+    rootBlockIndexByBlockID: foldedExtracted.rootBlockIndexByBlockID,
+    rootBlockIDs: foldedExtracted.rootBlockIDs,
+  };
+  const foldedLiveHtml = [
+    `<div data-node-id="${b1}" data-type="NodeHeading" data-subtype="h2" fold="1"><div contenteditable="true">折叠章节</div></div>`,
+    `<div data-node-id="${b3}" data-type="NodeHeading" data-subtype="h2"><div contenteditable="true">下一章节</div></div>`,
+  ].join("");
+  assert.equal(verifyVisibleParity(makeLiveView(foldedLiveHtml), foldedSnap), true, "Folded heading skipping child ordinals must pass parity");
+});
+
+test("readImageAttributes escapes parentheses and computeChangedTokenIndices isolates inserted/modified images via LCS (B-BUG-07)", () => {
+  const docHtml = `<div data-node-id="20260406000001-imgpar1" data-type="NodeParagraph"><div contenteditable="true"><span contenteditable="false" data-type="img" class="img" style="width: calc(100% - 16px);"><img data-src="assets/screenshot (1).png" alt="图 (A)" data-title="说明 (v1)" /></span></div></div>`;
+  const extracted = extractBlockDomUnits("20260406000000-docimg1", docHtml);
+  const tokens = extractImageTokens(extracted.units[0].format);
+  assert.equal(tokens.length, 1);
+  assert.ok(tokens[0].includes("screenshot %281%29.png"));
+  assert.ok(tokens[0].includes("%28v1%29"));
+  assert.ok(tokens[0].includes("calc%28100% - 16px%29"));
+
+  // Inserting an image in front of two existing images marks ONLY index 0 on the side with insertion, and 0 indices on the unchanged side
+  assert.deepEqual(computeChangedTokenIndices(["img(a)", "img(b)"], ["img(new)", "img(a)", "img(b)"]), []);
+  assert.deepEqual(computeChangedTokenIndices(["img(new)", "img(a)", "img(b)"], ["img(a)", "img(b)"]), [0]);
 });

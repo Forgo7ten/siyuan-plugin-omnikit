@@ -201,13 +201,20 @@ export function buildBlockGroups(
     const subtype = formatParts[0] ?? "";
     const codeLang = kind === "NodeCodeBlock" ? (formatParts[1] ?? "").trim().toLowerCase() : "";
     const normalizedLines = blockUnits.map(u => normalizeWhitespace(u.text));
+    const nonEmptyLines = normalizedLines.filter(line => line.length > 0);
+    const tableBodyLines =
+      kind === "NodeTableRow" && normalizedLines.length > 1
+        ? normalizedLines.slice(1).filter(line => line.length > 0)
+        : [];
     const meaningfulLines =
       kind === "NodeCodeBlock"
         ? normalizedLines.filter(line => !isLowEntropyCodeLine(line))
-        : normalizedLines.filter(line => line.length > 0);
+        : tableBodyLines.length > 0
+          ? tableBodyLines
+          : nonEmptyLines;
     const sortedMeaningfulLines =
       meaningfulLines.length > 1 ? [...meaningfulLines].sort() : meaningfulLines;
-    const joinedNormalizedText = normalizedLines.filter(Boolean).join("\n");
+    const joinedNormalizedText = nonEmptyLines.join("\n");
     const headingCoreText =
       kind === "NodeHeading"
         ? joinedNormalizedText.replace(HEADING_NUMBER_PREFIX_RE, "").trim()
@@ -216,9 +223,11 @@ export function buildBlockGroups(
     const sketch =
       kind === "NodeCodeBlock"
         ? buildCodeFourgramSketch(meaningfulLines.join("\n"))
-        : kind === "NodeHeading"
-          ? buildCompactBigramSketch(headingCoreText || joinedNormalizedText)
-          : buildCompactBigramSketch(joinedNormalizedText);
+        : kind === "NodeTableRow"
+          ? buildCompactBigramSketch(meaningfulLines.join("\n"))
+          : kind === "NodeHeading"
+            ? buildCompactBigramSketch(headingCoreText || joinedNormalizedText)
+            : buildCompactBigramSketch(joinedNormalizedText);
 
     groups.push({
       kind,
@@ -274,10 +283,6 @@ export function areBlockContainersCompatible(left: BlockGroup, right: BlockGroup
   return left.containerPath === right.containerPath || left.kind === "NodeParagraph";
 }
 
-function hasOpaqueInlineToken(unit: SemanticUnit, tokenPrefix: string): boolean {
-  return unit.format.includes(tokenPrefix);
-}
-
 export function scoreModifiedBlockPair(
   left: BlockGroup,
   right: BlockGroup,
@@ -326,7 +331,12 @@ export function scoreModifiedBlockPair(
     );
     const denom = Math.max(1, left.meaningfulLines.length + right.meaningfulLines.length);
     const rowSim = (2 * commonRows) / denom;
-    return 220 + Math.round(600 * rowSim) + 30 * commonRows;
+    const sketchSim = sortedMultisetDice(left.sketch, right.sketch);
+    if (rowSim >= 0.25 || sketchSim >= 0.35) {
+      const sim = Math.max(rowSim, sketchSim * 0.9);
+      return Math.round(220 + 600 * sim) + 30 * commonRows;
+    }
+    return isIsolatedOneToOne && sameContainer ? 120 : 0;
   }
 
   // `NodeParagraph` and single-unit atomic blocks (`NodeVideo`, `NodeHTMLBlock`, `NodeAttributeView`, etc.)
@@ -340,17 +350,6 @@ export function scoreModifiedBlockPair(
       (2 * sortedStringMultisetOverlap(left.sortedMeaningfulLines, right.sortedMeaningfulLines)) /
       Math.max(1, left.meaningfulLines.length + right.meaningfulLines.length);
     sim = Math.max(sim, lineSim);
-  }
-
-  if (sameContainer && left.units.length === 1 && right.units.length === 1) {
-    const uL = left.units[0]!;
-    const uR = right.units[0]!;
-    if (
-      (hasOpaqueInlineToken(uL, "img(") && hasOpaqueInlineToken(uR, "img(")) ||
-      (hasOpaqueInlineToken(uL, "inline-math(") && hasOpaqueInlineToken(uR, "inline-math("))
-    ) {
-      sim = Math.max(sim, 0.6);
-    }
   }
 
   if (!sameContainer) {

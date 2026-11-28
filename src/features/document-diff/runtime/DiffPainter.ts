@@ -10,6 +10,7 @@ import {
 } from "../model/types.ts";
 import {
   collectBlockCleanTextMap,
+  computeChangedTokenIndices,
   doesBlockTextMatchExpected,
   extractImageTokens,
   findDirectBlockImageElements,
@@ -153,6 +154,7 @@ export class DiffPainter {
 
     const blockExpectedLines = new Map<string, string[]>();
     const blockTotalUnitCount = new Map<string, number>();
+    const blockLineImageCounts = new Map<string, number[]>();
     for (const unit of allSideUnits) {
       if (!unit.blockID) continue;
       blockTotalUnitCount.set(unit.blockID, (blockTotalUnitCount.get(unit.blockID) ?? 0) + 1);
@@ -160,7 +162,23 @@ export class DiffPainter {
       const lines = blockExpectedLines.get(unit.blockID) ?? [];
       lines[unit.line] = unit.text;
       blockExpectedLines.set(unit.blockID, lines);
+      if (unit.format.includes("img(")) {
+        const imgCounts = blockLineImageCounts.get(unit.blockID) ?? [];
+        imgCounts[unit.line] = extractImageTokens(unit.format).length;
+        blockLineImageCounts.set(unit.blockID, imgCounts);
+      }
     }
+
+    const getLineImageStartOffset = (blockID: string, line: number): number => {
+      if (line <= 0) return 0;
+      const counts = blockLineImageCounts.get(blockID);
+      if (!counts) return 0;
+      let offset = 0;
+      for (let l = 0; l < line && l < counts.length; l++) {
+        offset += counts[l] ?? 0;
+      }
+      return offset;
+    };
 
     const blockOnlyUnitCount = new Map<string, number>();
     for (const hunk of result.hunks) {
@@ -189,6 +207,26 @@ export class DiffPainter {
       this.targets.push({ element, kind, hunkKey });
     };
 
+    const cleanTextCache = new Map<string, CleanBlockTextMap>();
+    const getCleanText = (blockID: string, blockEl: HTMLElement): CleanBlockTextMap => {
+      let cached = cleanTextCache.get(blockID);
+      if (!cached) {
+        cached = collectBlockCleanTextMap(blockEl);
+        cleanTextCache.set(blockID, cached);
+      }
+      return cached;
+    };
+
+    const blockImagesCache = new Map<string, HTMLElement[]>();
+    const getBlockImageElements = (blockID: string, blockEl: HTMLElement): HTMLElement[] => {
+      let cached = blockImagesCache.get(blockID);
+      if (!cached) {
+        cached = findDirectBlockImageElements(blockEl);
+        blockImagesCache.set(blockID, cached);
+      }
+      return cached;
+    };
+
     for (const hunk of result.hunks) {
       if (!matchesDiffFilter(hunk, filter)) continue;
 
@@ -209,23 +247,7 @@ export class DiffPainter {
           const peer = oppositeUnits[peerIdx];
           if (peer) pairedByOwnIdx.set(ownIdx, peer);
         }
-      } else if (sideUnits.length === oppositeUnits.length) {
-        for (let k = 0; k < sideUnits.length; k++) {
-          if (sideUnits[k]!.kind === oppositeUnits[k]!.kind) {
-            pairedByOwnIdx.set(k, oppositeUnits[k]!);
-          }
-        }
       }
-
-      const cleanTextCache = new Map<string, CleanBlockTextMap>();
-      const getCleanText = (blockID: string, blockEl: HTMLElement): CleanBlockTextMap => {
-        let cached = cleanTextCache.get(blockID);
-        if (!cached) {
-          cached = collectBlockCleanTextMap(blockEl);
-          cleanTextCache.set(blockID, cached);
-        }
-        return cached;
-      };
 
       sideUnits.forEach((unit, idx) => {
         if (!unit.blockID) return;
@@ -271,6 +293,17 @@ export class DiffPainter {
                 }
               }
             }
+            if (unit.format.includes("img(")) {
+              const ownImages = extractImageTokens(unit.format);
+              if (ownImages.length > 0) {
+                const blockImgEls = getBlockImageElements(unit.blockID, block);
+                const lineImageStartOffset = getLineImageStartOffset(unit.blockID, unit.line);
+                for (let localIdx = 0; localIdx < ownImages.length; localIdx++) {
+                  const imgEl = blockImgEls[lineImageStartOffset + localIdx];
+                  if (imgEl) addOverlayTarget(imgEl, "image-diff", hunk.key);
+                }
+              }
+            }
             addOverlayTarget(
               block,
               paintedOnlyLine || (Boolean(this.highlightSet) && textVerified && unit.text.length === 0)
@@ -282,20 +315,35 @@ export class DiffPainter {
           }
 
           addOverlayTarget(block, "only", hunk.key);
-          for (const imgEl of findDirectBlockImageElements(block)) {
+          for (const imgEl of getBlockImageElements(unit.blockID, block)) {
             addOverlayTarget(imgEl, "image-diff", hunk.key);
           }
           return;
         }
 
         // `hunk.kind === "modified"`
+        const pairedUnit = pairedByOwnIdx.get(idx);
         if (unit.tableRowIndex !== undefined) {
-          const rowEl = findTableRowElement(block, unit.tableRowIndex) ?? block;
+          const targetRowEl = findTableRowElement(block, unit.tableRowIndex);
+          const rowEl = targetRowEl ?? block;
           addOverlayTarget(rowEl, "modified-fill", hunk.key);
+          if (targetRowEl && unit.format.includes("img(")) {
+            const ownImages = extractImageTokens(unit.format);
+            if (ownImages.length > 0) {
+              const peerImages =
+                pairedUnit && pairedUnit.tableRowIndex !== undefined
+                  ? extractImageTokens(pairedUnit.format)
+                  : [];
+              const rowImgEls = findDirectBlockImageElements(targetRowEl);
+              for (const localIdx of computeChangedTokenIndices(ownImages, peerImages)) {
+                const imgEl = rowImgEls[localIdx];
+                if (imgEl) addOverlayTarget(imgEl, "image-diff", hunk.key);
+              }
+            }
+          }
           return;
         }
 
-        const pairedUnit = pairedByOwnIdx.get(idx);
         let paintedInlineText = false;
         let hasExactInlinePairing = false;
         let verifiedUnpairedEmptyLine = false;
@@ -334,16 +382,18 @@ export class DiffPainter {
           }
         }
 
-        // Highlight changed inline/standalone images inside modified blocks so opaque images are visually unmistakable.
-        const ownImages = extractImageTokens(unit.format);
-        if (ownImages.length > 0) {
-          const peerImages = pairedUnit ? extractImageTokens(pairedUnit.format) : [];
-          const blockImgEls = findDirectBlockImageElements(block);
-          blockImgEls.forEach((imgEl, imgIdx) => {
-            if (!pairedUnit || ownImages[imgIdx] !== peerImages[imgIdx]) {
-              addOverlayTarget(imgEl, "image-diff", hunk.key);
+        // Highlight changed inline/standalone images inside modified blocks using per-line cumulative offsets and LCS.
+        if (unit.format.includes("img(")) {
+          const ownImages = extractImageTokens(unit.format);
+          if (ownImages.length > 0) {
+            const peerImages = pairedUnit ? extractImageTokens(pairedUnit.format) : [];
+            const blockImgEls = getBlockImageElements(unit.blockID, block);
+            const lineImageStartOffset = getLineImageStartOffset(unit.blockID, unit.line);
+            for (const localIdx of computeChangedTokenIndices(ownImages, peerImages)) {
+              const imgEl = blockImgEls[lineImageStartOffset + localIdx];
+              if (imgEl) addOverlayTarget(imgEl, "image-diff", hunk.key);
             }
-          });
+          }
         }
 
         addOverlayTarget(

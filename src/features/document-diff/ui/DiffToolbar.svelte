@@ -1,6 +1,6 @@
 <script lang="ts">
+  import type { ToolbarActions, ToolbarViewState } from "../model/toolbarState.ts";
   import type { DiffFilter } from "../model/types.ts";
-  import type { ToolbarActions, ToolbarViewState } from "../runtime/DocumentDiffSession.ts";
 
   interface Props {
     getState: () => ToolbarViewState;
@@ -23,13 +23,22 @@
     return pathInfo ? `${sideLabel}: ${doc.title}\n${pathInfo}` : `${sideLabel}: ${doc.title}`;
   }
 
+  function clampToViewport(x: number, y: number, rect: DOMRect): { x: number; y: number } {
+    const maxX = Math.max(8, window.innerWidth - rect.width - 8);
+    const maxY = Math.max(8, window.innerHeight - rect.height - 8);
+    return {
+      x: Math.min(maxX, Math.max(8, x)),
+      y: Math.min(maxY, Math.max(8, y)),
+    };
+  }
+
   function onGripPointerDown(event: PointerEvent): void {
     if (event.button !== 0 || !toolbarEl) return;
     const rect = toolbarEl.getBoundingClientRect();
     const startX = customPos ? customPos.x : rect.left;
     const startY = customPos ? customPos.y : rect.top;
-    customPos = { x: startX, y: startY };
-    dragStart = { pointerX: event.clientX, pointerY: event.clientY, startX, startY };
+    customPos = clampToViewport(startX, startY, rect);
+    dragStart = { pointerX: event.clientX, pointerY: event.clientY, startX: customPos.x, startY: customPos.y };
     dragging = true;
     (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
     event.preventDefault();
@@ -37,12 +46,19 @@
 
   function onGripPointerMove(event: PointerEvent): void {
     if (!dragging || !toolbarEl) return;
-    const rect = toolbarEl.getBoundingClientRect();
-    const maxX = Math.max(8, window.innerWidth - rect.width - 8);
-    const maxY = Math.max(8, window.innerHeight - rect.height - 8);
-    const nextX = Math.min(maxX, Math.max(8, dragStart.startX + (event.clientX - dragStart.pointerX)));
-    const nextY = Math.min(maxY, Math.max(8, dragStart.startY + (event.clientY - dragStart.pointerY)));
-    customPos = { x: nextX, y: nextY };
+    customPos = clampToViewport(
+      dragStart.startX + (event.clientX - dragStart.pointerX),
+      dragStart.startY + (event.clientY - dragStart.pointerY),
+      toolbarEl.getBoundingClientRect(),
+    );
+  }
+
+  function onWindowResize(): void {
+    if (!customPos || !toolbarEl) return;
+    const clamped = clampToViewport(customPos.x, customPos.y, toolbarEl.getBoundingClientRect());
+    if (clamped.x !== customPos.x || clamped.y !== customPos.y) {
+      customPos = clamped;
+    }
   }
 
   function onGripPointerUp(event: PointerEvent): void {
@@ -73,6 +89,8 @@
     return items;
   });
 </script>
+
+<svelte:window onresize={onWindowResize} />
 
 <div
   bind:this={toolbarEl}

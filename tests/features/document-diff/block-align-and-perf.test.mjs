@@ -116,6 +116,10 @@ class LiteMockElement {
       if (exact && this.getAttribute(exact[1]) === exact[2]) return true;
       const word = /^\[([a-zA-Z0-9_-]+)~="([^"]+)"\]$/.exec(s);
       if (word && (this.getAttribute(word[1]) ?? "").split(/\s+/).includes(word[2])) return true;
+      const tagNotAttr = /^([a-zA-Z0-9_-]+):not\(\[([a-zA-Z0-9_-]+)\]\)$/.exec(s);
+      if (tagNotAttr && this.tagName === tagNotAttr[1].toUpperCase() && this.getAttribute(tagNotAttr[2]) === null) return true;
+      const attrHas = /^\[([a-zA-Z0-9_-]+)\]$/.exec(s);
+      if (attrHas && this.getAttribute(attrHas[1]) !== null) return true;
       if (this.tagName === s.toUpperCase()) return true;
     }
     return false;
@@ -839,4 +843,274 @@ test("long-document performance gate: 400-block head/tail edit (< 80 ms) and 400
   t.diagnostic(
     `perf: 400-head-tail=${anchorElapsedMs.toFixed(2)}ms, 400x400-all-modified=${allModElapsedMs.toFixed(2)}ms (avgLen=${units400AllModL[0].text.length})`,
   );
+});
+
+function buildTableHtml(id, rows) {
+  const trs = rows
+    .map((cells, rIdx) => {
+      const tag = rIdx === 0 ? "th" : "td";
+      return `<tr>${cells.map(c => `<${tag}>${c}</${tag}>`).join("")}</tr>`;
+    })
+    .join("");
+  return `<div data-node-id="${id}" data-type="NodeTable"><table><tbody>${trs}</tbody></table></div>`;
+}
+
+test("table alignment (A-01): rejects unrelated tables and shared-header small tables while pairing column-edited tables", () => {
+  // 1. Unrelated tables in a multi-block interval (0 common rows, distinct headers & bodies) -> left-only / right-only
+  const unrelatedLeft =
+    buildTableHtml(makeBlockID("tl", 1), [
+      ["主机名", "内网地址", "机房区域"],
+      ["gw-prod-01", "10.20.1.11", "cn-north-1a"],
+      ["gw-prod-02", "10.20.1.12", "cn-north-1b"],
+    ]) +
+    `<div data-node-id="${makeBlockID("tl", 2)}" data-type="NodeParagraph"><div contenteditable="true">附注：网络拓扑巡检清单</div></div>`;
+
+  const unrelatedRight =
+    buildTableHtml(makeBlockID("tr", 1), [
+      ["课程编号", "主讲教师", "学分"],
+      ["CS-301", "林教授", "4.0"],
+      ["MATH-204", "周老师", "3.5"],
+    ]) +
+    `<div data-node-id="${makeBlockID("tr", 2)}" data-type="NodeParagraph"><div contenteditable="true">选课指南：春季学期培养方案</div></div>`;
+
+  const unL = extractBlockDomUnits(makeBlockID("tl", 0), unrelatedLeft);
+  const unR = extractBlockDomUnits(makeBlockID("tr", 0), unrelatedRight);
+  const unDiff = alignUnits(unL.units, unR.units);
+  assert.equal(unDiff.counts.modified, 0, "Completely unrelated tables in multi-block gap must not pair as modified");
+  assert.equal(unDiff.counts.removed, 1);
+  assert.equal(unDiff.counts.added, 1);
+
+  // 2. Two unrelated small tables sharing identical generic header `参数 | 类型 | 说明` -> must NOT pair in 2v2 interval!
+  const sharedHeaderLeft =
+    buildTableHtml(makeBlockID("shl", 1), [
+      ["参数", "类型", "说明"],
+      ["maxRetries", "number", "请求失败后的最大重试次数"],
+      ["backoffMs", "number", "指数退避初始等待毫秒数"],
+    ]) +
+    `<div data-node-id="${makeBlockID("shl", 2)}" data-type="NodeParagraph"><div contenteditable="true">客户端网络容错策略</div></div>`;
+
+  const sharedHeaderRight =
+    buildTableHtml(makeBlockID("shr", 1), [
+      ["参数", "类型", "说明"],
+      ["avatarUrl", "string", "用户个人资料头像展示地址"],
+      ["nickname", "string", "社区公开昵称文本"],
+    ]) +
+    `<div data-node-id="${makeBlockID("shr", 2)}" data-type="NodeParagraph"><div contenteditable="true">个人主页资料展示卡片</div></div>`;
+
+  const shL = extractBlockDomUnits(makeBlockID("shl", 0), sharedHeaderLeft);
+  const shR = extractBlockDomUnits(makeBlockID("shr", 0), sharedHeaderRight);
+  const shDiff = alignUnits(shL.units, shR.units);
+  assert.equal(shDiff.counts.modified, 0, "Generic header alone must not pair unrelated tables");
+  assert.equal(shDiff.counts.removed, 1);
+  assert.equal(shDiff.counts.added, 1);
+
+  // 3. Same table with an added column in a 2v2 interval (`commonRows === 0` because every row changed, but `sketchSim >= 0.35`) -> pairs as modified!
+  const colEditLeft =
+    buildTableHtml(makeBlockID("cel", 1), [
+      ["接口路径", "鉴权级别"],
+      ["/api/v1/orders/create", "BearerToken"],
+      ["/api/v1/orders/cancel", "BearerToken"],
+      ["/api/v1/health/live", "Public"],
+    ]) +
+    `<div data-node-id="${makeBlockID("cel", 2)}" data-type="NodeParagraph"><div contenteditable="true">以上接口默认开启网关限流策略 v1。</div></div>`;
+
+  const colEditRight =
+    buildTableHtml(makeBlockID("cer", 1), [
+      ["接口路径", "鉴权级别", "超时阈值"],
+      ["/api/v1/orders/create", "BearerToken", "3000ms"],
+      ["/api/v1/orders/cancel", "BearerToken", "2000ms"],
+      ["/api/v1/health/live", "Public", "500ms"],
+    ]) +
+    `<div data-node-id="${makeBlockID("cer", 2)}" data-type="NodeParagraph"><div contenteditable="true">以上接口默认开启网关限流策略 v2。</div></div>`;
+
+  const ceL = extractBlockDomUnits(makeBlockID("cel", 0), colEditLeft);
+  const ceR = extractBlockDomUnits(makeBlockID("cer", 0), colEditRight);
+  const ceDiff = alignUnits(ceL.units, ceR.units);
+  assert.equal(ceDiff.counts.removed, 0);
+  assert.equal(ceDiff.counts.added, 0);
+  assert.ok(ceDiff.counts.modified >= 1, "Same table with an added column must still pair via body sketch similarity");
+});
+
+test("inline-math / image paragraphs (A-03) and sparse container filtering (A-05)", () => {
+  // 1. A-03: Two unrelated paragraphs that both happen to contain `$x$` in a multi-block gap must NOT pair as modified
+  const mathLeftHtml = [
+    `<div data-node-id="${makeBlockID("ml", 1)}" data-type="NodeParagraph"><div contenteditable="true">在梯度下降收敛证明中，令步长因子满足 <span contenteditable="false" data-type="inline-math" data-content="x"></span> 的李普希茨上界</div></div>`,
+    `<div data-node-id="${makeBlockID("ml", 2)}" data-type="NodeParagraph"><div contenteditable="true">由此可导出凸优化目标函数的全局误差界。</div></div>`,
+  ].join("");
+  const mathRightHtml = [
+    `<div data-node-id="${makeBlockID("mr", 1)}" data-type="NodeParagraph"><div contenteditable="true">仓库盘点时按货架编号 <span contenteditable="false" data-type="inline-math" data-content="x"></span> 逐箱核对冷链批次条码</div></div>`,
+    `<div data-node-id="${makeBlockID("mr", 2)}" data-type="NodeParagraph"><div contenteditable="true">出库复核单须由当班主管签字归档。</div></div>`,
+  ].join("");
+
+  const mL = extractBlockDomUnits(makeBlockID("ml", 0), mathLeftHtml);
+  const mR = extractBlockDomUnits(makeBlockID("mr", 0), mathRightHtml);
+  const mDiff = alignUnits(mL.units, mR.units);
+  assert.equal(mDiff.counts.modified, 0, "Unrelated paragraphs sharing only `$x$` must not pair in 2v2 interval");
+  assert.equal(mDiff.counts.removed, 1);
+  assert.equal(mDiff.counts.added, 1);
+
+  // 2. A-03 local 1x1 gap closure in `emitChainSteps`: standalone image replacement between two PAIRED modified paragraphs pairs cleanly
+  const sandwichLeft = [
+    `<div data-node-id="${makeBlockID("sl", 1)}" data-type="NodeParagraph"><div contenteditable="true">架构演进说明：第一阶段采用主从复制部署方案（v1）</div></div>`,
+    `<div data-node-id="${makeBlockID("sl", 2)}" data-type="NodeParagraph"><div contenteditable="true"><span contenteditable="false" data-type="img" class="img"><img data-src="assets/topo-v1.png" /></span></div></div>`,
+    `<div data-node-id="${makeBlockID("sl", 3)}" data-type="NodeParagraph"><div contenteditable="true">压测结论：写吞吐稳定在每秒 12000 事务左右</div></div>`,
+  ].join("");
+  const sandwichRight = [
+    `<div data-node-id="${makeBlockID("sr", 1)}" data-type="NodeParagraph"><div contenteditable="true">架构演进说明：第一阶段采用多活分片部署方案（v2）</div></div>`,
+    `<div data-node-id="${makeBlockID("sr", 2)}" data-type="NodeParagraph"><div contenteditable="true"><span contenteditable="false" data-type="img" class="img"><img data-src="assets/topo-v2.png" /></span></div></div>`,
+    `<div data-node-id="${makeBlockID("sr", 3)}" data-type="NodeParagraph"><div contenteditable="true">压测结论：写吞吐稳定在每秒 45000 事务左右</div></div>`,
+  ].join("");
+
+  const sL = extractBlockDomUnits(makeBlockID("sl", 0), sandwichLeft);
+  const sR = extractBlockDomUnits(makeBlockID("sr", 0), sandwichRight);
+  const sDiff = alignUnits(sL.units, sR.units);
+  assert.equal(sDiff.counts.removed, 0);
+  assert.equal(sDiff.counts.added, 0);
+  assert.equal(sDiff.counts.modified, 1);
+  assert.equal(sDiff.hunks[0].pairedUnits?.length, 3, "Middle standalone image in 1x1 local gap between paired blocks pairs 1:1");
+
+  // 3. A-05: Sparse DP inverted index ignores incompatible containers (10 list-nested code blocks sharing exact 4-grams do not crowd out Top-8)
+  const targetCodeLeft = "export function calculateInvoiceSubtotal(items: LineItem[]) {\n  return items.reduce((acc, it) => acc + it.price * it.qty, 0);\n}";
+  const targetCodeRight = "export function calculateInvoiceSubtotal(items: OrderItem[]) {\n  return items.reduce((acc, it) => acc + it.unitPrice * it.qty, 0);\n}";
+  const sparseLeftUnits = [
+    {
+      blockID: makeBlockID("spl", 1),
+      kind: "NodeCodeBlock",
+      context: "",
+      text: targetCodeLeft,
+      format: "|ts||",
+      target: "",
+      line: 0,
+      reliable: true,
+    },
+  ];
+  const sparseRightUnits = [
+    // 10 list-nested code blocks with identical text (`hitCounts` higher, closer to `centerJ = 0`), plus 10 filler paragraphs, then the real top-level TS block at j = 20 (outside diagonal band `0..4`!)
+    ...Array.from({ length: 10 }, (_, idx) => ({
+      blockID: makeBlockID("spr-list", idx + 1),
+      kind: "NodeCodeBlock",
+      context: "NodeList:u::::>NodeListItem:u::::",
+      text: targetCodeLeft,
+      format: "|ts||",
+      target: "",
+      line: 0,
+      reliable: true,
+    })),
+    ...Array.from({ length: 10 }, (_, idx) => ({
+      blockID: makeBlockID("spr-pad", idx + 1),
+      kind: "NodeParagraph",
+      context: "",
+      text: `填充段落 ${idx}`,
+      format: "|||",
+      target: "",
+      line: 0,
+      reliable: true,
+    })),
+    {
+      blockID: makeBlockID("spr-top", 1),
+      kind: "NodeCodeBlock",
+      context: "",
+      text: targetCodeRight,
+      format: "|ts||",
+      target: "",
+      line: 0,
+      reliable: true,
+    },
+  ];
+
+  const gL = buildBlockGroups(sparseLeftUnits, sparseLeftUnits.map(semanticKey));
+  const gR = buildBlockGroups(sparseRightUnits, sparseRightUnits.map(semanticKey));
+  const sparseOut = [];
+  assert.equal(
+    emitSparseBlockFenwickDP(gL, gR, 0, gL.length, 0, gR.length, { remaining: 200_000, maxCells: 200_000 }, sparseOut),
+    true,
+  );
+  assert.ok(
+    sparseOut.some(step => step.type === "paired-block" && step.leftBlock === 0 && step.rightBlock === 20),
+    "Top-level code block at j=20 must not be crowded out of Top-8 inverted candidates by list-nested code blocks",
+  );
+});
+
+test("table row images (A-06) and parenthesized multi-line image offsets (B-BUG-07) paint accurate image-diff boxes", () => {
+  // 1. A-06: Added table row containing an image paints `image-diff` on the image wrapper inside `<tr>`
+  const tblIdL = makeBlockID("u", 1);
+  const tblIdR = makeBlockID("v", 1);
+  const leftTableHtml = buildTableHtml(tblIdL, [
+    ["模块", "示意图"],
+    ["网关", "无"],
+  ]);
+  const rightTableHtml = buildTableHtml(tblIdR, [
+    ["模块", "示意图"],
+    ["网关", "无"],
+    ["存储", `<span contenteditable="false" data-type="img" class="img"><img data-src="assets/diagram (1).png" /></span>`],
+  ]);
+
+  const extTblL = extractBlockDomUnits(makeBlockID("u", 0), leftTableHtml);
+  const extTblR = extractBlockDomUnits(makeBlockID("v", 0), rightTableHtml);
+  const tblDiff = alignUnits(extTblL.units, extTblR.units);
+
+  withHighlightDomEnv(registry => {
+    const tblBlock = new LiteMockElement("DIV", { "data-node-id": tblIdR, "data-type": "NodeTable" });
+    tblBlock._rect = { left: 16, top: 20, right: 480, bottom: 220, width: 464, height: 200 };
+    const tr0 = new LiteMockElement("TR");
+    tr0._rect = { left: 16, top: 20, right: 480, bottom: 60, width: 464, height: 40 };
+    const tr1 = new LiteMockElement("TR");
+    tr1._rect = { left: 16, top: 60, right: 480, bottom: 100, width: 464, height: 40 };
+    const tr2 = new LiteMockElement("TR");
+    tr2._rect = { left: 16, top: 100, right: 480, bottom: 180, width: 464, height: 80 };
+    const td = new LiteMockElement("TD");
+    const imgSpan = new LiteMockElement("SPAN", { contenteditable: "false", "data-type": "img", class: "img" });
+    imgSpan._rect = { left: 80, top: 108, right: 200, bottom: 172, width: 120, height: 64 };
+    const imgEl = new LiteMockElement("IMG", { "data-src": "assets/diagram (1).png" });
+    imgSpan.append(imgEl);
+    td.append(imgSpan);
+    tr2.append(td);
+    tblBlock.append(tr0, tr1, tr2);
+
+    const rightProtyle = buildPaintableProtyle([tblBlock]);
+    const rightPainter = new DiffPainter(rightProtyle, "right");
+    rightPainter.paint(tblDiff, extTblR.units);
+    const overlay = rightProtyle.element.children.find(c => c.className === "omnikit-document-diff-overlay");
+    const imgBoxes = overlay.children.filter(b => b.style.border.includes("2px solid"));
+    assert.equal(imgBoxes.length, 1, "Added table row `<tr>` image receives `image-diff` border box");
+    assert.equal(imgBoxes[0].style.top, "108px");
+    rightPainter.dispose();
+    registry.clear();
+  });
+
+  // 2. B-BUG-07: Multi-line paragraph where line 0 has an unchanged image and line 1 updates `shot (1).png` -> `shot (2).png`
+  const pIdL = makeBlockID("w", 1);
+  const pIdR = makeBlockID("y", 1);
+  const multiLineLeftHtml = `<div data-node-id="${pIdL}" data-type="NodeParagraph"><div contenteditable="true">导览图 <span contenteditable="false" data-type="img" class="img"><img data-src="assets/keep (0).png" /></span><br>步骤图 <span contenteditable="false" data-type="img" class="img"><img data-src="assets/same.png" /></span> 与 <span contenteditable="false" data-type="img" class="img"><img data-src="assets/shot (1).png" data-title="截图 (旧)" /></span></div></div>`;
+  const multiLineRightHtml = `<div data-node-id="${pIdR}" data-type="NodeParagraph"><div contenteditable="true">导览图 <span contenteditable="false" data-type="img" class="img"><img data-src="assets/keep (0).png" /></span><br>步骤图 <span contenteditable="false" data-type="img" class="img"><img data-src="assets/same.png" /></span> 与 <span contenteditable="false" data-type="img" class="img"><img data-src="assets/shot (2).png" data-title="截图 (新)" /></span></div></div>`;
+
+  const mlL = extractBlockDomUnits(makeBlockID("w", 0), multiLineLeftHtml);
+  const mlR = extractBlockDomUnits(makeBlockID("y", 0), multiLineRightHtml);
+  const mlDiff = alignUnits(mlL.units, mlR.units);
+  assert.equal(mlDiff.matches.length, 1, "Line 0 with `keep (0).png` matches strictly");
+  assert.equal(mlDiff.counts.modified, 1, "Line 1 with `shot (1).png` -> `shot (2).png` is detected as modified despite parentheses");
+
+  withHighlightDomEnv(() => {
+    const paraBlock = new LiteMockElement("DIV", { "data-node-id": pIdR, "data-type": "NodeParagraph" });
+    paraBlock._rect = { left: 16, top: 20, right: 480, bottom: 260, width: 464, height: 240 };
+    const mkImgWrap = (src, top) => {
+      const span = new LiteMockElement("SPAN", { contenteditable: "false", "data-type": "img", class: "img" });
+      span._rect = { left: 40, top, right: 160, bottom: top + 50, width: 120, height: 50 };
+      span.append(new LiteMockElement("IMG", { "data-src": src }));
+      return span;
+    };
+    const imgKeep = mkImgWrap("assets/keep (0).png", 30);
+    const imgSame = mkImgWrap("assets/same.png", 110);
+    const imgChanged = mkImgWrap("assets/shot (2).png", 180);
+    paraBlock.append(imgKeep, new LiteMockElement("BR"), imgSame, imgChanged);
+
+    const rightProtyle = buildPaintableProtyle([paraBlock]);
+    const rightPainter = new DiffPainter(rightProtyle, "right");
+    rightPainter.paint(mlDiff, mlR.units);
+    const overlay = rightProtyle.element.children.find(c => c.className === "omnikit-document-diff-overlay");
+    const imgBoxes = overlay.children.filter(b => b.style.border.includes("2px solid"));
+    assert.equal(imgBoxes.length, 1, "Only the 3rd image (`shot (2).png` at index 2) should be marked `image-diff`");
+    assert.equal(imgBoxes[0].style.top, "180px", "Must apply lineImageStartOffset=1 + localIdx=1 = index 2");
+    rightPainter.dispose();
+  });
 });

@@ -37,6 +37,19 @@ export interface ScrollSyncCallbacks {
   ) => number | void;
 
   /**
+   * Optional predicate returning `true` when cross-pane scroll echoing must be suppressed
+   * (for example, while cross-slice centered hunk navigation is still settling).
+   */
+  shouldSuppressSync?: (fromSide: Side) => boolean;
+
+  /**
+   * Whether `ScrollSync` should attach its own bubble-phase gesture listeners (`wheel`, `touchstart`,
+   * `pointerdown`, `keydown`) on scrollers. Defaults to `true`; `DocumentDiffSession` passes `false`
+   * because it already binds capture-phase `bindProtyleScrollGestures` on `.protyle` roots.
+   */
+  bindGestureListeners?: boolean;
+
+  /**
    * Optional structured diagnostic callback for scroll synchronization events.
    */
   onDebug?: (stage: string, detail: Record<string, unknown>, throttleKey?: string) => void;
@@ -146,22 +159,24 @@ export class ScrollSync {
   }
 
   private bindSide(side: Side, element: ScrollerLike): void {
-    const onIntent: EventListener = (event: Event) => {
-      if (event.type === "keydown") {
-        const key = (event as KeyboardEvent).key;
-        if (typeof key === "string" && !SCROLL_INTENT_KEYS.has(key)) {
-          return;
+    if (this.callbacks.bindGestureListeners !== false) {
+      const onIntent: EventListener = (event: Event) => {
+        if (event.type === "keydown") {
+          const key = (event as KeyboardEvent).key;
+          if (typeof key === "string" && !SCROLL_INTENT_KEYS.has(key)) {
+            return;
+          }
         }
+        this.notifyUserIntent(side);
+      };
+      for (const eventName of ["wheel", "touchstart", "pointerdown", "keydown"]) {
+        element.addEventListener(eventName, onIntent, { passive: true });
+        this.listeners.push(() => element.removeEventListener(eventName, onIntent));
       }
-      this.notifyUserIntent(side);
-    };
+    }
     const onScroll: EventListener = () => {
       this.handleScroll(side);
     };
-    for (const eventName of ["wheel", "touchstart", "pointerdown", "keydown"]) {
-      element.addEventListener(eventName, onIntent, { passive: true });
-      this.listeners.push(() => element.removeEventListener(eventName, onIntent));
-    }
     element.addEventListener("scroll", onScroll, { passive: true });
     this.listeners.push(() => element.removeEventListener("scroll", onScroll));
   }
@@ -253,6 +268,7 @@ export class ScrollSync {
     if (!this.active || !this.enabled) return false;
     const currentTime = this.now();
     if (currentTime < this.suspendedUntil) return false;
+    if (this.callbacks.shouldSuppressSync?.(side)) return false;
 
     const own = side === "left" ? this.left : this.right;
     const other = side === "left" ? this.right : this.left;

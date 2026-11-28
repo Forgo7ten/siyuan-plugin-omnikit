@@ -9,6 +9,7 @@ import {
   type DomElementLike,
   type DomNodeLike,
 } from "./domParser.ts";
+import { isValidBlockID } from "./types.ts";
 
 export const VOLATILE_BLOCK_ATTRS = new Set([
   "id",
@@ -67,21 +68,27 @@ export function extractBlockLinkTargetID(href: string): string | undefined {
   const rest = href.slice(SIYUAN_BLOCK_LINK_PREFIX.length);
   const cut = rest.search(/[?#]/);
   const id = cut >= 0 ? rest.slice(0, cut) : rest;
-  return /^\d{14}-[a-zA-Z0-9]{7}$/.test(id) ? id : undefined;
+  return isValidBlockID(id) ? id : undefined;
+}
+
+function escapeImageTokenPart(value: string): string {
+  return value.replace(/\(/g, "%28").replace(/\)/g, "%29");
 }
 
 export function readImageAttributes(imgEl: DomElementLike | undefined, wrapperEl?: DomElementLike): string {
-  const src = imgEl?.getAttribute("data-src") ?? imgEl?.getAttribute("src") ?? "";
-  const alt = imgEl?.getAttribute("alt") ?? "";
+  const src = escapeImageTokenPart(imgEl?.getAttribute("data-src") ?? imgEl?.getAttribute("src") ?? "");
+  const alt = escapeImageTokenPart(imgEl?.getAttribute("alt") ?? "");
   // SiYuan `imageTitle.ts` moves `title` to `data-title` in live Protyle DOM.
-  const title = imgEl?.getAttribute("data-title") ?? imgEl?.getAttribute("title") ?? "";
+  const title = escapeImageTokenPart(imgEl?.getAttribute("data-title") ?? imgEl?.getAttribute("title") ?? "");
   const containerEl = wrapperEl
     ? (findFirstDescendant(wrapperEl, c => hasClass(c, "protyle-image-container")) ?? wrapperEl)
     : undefined;
-  const widthStyle = normalizeInlineStyle(
-    containerEl?.getAttribute("style") ??
-      wrapperEl?.getAttribute("style") ??
-      (imgEl?.getAttribute("width") ? `width:${imgEl.getAttribute("width")}` : ""),
+  const widthStyle = escapeImageTokenPart(
+    normalizeInlineStyle(
+      containerEl?.getAttribute("style") ??
+        wrapperEl?.getAttribute("style") ??
+        (imgEl?.getAttribute("width") ? `width:${imgEl.getAttribute("width")}` : ""),
+    ),
   );
   return `img(${src}|${alt}|${title}|${widthStyle})`;
 }

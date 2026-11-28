@@ -6,7 +6,12 @@ import {
 import type { DocumentSnapshot } from "./KernelSnapshot.ts";
 
 export interface LiveProtyleView {
-  block?: { rootID?: string };
+  block?: {
+    rootID?: string;
+    id?: string;
+    showAll?: boolean;
+    scroll?: boolean;
+  };
   wysiwyg?: { element?: HTMLElement };
   title?: {
     editElement?: HTMLElement;
@@ -42,7 +47,8 @@ function isAtomicLiveBlock(el: HTMLElement): boolean {
 
 /**
  * Verifies that every atomic block currently mounted in `protyle.wysiwyg.element`
- * matches the canonical kernel snapshot using the exact same structural signature extractor.
+ * matches the canonical kernel snapshot in strictly increasing snapshot order,
+ * and matches full atomic block count when the view is neither virtualized nor folded.
  */
 export function verifyVisibleParity(
   view: LiveProtyleView,
@@ -62,18 +68,37 @@ export function verifyVisibleParity(
     }
   }
 
+  const orderByBlockID = new Map<string, number>();
+  let nextOrder = 0;
+  for (const id of snapshot.parityByBlockID.keys()) {
+    orderByBlockID.set(id, nextOrder++);
+  }
+
   const allNodes = Array.from(wysiwyg.querySelectorAll<HTMLElement>("[data-node-id]"));
+  let hasFoldedBlock = false;
+  let prevOrder = -1;
   let checkedCount = 0;
+
   for (const block of allNodes) {
     if (isEmbedBlock(block, wysiwyg)) continue;
+    if (block.getAttribute("fold") === "1" || block.getAttribute("heading-fold") === "1") {
+      hasFoldedBlock = true;
+    }
     if (!isAtomicLiveBlock(block)) continue;
+
+    const id = block.getAttribute("data-node-id");
+    if (!id) continue;
+    const order = orderByBlockID.get(id);
+    if (order === undefined || order <= prevOrder) {
+      return false;
+    }
+    prevOrder = order;
+
     // Large tables (>256 rows) virtualize offscreen rows via `tr[data-sy-table-virtual-rows]` in live DOM.
     if (block.getAttribute("data-type") === "NodeTable" && block.querySelector("tr[data-sy-table-virtual-rows]")) {
       checkedCount++;
       continue;
     }
-    const id = block.getAttribute("data-node-id");
-    if (!id) continue;
     const kernelSig = snapshot.parityByBlockID.get(id);
     if (kernelSig === undefined) {
       return false;
@@ -88,5 +113,10 @@ export function verifyVisibleParity(
     checkedCount++;
   }
 
+  const isVirtualized = Boolean(view.block?.scroll);
+  const isZoomedSubtree = Boolean(view.block?.id && view.block.id !== snapshot.id && !view.block.showAll);
+  if (!isVirtualized && !isZoomedSubtree && !hasFoldedBlock) {
+    return checkedCount === snapshot.parityByBlockID.size;
+  }
   return checkedCount > 0 || snapshot.parityByBlockID.size === 0;
 }

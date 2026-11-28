@@ -33,19 +33,19 @@ flowchart TD
         subgraph Runtime["runtime/ (运行期会话与交互)"]
             Pair["VisiblePair.ts (可见双栏几何校验 / 无损分屏展开 / Wnd 原地左右对调)"]
             Snapshot["KernelSnapshot.ts (事务刷新 + getBlockDOM 快照读取)"]
-            Parity["VisibleParity.ts (实时已加载块与内核快照同构一致性核验)"]
+            Parity["VisibleParity.ts (实时已加载块单调序与内核快照同构核验)"]
             Gate["DirtyGate.ts & ComputeCoordinator.ts (修订代次 / 分侧 IME / 400ms 防抖)"]
             Painter["DiffPainter.ts & domTextRanges.ts (CSS.highlights 行内着色 + 外置浮层)"]
-            Scroll["ScrollSync.ts & ViewportSliceSync.ts (锚点同步滚动 + 虚拟分片加载协同)"]
+            Scroll["ScrollSync.ts, ViewportSliceSync.ts & mountedDomIndex.ts (锚点同步滚动 + 虚拟分片协同)"]
             Picker["ManualPicker.ts (手动搜索指定文档弹窗)"]
-            Session["DocumentDiffSession.ts (状态机 / 筛选 / 跨视口导航协调 / 资源释放)"]
+            Session["DocumentDiffSession.ts & wsMainFilter.ts (状态机 / 事件过滤 / 导航协调 / 资源释放)"]
         end
 
         subgraph Model["model/ (纯函数模型与对齐引擎)"]
-            Types["types.ts & settings.ts (数据结构 / 筛选器 / 配置 Codec)"]
+            Types["types.ts, settings.ts & toolbarState.ts (数据结构 / 配置 Codec / 工具栏视图模型)"]
             Conflict["conflict.ts (冲突后缀解析 / 公历时间校验 / 同父目录精确配对)"]
             Extractor["BlockDomExtractor.ts, domParser.ts & inlineRuns.ts (离屏 BlockDOM 语义抽取)"]
-            Align["DiffEngine.ts, blockSimilarity.ts, blockAlign.ts & InlineDiff.ts (双层对齐引擎)"]
+            Align["DiffEngine.ts, blockSimilarity.ts, blockAlign.ts, sparseBlockAlign.ts, intraBlockAlign.ts & InlineDiff.ts (双层对齐引擎)"]
             Anchors["anchors.ts & blockMapping.ts (单调锚点链与跨侧块映射)"]
         end
 
@@ -84,36 +84,41 @@ flowchart TD
 ```text
 src/features/document-diff/
 ├── registration.ts                  # defineFeature 注册声明（frontends / defaultEnabled / codec）
-├── DocumentDiffFeature.ts           # BaseFeature 子类：三入口菜单贡献、冲突自动匹配与会话单例调度
+├── DocumentDiffFeature.ts           # BaseFeature 子类：三入口菜单贡献、冲突自动匹配、删文档通知核对与会话单例调度
 ├── host/
 │   └── SiyuanBridge.ts              # 唯一导入 siyuan 运行时值（getAllModels / openTab / Dialog）的薄适配器
 ├── model/
 │   ├── settings.ts                  # DocumentDiffConfig 类型与 StoreCodec 校验器
-│   ├── types.ts                     # SemanticUnit、DiffHunk、DiffUnitPair、DiffFilter、SessionStatus 等领域模型
+│   ├── types.ts                     # SemanticUnit、DiffHunk、DiffUnitPair、DiffFilter、isValidBlockID 等领域模型
+│   ├── toolbarState.ts              # 工具栏视图状态模型、动作契约与状态文案格式化纯函数
 │   ├── conflict.ts                  # 冲突后缀正则/UTC 日历校验、父路径计算、同父目录唯一原文档解析
 │   ├── domParser.ts                 # 离屏 BlockDOM 解析器、HTML 实体解码与轻量回退节点树
 │   ├── inlineRuns.ts                # 可编辑行内片段、引用标记、代码行、表格行与多媒体元数据提取
 │   ├── BlockDomExtractor.ts         # 块树上下文遍历、内部块引用两遍指纹归一化与同构校验签名
-│   ├── blockSimilarity.ts           # BlockGroup 聚合、代码语言解析、预计算有序 Uint32Array 特征草图与配对评分
-│   ├── blockAlign.ts                # 前置唯一锚点切分、小区间稠密 DP 与大区间倒排候选 + 树状数组稀疏单调配对
-│   ├── DiffEngine.ts                # 块内防缩进错位加权行对齐、差异组组装与导航游标保持
+│   ├── blockSimilarity.ts           # BlockGroup 聚合、代码语言解析、表体/文本/代码有序 Uint32Array 特征草图与配对评分
+│   ├── blockAlign.ts                # 前置唯一锚点切分、小区间稠密 DP、1×1 局部槽位收口与顶层块组对齐
+│   ├── sparseBlockAlign.ts          # 三通道稀疏候选生成（容器兼容过滤）与二维后缀最大树状数组求解器
+│   ├── intraBlockAlign.ts           # 已配对块组内的唯一精确行 LIS 切分与防缩进错位加权逻辑行对齐
+│   ├── DiffEngine.ts                # 顶层预算协调、一二级对齐串联、差异组组装与导航游标保持
 │   ├── InlineDiff.ts                # 配对修改块内的二级行内 Token LCS 区间计算与 UTF-16 偏移验证
-│   ├── anchors.ts                   # 匹配块几何投影、严格单调锚点链筛选与分段线性插值
-│   └── blockMapping.ts              # 基于匹配锚点、差异组与根块比例的跨侧目标块纯函数映射
+│   ├── anchors.ts                   # 匹配块几何投影、严格单调锚点链筛选与 O(log N) 分段线性插值
+│   └── blockMapping.ts              # 基于匹配锚点、差异组与根块比例的跨侧目标块与最近匹配锚点映射
 ├── runtime/
 │   ├── KernelSnapshot.ts            # 刷新编辑器待提交事务后并发读取 getDocInfo / getHPathByID / getBlockDOM
-│   ├── VisiblePair.ts               # 可见双栏几何判定、单栏/已有双栏无损展开、基于 Wnd 的原地交换左右
-│   ├── VisibleParity.ts             # 基于同构语义签名的实时可见叶子块与内核快照一致性核验
+│   ├── VisiblePair.ts               # 可见双栏几何判定（含 wysiwyg 可见性）、单栏/已有双栏无损展开、Wnd 原地交换左右
+│   ├── VisibleParity.ts             # 基于同构语义签名、严格递增块序与非折叠全文块数的实时可见块核验
 │   ├── DirtyGate.ts                 # 分侧编辑修订号与已核实水位门控
-│   ├── ComputeCoordinator.ts        # 分侧 IME 组合挂起、400ms 防抖、代次票据与 AbortController 协调
+│   ├── ComputeCoordinator.ts        # 分侧 IME 组合挂起、400ms 防抖、在途状态查询与 AbortController 协调
 │   ├── ScrollSync.ts                # 双向内容锚点滚动跟随、期望位置容差过滤与用户手势抢占
-│   ├── ViewportSliceSync.ts         # 已挂载块扫描、长文档虚拟分片相邻/远端加载对齐与跨视口块聚焦
-│   ├── domTextRanges.ts             # 实时可编辑块净文本槽位构建、偏移核验与 DOM Range 转换
+│   ├── mountedDomIndex.ts           # 实时已挂载 DOM 块扫描、顶层块区间统计、滚动锚点链与阅读块几何查询
+│   ├── ViewportSliceSync.ts         # 长文档虚拟分片相邻/远端加载对齐与原地跨视口块导航聚焦
+│   ├── wsMainFilter.ts              # 基于 context.rootIDs 与比较文档/笔记本身份的 ws-main 消息分类纯函数
+│   ├── domTextRanges.ts             # 实时可编辑块净文本槽位构建、偏移核验、DOM Range 转换与块/行内图片提取
 │   ├── DiffPainter.ts               # 独立键 CSS.highlights 渲染 + 外置浮层绘制（对齐思源 _history.scss）
 │   ├── ManualPicker.ts              # 基于 /api/filetree/searchDocs 的跨目录手动比较对象选择弹窗
-│   └── DocumentDiffSession.ts       # 会话主状态机、分类筛选、导航调度、工具栏挂载与全量资源回收
+│   └── DocumentDiffSession.ts       # 会话主状态机、分类筛选、导航调度、页签可见性观察、工具栏挂载与全量资源回收
 └── ui/
-    ├── DiffToolbar.svelte               # Svelte 5 可拖拽浮动工具栏（身份展示、分类胶囊、导航与控制动作）
+    ├── DiffToolbar.svelte               # Svelte 5 可拖拽浮动工具栏（含窗口缩放边界钳制、身份展示、分类胶囊与控制动作）
     ├── ToolbarStateBridge.svelte        # Svelte 5 工具栏响应式状态桥接组件
     ├── mountDiffToolbar.ts              # 工具栏容器挂载、状态更新与卸载工厂
     └── DocumentDiffSettingsPanel.svelte # Svelte 5 设置卡片（实现 DraftParticipant 协议）
@@ -146,7 +151,7 @@ src/features/document-diff/
 遍历 `host.getAllModels().editor`，仅保留同时满足以下条件的实例：
 - 持有非空 `rootID`（`model.editor.protyle.block.rootID`）、已连接的 `.protyle` 与 `.protyle-wysiwyg` 元素；
 - 位于主工作区窗格 `[data-type="wnd"]` 内（且位于 `#layouts .layout__center` 主编辑区，排除侧边栏 Dock、弹窗、悬浮窗 `block__popover`、搜索与反链内嵌编辑器）；
-- 所属页签头 `model.headElement` 具有 `item--focus` 类（排除后台隐藏标签页），面板与窗格计算样式均可见且非零矩形；
+- 所属页签头 `model.headElement` 具有 `item--focus` 类（排除后台隐藏标签页），面板、窗格、`.protyle` 与 `.protyle-wysiwyg` 计算样式均可见且非零矩形（排除切入导出预览隐藏 `.protyle-content` 的只读态）；
 - `!protyle.options?.history`（排除历史对比只读实例）。
 
 当且仅当可见主编辑器数量等于 `2`、分属两个不同 `Wnd`、两侧 `rootID` 不同、纵向重叠高度 `> 0` 且水平方向呈左右并排（`left.rect.left < right.rect.left` 且 `left.rect.right <= right.rect.left + 24`）时，按 `rect.left` 升序返回 `[leftDoc, rightDoc]`。
@@ -154,10 +159,10 @@ src/features/document-diff/
 ### 3.2 单栏与已有双栏下的无损展开 (`openAndVerifyPair`)
 给定目标 `(leftID, rightID)`：
 1. 先向内核并发调用 `/api/block/getDocInfo` 校验两篇文档均存在且可读；
-2. 检查当前 `visibleMainEditors()`：
+2. 检查当前 `visibleMainEditors()` 与几何并排双栏 `findSideBySidePanes()`（兼容当前左右双栏恰好打开同一篇文档的场景）：
    - **已有匹配的左右分屏**：若当前恰好是 `[leftID, rightID]`，直接复用返回；若当前恰好是反向的 `[rightID, leftID]`，直接执行 3.3 节的原地交换使其变为 `[leftID, rightID]`；
    - **单窗格布局（`editors.length <= 1`）**：先在当前窗格调用 `openTab({ doc: { id: leftID }, removeCurrentTab: false })` 打开或激活左文档，再调用 `openTab({ doc: { id: rightID }, position: "right", removeCurrentTab: false })` 创建右侧分屏；
-   - **已有左右双窗格布局（`editors.length === 2` 且满足左右并排 `leftWnd` / `rightWnd`）**：保留两侧窗格中全部既有标签页不关闭：
+   - **已有左右双窗格布局（`findSideBySidePanes()` 命中左右并排 `leftWnd` / `rightWnd`）**：保留两侧窗格中全部既有标签页不关闭：
      - 若 `leftID` 已在 `rightWnd` 中且 `rightWnd` 仅有这 1 个标签页，或双侧互换，优先通过 `Wnd` 迁移与切换页签避免右窗格因空标签自动合并；
      - 常规情况：先将焦点切换至 `leftWnd`（激活其当前活动页签使 `leftWnd` 成为 `.layout__wnd--active`），若 `leftID` 已在 `leftWnd` 则直接 `leftWnd.switchTab`，否则在 `leftWnd` 打开新页签；随后将焦点切换至 `rightWnd`，若 `rightID` 已在 `rightWnd` 则 `rightWnd.switchTab`，否则在 `rightWnd` 打开新页签（若 `openTab` 因跨栏同名页签复用了 `leftWnd` 中的实例，将该 `Tab` 通过 `rightWnd.moveTab(tab)` 移入右窗格）；
    - **3 个及以上多窗格或上下分屏等复杂布局**：不自动拆改布局，抛出可读提示中止启动；
@@ -200,23 +205,23 @@ src/features/document-diff/
      - `NodeAttributeView` 由 `KernelSnapshot` 并发调用只读 `/api/av/getAttributeView` 提取有效属性视图对象（须含 `keyValues` 或 `views` 数组）的名称、列定义、视图配置与行单元格语义值构建签名（读取成功时 `reliable = true`，接口返回空 `av` 或读取失败时 `reliable = false` 归入 `unresolved` 待核对）；
    - **顶层根子块序号映射 (`rootBlockIndexByBlockID`)**：在遍历完整 BlockDOM 时，按思源内核 `GetBlockIndex` 的顶层直接子块计数口径（`1 .. rootBlockCount`），为每个块（含容器内嵌套子块）记录其所属顶层根子块的 1 基序号，供长文档虚拟滚动分片判断与跨分片同步滚动定位使用。
 
-### 4.3 双层块组单调配对、块内加权行对齐与行内二级 Diff (`blockSimilarity.ts`、`blockAlign.ts`、`DiffEngine.ts` & `InlineDiff.ts`)
+### 4.3 双层块组单调配对、块内加权行对齐与行内二级 Diff (`blockSimilarity.ts`、`blockAlign.ts`、`sparseBlockAlign.ts`、`intraBlockAlign.ts`、`DiffEngine.ts` & `InlineDiff.ts`)
 1. **一级同侧块组单调配对与块内加权逻辑行对齐 (`alignUnits`)**：
    - 沿用思源 `history_diff.go` 预算参数：单段计算预算上限 `maxCells = 2_000_000`，整篇总预算 `totalCells = 8_000_000`，单侧最大逻辑行数 `10,000`；
    - 比较键 `semanticKey(unit)` 由 `[kind, context, text, format, target]` 序列化构成，不含 `blockID`；仅当双侧 `unit.reliable === true` 且 `semanticKey` 相同时才判为严格相等（`=`），预计算特征草图与空白归一化仅用于修改候选配对评分，不参与相等判定；
    - **同侧块组聚合与特征草图预提取（`blockSimilarity.ts`）**：
      - 按本侧连续非空且相同的 `blockID` 将 `SemanticUnit[]` 还原为 `BlockGroup`（跨侧签名不含 `blockID`），独立解析 `format` 中的子类型 `subtype`（如标题级别、图表渲染类型）与代码块语言 `codeLang`；
-     - 在构造每个 `BlockGroup` 时一次性提取有序 `Uint32Array` 多重集合特征草图（超长块按固定上限等距抽样）：普通文本/标题/表格块使用双字符紧凑哈希草图，普通代码块在剔除空行与纯括号行的高信息量代码上提取 4 字符滚动哈希草图，消除配对循环内的重复字符串切分与哈希表分配；
-   - **前置唯一锚点切分与稠密/稀疏自适应块组配对（`blockAlign.ts`）**：
+     - 在构造每个 `BlockGroup` 时一次性提取有序 `Uint32Array` 多重集合特征草图（超长块按固定上限等距抽样）：普通文本/标题块使用双字符紧凑哈希草图，多行表格块（`NodeTableRow`）优先对第 1 行起的非空表体行提取 `meaningfulLines` 与双字符草图以剥离通用表头噪声，普通代码块在剔除空行与纯括号行的高信息量代码上提取 4 字符滚动哈希草图，消除配对循环内的重复字符串切分与哈希表分配；
+   - **前置唯一锚点切分与稠密/稀疏自适应块组配对（`blockAlign.ts` & `sparseBlockAlign.ts`）**：
      - 对任意块组区间先剥离严格相等的公共前后缀；当剩余区间规模大于 `1 × 1` 时，先提取双侧仅出现 1 次的非空高信息量精确匹配块组，经右侧下标最长递增子序列（LIS）切分为独立子区间（使被相同锚点隔开的局部改写各自精确落入 `1 × 1` 同槽位区间，同时避免长文档首尾小改触发全量区间比对）；
      - 切分后的无唯一锚点子区间按规模自适应求解最大权单调配对：
        - 小规模子区间（`n * m <= 1024`）：直接运行基于预计算草图的稠密动态规划，求完整候选矩阵的精确最优配对；
-       - 大规模无锚点子区间（`n * m > 1024`）：生成稀疏正权候选边后通过树状数组（Fenwick Tree）求解二维最大权严格递增子序列（同一左块的全部候选边先统一查询前驱、计算完成后再批量更新树状态并记录回溯链，保证左右下标严格递增）：候选集合同时纳入完整签名相同的重复精确块、右侧非高频特征倒排表命中的 `Top-K` 相似块，以及相对于当前子区间比例对角线的局部邻域块；倒排表遍历步数与特征归并步数统一计入 `maxCells` / `remainingCells` 预算，超预算时回退全量唯一可靠块锚点切分或产出 `kind: "unresolved"` 差异组；
+       - 大规模无锚点子区间（`n * m > 1024`）：由 `sparseBlockAlign.ts` 生成稀疏正权候选边后通过树状数组（Fenwick Tree）求解二维最大权严格递增子序列（同一左块的全部候选边先统一查询前驱、计算完成后再批量更新树状态并记录回溯链，保证左右下标严格递增）：候选集合同时纳入完整签名相同的重复精确块、右侧非高频特征倒排表中满足 `areBlockContainersCompatible` 的 `Top-K` 相似块，以及相对于当前子区间比例对角线的局部邻域块；倒排表遍历步数与特征归并步数统一计入 `maxCells` / `remainingCells` 预算，超预算时回退全量唯一可靠块锚点切分或产出 `kind: "unresolved"` 差异组；
      - 块组配对分类规则：
        - 严格等价的可靠块组直接产出逐行匹配（`=`），禁止跨不同块组边界产生逻辑行匹配锚点；
-       - 同位置变更块组按类型、容器层级与特征重合度建立一对一修改配对：普通代码块在整行重合度 `>= 0.25` 或 4 字符草图重合度 `>= 0.30` 时配对（覆盖任意行数的变量重命名与表达式批量替换，同时排斥仅共享语法样板的无关函数），段落与单行原子块在特征重合度 `>= 0.15` 时配对；在锚点切分后的 `1 × 1` 同容器槽位（代码块须同时满足相同代码语言或任一侧未标语言，标题须同级）上保留基础修改配对权重，多块变更区间内低重合度的无关块不强行配对；
+       - 同位置变更块组按类型、容器层级与特征重合度建立一对一修改配对：普通代码块在整行重合度 `>= 0.25` 或 4 字符草图重合度 `>= 0.30` 时配对（覆盖任意行数的变量重命名与表达式批量替换，同时排斥仅共享语法样板的无关函数），表格块（`NodeTableRow`）在表体整行重合度 `>= 0.25` 或表体草图重合度 `>= 0.35` 时配对，段落与单行原子块在文本特征重合度 `>= 0.15` 时配对；在精确锚点或已配对块切分后的 `1 × 1` 同容器局部槽位（由 `emitChainSteps` 统一收口，代码块须同时满足相同代码语言或任一侧未标语言，标题须同级）上保留基础修改配对权重，多块变更区间内无内容关联的块不强行配对；
        - 无对应关系的单侧整块保持未配对状态，按连续区间独立产出 `"left-only"`（左侧独有/删除）或 `"right-only"`（右侧新增）差异组，不并入相邻 `"modified"` 差异组；连续含不可靠单元的区间合并产出 `"unresolved"` 差异组；
-   - **已配对块组内的加权逻辑行对齐（`DiffEngine.ts`）**：在确认对应的多行修改块组内部，剥离相等前后缀后先对中大区间执行非空非纯括号唯一精确行 LIS 切分，再共享剩余预算执行无临时对象分配的加权动态规划（超预算时产出 `unresolved`）：严格相等行优先产出 `=`，高信息量代码/文本行的精确匹配与空白归一化相似权重高于独立闭合括号行与空行，且禁止不同括号分隔符模糊互配；确认对应的变更行在所属 `"modified"` 差异组中记录显式行对索引 `pairedUnits: Array<{ leftIndex: number; rightIndex: number }>`，相邻已配对修改块之间未被 `=` 分隔的变更单元合并为单个 `"modified"` 差异组；
+   - **已配对块组内的加权逻辑行对齐（`intraBlockAlign.ts` & `DiffEngine.ts`）**：在确认对应的多行修改块组内部，剥离相等前后缀后先对中大区间执行非空非纯括号唯一精确行 LIS 切分，再共享剩余预算执行无临时对象分配的加权动态规划（超预算时产出 `unresolved`）：严格相等行优先产出 `=`，高信息量代码/文本行的精确匹配与空白归一化相似权重高于独立闭合括号行与空行，且禁止不同括号分隔符模糊互配；确认对应的变更行在所属 `"modified"` 差异组中记录显式行对索引 `pairedUnits: Array<{ leftIndex: number; rightIndex: number }>`，相邻已配对修改块之间未被 `=` 分隔的变更单元合并为单个 `"modified"` 差异组；
 2. **二级块内行内精细 Diff (`computeInlineDiffRanges`)**：
    - 对 `kind === "modified"` 差异组中由 `pairedUnits` 确认对应的逻辑行对，当存在可见文本变化时，仿照思源 `history_diff.go:799-838` 按字符码点执行带预算二级 LCS（单对上限 `200,000` 单元）；
    - 产出左右两侧在各自逻辑行内的变更 UTF-16 区间列表 `Array<{ start: number; end: number }>`：
@@ -238,8 +243,8 @@ src/features/document-diff/
 2. **通道二：`.protyle` 外置绝对定位只读浮层（块级背景、左侧指示条、图片高亮框与聚焦框）**：
    - 在 `.protyle` 根节点下（`.protyle-content` 同级，位于编辑区 DOM 树之外）挂载 `div.omnikit-document-diff-overlay`（`position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 2`）；
    - 按可视视口裁剪（`[viewport.top, viewport.bottom]`）绘制各可见差异块及块内变更图片（`span[data-type~="img"]`）的几何投影框：
-     - **`left-only` / `right-only` 整块**：左侧 `3px solid` 错误红/成功绿边框 + `15%` 混合底色；
-     - **`modified` 块**：左侧 `3px solid var(--b3-theme-primary)` 指示条（对齐思源 `[data-history-diff~="modified"]`）；绘制时按 `DiffHunk.pairedUnits` 解析显式配对单元（无 `pairedUnits` 的合成差异组仅在两侧长度相等且同下标单元 `kind` 相同时回退配对）：当成对逻辑行完成精确二级 LCS 比对且实时文本经核验一致时，仅对存在新增或删除字符的一侧绘制行内 `CSS.highlights`（单侧纯插入或纯删除时，未发生字符删改的对侧仅展示左侧 `3px` 主色指示条，不涂满整行或整块底色）；同一 `"modified"` 差异组内的单侧未配对非空行在文本核验通过时按该行范围绘制 `CSS.highlights` 并展示左侧 `3px` 主色指示条，单侧未配对空行（含代码块末尾空行或内部空行）在实时文本核验通过且支持 `CSS.highlights` 时同样仅展示左侧 `3px` 主色指示条而不升级整块底色；仅当文本完全相同而纯格式/属性变更、块属无可见文本节点的独立图片/图表渲染 `render-node`/音视频/HTML/数据库块、运行环境无 `CSS.highlights` 或实时文本偏移无法唯一证明时，补充 `12%` 左红/右绿弱底色，并对包含行内图片变化的段落中发生变更的 `.img[data-type~="img"]` 元素叠加对应侧边框与弱底色框；
+     - **`left-only` / `right-only` 整块与单侧表格行**：左侧 `3px solid` 错误红/成功绿边框 + `15%` 混合底色，并对该块或 `<tr>` 表格行直属的 `.img[data-type~="img"]` 元素叠加 `image-diff` 对应侧边框与弱底色框；
+     - **`modified` 块与修改表格行**：左侧 `3px solid var(--b3-theme-primary)` 指示条（对齐思源 `[data-history-diff~="modified"]`）；绘制时按 `DiffHunk.pairedUnits` 解析显式配对单元：当成对逻辑行完成精确二级 LCS 比对且实时文本经核验一致时，仅对存在新增或删除字符的一侧绘制行内 `CSS.highlights`（单侧纯插入或纯删除时，未发生字符删改的对侧仅展示左侧 `3px` 主色指示条，不涂满整行或整块底色）；同一 `"modified"` 差异组内的单侧未配对非空行在文本核验通过时按该行范围绘制 `CSS.highlights` 并展示左侧 `3px` 主色指示条，单侧未配对空行（含代码块末尾空行或内部空行）在实时文本核验通过且支持 `CSS.highlights` 时同样仅展示左侧 `3px` 主色指示条而不升级整块底色；仅当文本完全相同而纯格式/属性变更、块属无可见文本节点的独立图片/图表渲染 `render-node`/音视频/HTML/数据库块、运行环境无 `CSS.highlights` 或实时文本偏移无法唯一证明时，补充 `12%` 左红/右绿弱底色，并结合括号转义后的 `img(...)` 标记与同块前置行的累计图片偏移对 `[data-node-id]` 或 `<tr>` 表格行直属的发生变更的 `.img[data-type~="img"]` 元素精准叠加对应侧边框与弱底色框；
      - **`title` 差异**：在 `protyle.title.element` 投影位置绘制 `3px solid var(--b3-theme-primary)` 与对应侧红/绿弱底色；
      - **`unresolved` 待核对块**：左侧 `3px dashed var(--b3-theme-warning)` + `10%` 警示弱底色；
      - **当前聚焦差异组 (`focusedHunkKey`)**：附加 `2px solid var(--b3-theme-primary)` 聚焦脉冲边框（复刻思源 `history-diff-focus` 关键帧动画）；
@@ -280,27 +285,27 @@ sequenceDiagram
 ```
 
 ### 6.1 按需本地编辑核验 (`VisibleParity.ts`)
-仅当 `DirtyGate.isSidePending(side)` 为真（即该侧发生过本地输入且尚未确认落盘）时才运行 `verifyVisibleParity`；初始打开会话或未发生本地编辑的一侧在 `flushPendingTransactions` 后直接采信内核权威快照，避免思源运行时装饰（如大表格虚拟化行、未命名标题占位、图片延迟尺寸等）导致无编辑文档误入 `unconfirmed`。对存在待核实输入的侧，比对已加载非嵌入原子块的同构归一化签名（统一剥离行号、零宽边界字符、虚拟引用包装与运行时 `line-height` 样式，兼容空标题标记 `custom-sy-title-empty` 与图片 `data-title`）；连续重试达上限且期间无新输入时采信最新内核快照解除挂起。
+仅当 `DirtyGate.isSidePending(side)` 为真（即该侧发生过本地输入且尚未确认落盘）时才运行 `verifyVisibleParity`；初始打开会话或未发生本地编辑的一侧在 `flushPendingTransactions` 后直接采信内核权威快照，避免思源运行时装饰（如大表格虚拟化行、未命名标题占位、图片延迟尺寸等）导致无编辑文档误入 `unconfirmed`。对存在待核实输入的侧，按内核快照前序插入顺序核验实时已加载非嵌入原子块同时满足：① 快照序号严格单调递增（`order > prevOrder`，捕获块拖拽移动）；② 单块同构归一化签名一致（统一剥离行号、零宽边界字符、虚拟引用包装与运行时 `line-height` 样式，兼容空标题标记 `custom-sy-title-empty` 与图片 `data-title`）；③ 在无折叠节点且非虚拟滚动的完整根视图中，已核验原子块总数等于 `snapshot.parityByBlockID.size`（捕获整块删除）；连续重试达上限且期间无新输入时采信最新内核快照解除挂起。
 
 ---
 
-## 7. 双向内容锚点同步滚动与跨视口跳转 (`ScrollSync.ts`、`ViewportSliceSync.ts` & `DocumentDiffSession.ts`)
+## 7. 双向内容锚点同步滚动与跨视口跳转 (`ScrollSync.ts`、`mountedDomIndex.ts`、`ViewportSliceSync.ts` & `DocumentDiffSession.ts`)
 
-### 7.1 单遍挂载映射、锚点链插值与长文档跨分片同步 (`ScrollSync.ts`、`anchors.ts`、`blockMapping.ts` & `ViewportSliceSync.ts`)
+### 7.1 单遍挂载映射、锚点链插值与长文档跨分片同步 (`ScrollSync.ts`、`mountedDomIndex.ts`、`anchors.ts`、`blockMapping.ts` & `ViewportSliceSync.ts`)
 1. **单遍挂载块扫描与严格单调锚点链**：
-   - 每次滚动同步计算时，对左右两侧 `protyle.wysiwyg.element` 各执行一次非嵌入 `[data-node-id]` 挂载块扫描，构建 `Map<string, HTMLElement>` 及当前已挂载的顶层根子块序号区间 `[minRootIndex, maxRootIndex]`，每侧仅读取一次 `contentElement.getBoundingClientRect()`；
+   - 每次滚动同步计算时，由 `mountedDomIndex.ts` 对左右两侧 `protyle.wysiwyg.element` 各执行一次非嵌入 `[data-node-id]` 挂载块扫描，构建 `Map<string, HTMLElement>` 及当前已挂载的顶层根子块序号区间 `[minRootIndex, maxRootIndex]`（并在 `bottomBoundaryLoaded` 时记录末尾折叠标题），每侧仅读取一次 `contentElement.getBoundingClientRect()`；
    - 从已确认的 `DiffResult.matches` 与成对 `modified` / `unresolved` 差异组首块中提取双侧同时挂载在 DOM 中的块对，计算各自相对于 `protyle.contentElement` 内容顶部的纵向偏移，经 `monotoneAnchors`（LIS）生成 `leftY` 与 `rightY` 同时严格递增的单调锚点链；
 2. **同分片插值与边界块精确回退**：
-   - 当主动滚动侧的视口阅读锚线（`scrollTop + min(48, clientHeight * 0.15)`）落在已挂载单调锚点链范围内时，按二分查找与分段线性插值计算对侧目标 `scrollTop`；
+   - 当主动滚动侧的视口阅读锚线（`scrollTop + min(48, clientHeight * 0.15)`）落在已挂载单调锚点链范围内时，按 `O(log N)` 二分查找与分段线性插值计算对侧目标 `scrollTop`；
    - 若双侧当前已挂载分片无共同 `=` 锚点或阅读锚线超出锚点链外推距离，则取主动侧阅读锚线处的当前可见块，通过全量文档对齐结果（依次按精确匹配块、同差异组对应块、最近匹配锚点块、顶层块比例）映射为对侧目标块 `(targetBlockID, targetRootIndex)`；若 `targetRootIndex` 位于对侧已挂载区间 `[minRootIndex, maxRootIndex]` 内，直接按对侧该块（或折叠标题祖先块）与阅读锚线的相对进度换算对侧 `scrollTop`；
 3. **长文档跨分片动态加载协同（兼容 `.protyle-scroll` 加载块滚动条）**：
    - 同步写入对侧 `other.scrollTop = target` 前，联动更新 `otherProtyle.scroll.lastScrollTop`，避免触发思源 `scrollEvent` 的快速拖拽回退矫正（`scrollTop > lastScrollTop * 2`），并在向上逼近未加载顶边界时保持 `scrollTop >= 1` 以正常触发思源向上动态加载；
    - 当对侧目标 `targetRootIndex` 超出对侧当前已挂载分片 `[minRootIndex, maxRootIndex]` 时：
      - **相邻分片（距离在单次 `dynamicLoadBlocks` 窗口内）**：先将对侧滚动至视口边界，并调用 `otherProtyle.scroll.loadDynamic(otherProtyle, mode, { suppressFocus: true })` 预取相邻分片；
-     - **不相交远端分片（如双侧初始加载区间不同、用户拖动 `.protyle-scroll` 的 `b3-slider` 滑块或点击跳至首尾/翻页按钮）**：通过防抖调度更新对侧 `protyle.scroll` 滑块索引（预留前导上下文块并限制末尾起始索引上限以保证单次加载填满视口），以 `suppressFocus: true` 触发对侧加载目标分片（不夺取当前焦点、不切换活动窗格），待 `loaded-protyle-static` / `loaded-protyle-dynamic` 到达后立即将对侧 `targetBlockID` 对齐至阅读锚线并补绘差异高亮；
+     - **不相交远端分片（如双侧初始加载区间不同、用户拖动 `.protyle-scroll` 的 `b3-slider` 滑块或点击跳至首尾/翻页按钮）**：通过防抖调度更新对侧 `protyle.scroll` 滑块索引（预留前导上下文块、限制末尾起始索引上限并校正 `blockCount` 未定义时的滑块数值），以 `suppressFocus: true` 触发对侧加载目标分片（不夺取当前焦点、不切换活动窗格），待 `loaded-protyle-static` / `loaded-protyle-dynamic` 到达后立即将对侧 `targetBlockID` 对齐至阅读锚线并补绘差异高亮；
    - 非编辑态下的 `loaded-protyle-static` 事件（由虚拟滚动分片切换或导航触发，且文档根 ID 未变）直接复用内存 `DiffResult` 重绘高亮并执行待定滚动对齐，不重复发起 `/api/block/getBlockDOM` 全量重算；
 4. **防循环、手势抢占与调试诊断日志**：
-   - 在 `protyle.element` 捕获期监听用户物理手势（`wheel` / `touchstart` / `pointerdown` / `keydown` / `.b3-slider` 的 `input` 与 `change`），记录当前主动滚动侧；程序写入对侧 `scrollTop` 或触发对侧分片加载期间抑制反向回声，用户在对侧产生物理手势时立即取消挂起对齐并接管控制权；
+   - 在会话级 `protyle.element` 捕获期统一监听用户物理手势（`wheel` / `touchstart` / `pointerdown` / `keydown` / `.b3-slider` 的 `input` 与 `change`），记录当前主动滚动侧；程序写入对侧 `scrollTop`、执行跨视口导航或触发对侧分片加载期间抑制反向回声，用户在对侧产生物理手势时立即取消挂起对齐并接管控制权；
    - 接入 `Logger` 调试通道（受插件通用设置「调试日志」开关控制），输出快照顶层块范围、双方已挂载分片区间、锚点链命中/回退模式、跨分片 `loadDynamic` / `setIndex` 触发及分片到达后的对齐详情。
 
 ### 7.2 跨视口差异导航（兼容虚拟滚动）
@@ -309,9 +314,9 @@ sequenceDiagram
 2. 对左右两侧分别确定目标定位块 ID：
    - 若该侧在当前 `DiffHunk` 中含有自身单元，取其首个 `blockID`；
    - 若该侧无自身单元（例如右侧独有新增块，左侧在该处为空），在 `DiffResult.matches` 中查找紧邻该差异组逻辑下标 `leftIndex` 的前一个或后一个匹配锚点块 ID，使对侧同步跳转到同一上下文位置；
-3. **已加载块 vs 虚拟滚动未加载块**：
-   - 若目标块存在于 `protyle.wysiwyg.element` 中，直接调整 `contentElement.scrollTop` 使其居中，并设置 `focusedHunkKey` 触发 `DiffPainter` 绘制聚焦框动画；
-   - 若目标块因长文档虚拟滚动不在当前 DOM 中，先暂停本次滚动同步回声并聚焦目标侧窗格，调用宿主桥接传入 `action: ["cb-get-hl", "cb-get-context"]`（使思源走 `mode: 3` 上下文分片加载而非单块缩放聚焦），待 `MutationObserver` 观测到目标块挂载后自动补绘高亮与聚焦框。
+3. **已加载块/折叠祖先 vs 虚拟滚动未加载分片**：
+   - 若 `findMountedTargetElement` 在当前已加载分片中定位到目标块或其可见折叠祖先块，直接调整 `contentElement.scrollTop` 使其居中，并设置 `focusedHunkKey` 触发 `DiffPainter` 绘制聚焦框动画；
+   - 若目标块因长文档虚拟滚动不在当前已挂载分片中，登记 `alignMode: "center"` 的 `pendingSliceSync` 并原地调用该侧编辑器的 `executeDisjointSliceJump`（通过 `protyle.scroll` 加载目标分片，不调用 `openTab` 切换活动窗格、也不注入 `"cb-get-hl"` 污染正文块类名），待分片挂载后自动居中对齐并补绘高亮与外置聚焦脉冲框。
 
 ---
 
@@ -325,10 +330,15 @@ export interface DocumentDiffConfig {
 ```
 默认值 `{ defaultSyncScroll: true }`。`parseDocumentDiffConfig` 校验顶层为非数组纯对象，且 `defaultSyncScroll` 为布尔值（缺失时填默认值，类型非法时抛错触发 `JsonStore` 只读损坏保护）。
 
-### 8.2 会话销毁闭包 (`DocumentDiffSession.dispose`)
-任一退出条件（手动关闭、`destroy-protyle`、`switch-protyle` 检测到左右任一窗格活动文档根 ID 改变、比较目标失效、`FeatureScope` 中止、插件卸载）触发幂等 `dispose()`：
-1. 中止 `ComputeCoordinator`（清除防抖定时器、触发在途请求 `AbortController.abort()`）与核验重试定时器；
-2. 断开双侧 `MutationObserver`、`ResizeObserver` 与 `ScrollSync` 监听；
-3. 按逆序卸载全部浏览器捕获期事件（`input` / `compositionstart` / `compositionend` / `scroll`）与思源 `eventBus` 监听（`ws-main` / `loaded-protyle-dynamic` / `loaded-protyle-static` / `switch-protyle` / `destroy-protyle` / `sync-end`）；
-4. 调用双侧 `DiffPainter.dispose()`：清空 `Highlight` Range、从 `CSS.highlights` 删除私有键、移除注入的 `<style>` 与 `.omnikit-document-diff-overlay` 节点；
-5. 调用 Svelte 5 `unmount` 卸载并移除 `DiffToolbar.svelte` 挂载容器，保留宿主原有的双分屏编辑器与文档标签页不变。
+### 8.2 会话事件过滤、窗口自适应与销毁闭包 (`wsMainFilter.ts`、`DiffToolbar.svelte` & `DocumentDiffSession.ts`)
+- **`ws-main` 消息精确过滤与删文档通知协同**：
+  - `wsMainFilter.ts` 按比较会话双侧文档 `id` 与 `notebook` 分类 `ws-main` 消息（`transactions` 优先匹配内核 `context.rootIDs` 并回退已知块表）；当本地输入已进入 `dirty.pending` 且 `ComputeCoordinator.isScheduledOrRunning` 为真时，忽略自身编辑落盘广播避免重置 400ms 防抖或中断在途快照读取；非本地输入态下的相关事务直接立即刷新；
+  - 因思源删除文档或关闭笔记本时，`switch-protyle`、面板类名变更或 `Protyle` 自有 WebSocket 派发的 `destroy-protyle` 可能先于 `mainWs` 的 `ws-main (removeDoc / removeBox / closeBox)` 使会话因双栏配对失效提前关闭，`DocumentDiffFeature` 在 `scope` 级 `ws-main` 监听中核对刚因宿主配对失效关闭的文档对时间戳，命中删除消息时补发一次 `diff.notice.docRemoved` 通知；
+- **非编辑器页签切换、预览模式与窗口缩放联动**：
+  - 会话同时监听 `"switch-protyle"`、`"switch-protyle-mode"`、`"destroy-protyle"` 以及双侧面板/页签头的类名 `MutationObserver`：当任一比较窗格切换至其他文档、非编辑器页签（PDF/关系图/自定义页签）或导出预览模式导致 `isPairStillLive()` 不再成立时立即调用 `dispose()`；`DiffToolbar.svelte` 在窗口 `resize` 时将自定义拖拽坐标钳制在可视区域内；
+- **幂等 `dispose()` 清理顺序**：
+  1. 中止 `ComputeCoordinator`（清除防抖定时器、触发在途请求 `AbortController.abort()`）与核验重试定时器；
+  2. 断开双侧 `MutationObserver`、`ResizeObserver`、面板可见性观察器与 `ScrollSync` 监听；
+  3. 按逆序卸载全部浏览器捕获期事件（`input` / `compositionstart` / `compositionend` / 手势）与思源 `eventBus` 监听；
+  4. 调用双侧 `DiffPainter.dispose()`：清空 `Highlight` Range、从 `CSS.highlights` 删除私有键、移除注入的 `<style>` 与 `.omnikit-document-diff-overlay` 节点；
+  5. 调用 Svelte 5 `unmount` 卸载并移除 `DiffToolbar.svelte` 挂载容器，保留宿主原有的双分屏编辑器与文档标签页不变。

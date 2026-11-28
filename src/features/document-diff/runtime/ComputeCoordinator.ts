@@ -53,6 +53,10 @@ export class ComputeCoordinator<T> {
     return this.composingSince.size > 0;
   }
 
+  get isScheduledOrRunning(): boolean {
+    return !this.disposed && (this.timer !== undefined || this.aborter !== undefined || this.hasActiveComposition());
+  }
+
   request(): void {
     this.invalidate();
     if (this.disposed || this.hasActiveComposition()) return;
