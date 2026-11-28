@@ -1,6 +1,6 @@
 import type { Plugin } from "siyuan";
 import type { Logger } from "../host/Logger.ts";
-import type { HostMenuContext, MenuRegistry } from "./MenuRegistry.ts";
+import type { MenuRegistry } from "./MenuRegistry.ts";
 import { resolveEditorRootID } from "../host/ProtyleAdapter.ts";
 
 function isNotebookDocTreeItem(item: any): boolean {
@@ -17,39 +17,32 @@ function isNotebookDocTreeElement(el: any): boolean {
   return nodeType === "navigation-root" || nodeType === "navigation-closed" || nodeType === "notebook";
 }
 
+function resolveClosestBlockID(targetElement: HTMLElement | undefined, protyle: any): string | undefined {
+  return targetElement?.closest?.("[data-node-id]")?.getAttribute?.("data-node-id") ?? protyle?.block?.id;
+}
+
 /**
  * Extract selected document IDs from SiYuan tree menu event details.
  * Supports single and multiple selection without filtering by business rules.
  */
 export function extractDocTreeDocumentIDs(detail: any): string[] {
-  if (!detail) return [];
-  if (detail.type === "notebook" || detail.type === "notebooks") return [];
+  if (!detail || detail.type === "notebook" || detail.type === "notebooks") return [];
   const ids: string[] = [];
 
   if (Array.isArray(detail.items)) {
     for (const item of detail.items) {
-      if (item && typeof item.id === "string" && item.id) {
-        if (isNotebookDocTreeItem(item)) {
-          continue;
-        }
+      if (item && typeof item.id === "string" && item.id && !isNotebookDocTreeItem(item)) {
         ids.push(item.id);
       }
     }
   } else if (detail.elements) {
-    const elements = Array.from(detail.elements as ArrayLike<HTMLElement>);
-    for (const el of elements) {
-      if (isNotebookDocTreeElement(el)) {
-        continue;
-      }
-      const id = el?.getAttribute?.("data-node-id") ?? (el as any)?.dataset?.id;
+    for (const el of Array.from(detail.elements as ArrayLike<HTMLElement>)) {
+      if (isNotebookDocTreeElement(el)) continue;
+      const id = el?.getAttribute?.("data-node-id");
       if (typeof id === "string" && id) {
         ids.push(id);
       }
     }
-  } else if (detail.data?.id && typeof detail.data.id === "string") {
-    ids.push(detail.data.id);
-  } else if (detail.id && typeof detail.id === "string") {
-    ids.push(detail.id);
   }
 
   return ids;
@@ -65,15 +58,11 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
     const detail = event.detail;
     if (!detail?.menu) return;
     const rootID = resolveEditorRootID(detail);
-    const selectedDocumentIDs = rootID ? [rootID] : [];
     logger?.debug("打开文档标题菜单", { 文档根ID: rootID });
     menus.render("doc-title", detail.menu, {
       location: "doc-title",
       rootID,
-      selectedDocumentIDs,
-      selectedDocumentCount: selectedDocumentIDs.length,
       protyle: detail.protyle,
-      targetElement: detail.element,
       detail,
     });
   };
@@ -88,7 +77,6 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
     const targetElement = detail.type === "notebook" || detail.type === "notebooks"
       ? undefined
       : (rawElements.find(el => !isNotebookDocTreeElement(el)) ?? (detail.elements ? undefined : detail.element));
-    const protyle = detail.protyle;
 
     logger?.debug("打开文档树菜单", { detailType: detail.type, selectedDocumentIDs, selectedDocumentCount, rootID });
     menus.render("doc-tree", detail.menu, {
@@ -97,7 +85,7 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
       selectedDocumentIDs,
       selectedDocumentCount,
       targetElement,
-      protyle,
+      protyle: detail.protyle,
       detail,
     });
   };
@@ -108,8 +96,7 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
     const targetElement = detail.element as HTMLElement | undefined;
     const rootID = resolveEditorRootID(detail);
     const protyle = detail.protyle;
-    const blockID = targetElement?.closest?.("[data-node-id]")?.getAttribute?.("data-node-id") ?? protyle?.block?.id;
-    const selectedDocumentIDs = rootID ? [rootID] : [];
+    const blockID = resolveClosestBlockID(targetElement, protyle);
 
     const image = targetElement?.tagName?.toLowerCase() === "img"
       ? (targetElement as HTMLImageElement)
@@ -120,8 +107,6 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
     menus.render("image", detail.menu, {
       location: "image",
       rootID,
-      selectedDocumentIDs,
-      selectedDocumentCount: selectedDocumentIDs.length,
       targetElement,
       protyle,
       blockID,
@@ -137,15 +122,12 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
     const targetElement = detail.element as HTMLElement | undefined;
     const rootID = resolveEditorRootID(detail);
     const protyle = detail.protyle;
-    const blockID = targetElement?.closest?.("[data-node-id]")?.getAttribute?.("data-node-id") ?? protyle?.block?.id;
-    const selectedDocumentIDs = rootID ? [rootID] : [];
+    const blockID = resolveClosestBlockID(targetElement, protyle);
 
     logger?.debug("打开链接菜单", { rootID, blockID });
     menus.render("link", detail.menu, {
       location: "link",
       rootID,
-      selectedDocumentIDs,
-      selectedDocumentCount: selectedDocumentIDs.length,
       targetElement,
       protyle,
       blockID,
@@ -157,7 +139,6 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
     const detail = event.detail;
     if (!detail?.menu) return;
     const rootID = resolveEditorRootID(detail);
-    const selectedDocumentIDs = rootID ? [rootID] : [];
     const protyle = detail.protyle;
     const targetElement = Array.isArray(detail.blockElements) ? detail.blockElements[0] : detail.element;
     const blockID = targetElement?.getAttribute?.("data-node-id") ?? protyle?.block?.id;
@@ -166,8 +147,6 @@ export function installMenuRouter(plugin: Plugin, menus: MenuRegistry, logger?: 
     menus.render("blockicon", detail.menu, {
       location: "blockicon",
       rootID,
-      selectedDocumentIDs,
-      selectedDocumentCount: selectedDocumentIDs.length,
       targetElement,
       protyle,
       blockID,

@@ -1,3 +1,5 @@
+import { Logger } from "../host/Logger.ts";
+
 export type Disposer = () => void;
 
 /** Centralized ownership of every runtime resource in one feature activation. */
@@ -36,7 +38,7 @@ export class FeatureScope {
     this.controller.abort("Feature disabled");
     for (const cleanup of this.disposers.splice(0).reverse()) {
       try { cleanup(); }
-      catch (error) { console.error("[OmniKit][error] 清理功能作用域失败", error); }
+      catch (error) { Logger.shared.error("清理功能作用域失败", error); }
     }
   }
 }

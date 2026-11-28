@@ -109,20 +109,51 @@ export function listEditorsSafe(
 }
 
 /**
+ * Checks whether a Protyle editor instance or target block/node is in read-only / locked mode.
+ */
+export function isProtyleReadOnly(context: unknown, node?: Element | null): boolean {
+  const target = unwrapDetail(context);
+  const inner = unwrapProtyle(target);
+  if (inner?.disabled === true || target?.disabled === true) return true;
+  const wysiwyg = inner?.wysiwyg?.element;
+  if (
+    wysiwyg?.getAttribute?.("data-readonly") === "true" ||
+    wysiwyg?.getAttribute?.("contenteditable") === "false"
+  ) {
+    return true;
+  }
+  if (node?.closest?.('[custom-sy-readonly="true"]')) return true;
+  if (node?.closest?.("[contenteditable]")?.getAttribute?.("contenteditable") === "false") return true;
+  return false;
+}
+
+/**
+ * Flush pending Protyle editor transactions when supported by the host editor instance.
+ */
+export async function flushProtyleTransactions(context: unknown): Promise<void> {
+  const runner = resolveProtyleRunner(context);
+  if (typeof runner?.flushPendingTransactions === "function") {
+    await runner.flushPendingTransactions();
+    return;
+  }
+  const target = unwrapDetail(context);
+  const instance = typeof target?.getInstance === "function" ? target.getInstance() : target;
+  if (typeof instance?.flushPendingTransactions === "function") {
+    await instance.flushPendingTransactions();
+    return;
+  }
+  const inner = unwrapProtyle(target);
+  if (typeof inner?.flushPendingTransactions === "function") {
+    await inner.flushPendingTransactions();
+  }
+}
+
+/**
  * Combine multiple abort signals using modern native AbortSignal.any.
  */
 export function combineSignals(...signals: (AbortSignal | undefined)[]): AbortSignal | undefined {
   const valid = signals.filter((s): s is AbortSignal => !!s);
   if (valid.length === 0) return undefined;
   if (valid.length === 1) return valid[0];
-  if (typeof AbortSignal.any === "function") return AbortSignal.any(valid);
-  const controller = new AbortController();
-  for (const s of valid) {
-    if (s.aborted) {
-      controller.abort(s.reason);
-      return controller.signal;
-    }
-    s.addEventListener("abort", () => controller.abort(s.reason), { once: true });
-  }
-  return controller.signal;
+  return AbortSignal.any(valid);
 }

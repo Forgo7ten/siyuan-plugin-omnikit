@@ -1,6 +1,7 @@
 import type { Plugin } from "siyuan";
 import { JsonStore, type StoreCodec } from "./JsonStore.ts";
 import type { FeatureRegistration } from "../framework/FeatureRegistration.ts";
+import { Logger } from "../host/Logger.ts";
 
 export interface GeneralSettings {
   debugLog: boolean;
@@ -96,7 +97,7 @@ export class SettingsManager {
       if (result.status === "rejected") {
         // @safety A failed read keeps that store read-only; it must not abort startup,
         // otherwise the recovery UI (SettingsRoot) can never be reached.
-        console.warn(`[OmniKit][warn] 配置读取失败，已进入只读保护 (${stores[index].file}):`, result.reason);
+        Logger.shared.warn(`配置读取失败，已进入只读保护 (${stores[index].file}):`, result.reason);
       }
     });
     if (!this.core.needsRecovery && this.getGeneral().userAgent.trim() === "") {
@@ -108,7 +109,7 @@ export class SettingsManager {
         });
       } catch (error) {
         // @safety Keep startup reachable and rely on getUserAgent() fallback if disk write fails.
-        console.warn(`[OmniKit][warn] 自动补全默认 User-Agent 写入失败 (${this.core.file}):`, error);
+        Logger.shared.warn(`自动补全默认 User-Agent 写入失败 (${this.core.file}):`, error);
       }
     }
   }
@@ -179,7 +180,7 @@ export class SettingsManager {
       if (result.status === "fulfilled") {
         if (result.value.changed) changed.push(result.value.id);
       } else {
-        console.warn(`[OmniKit][warn] 重载配置失败 (${entries[i][0]}):`, result.reason);
+        Logger.shared.warn(`重载配置失败 (${entries[i][0]}):`, result.reason);
       }
     }
     return changed;

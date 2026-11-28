@@ -58,7 +58,7 @@ flowchart TD
         
         subgraph CoreUI["统一宿主 UI 容器与反馈 (src/ui/ & src/core/feedback/)"]
             UnifiedDock["registerDock (单槽位多 Tab 容器)"]
-            SettingsShell["SettingsRoot.svelte & mountSettings (双栏设置面板)"]
+            SettingsShell["SettingsRoot.svelte, mountSettings & 子卡片组件 (双栏设置面板)"]
             DraftProtocol["DraftParticipant (全界面统一草稿协议)"]
             TopBarEntry["registerTopBar (统一顶栏图标与下拉菜单)"]
             MenuRouter["MenuRouter & MenuRegistry (上下文提取与前缀/复选框适配)"]
@@ -141,8 +141,8 @@ stateDiagram-v2
 - **主要职责**：
   - 继承思源官方 `Plugin`，维护顶层 `registrations` 列表；
   - **独立设置窗口隔离 (`body--settings`)**：通过 `document.body.classList.contains("body--settings")` 识别独立设置窗口。在设置窗口中仅初始化 `SettingsManager` 与 `createSettingsWindow`（`onload()` 阶段不自动弹窗，由 `openSetting()` 等待 `ready` 后打开）；不实例化 `FeatureManager`（`manager === undefined`），受当前平台支持且配置为启用的特性其 `runtimePhase` 派生为 `"configured"`（显示「已配置启用（运行状态请看主窗口）」），不挂载 Dock、`MenuRouter`、`PluginStatusBar` 或任何 Feature 运行时；
-  - **主窗口启动与卸载**：在主工作区窗口中初始化 `Platform`（注入 `getFrontend`）、`Logger`、`SettingsManager`，并行加载 `omnikit-core.json` 与各 Feature 配置；实例化并向 `FeatureCatalog` 注册各 Feature，创建 `UiFeedback`、`MenuRegistry`、`PluginStatusBar`、`FeatureManager`、设置窗口、`MenuRouter` 与 `registerDock`，再调用 `manager.initialize()` 依次激活已启用且平台支持的功能；`onLayoutReady()` 等待 `ready` 后挂载 `PluginStatusBar` 与 `registerTopBar`；`onunload()` 标记 `unloading = true`，销毁状态栏与订阅，先调用 `manager.freezeAll()` 同步废止所有 `FeatureScope`，再关闭设置弹窗并调用 `manager.disposeAll()` 按逆序执行各 Feature 的 `deactivate()`；
-  - **外部数据同步 (`onDataChanged`)**：先等待 `ready` 完成且全程不回写文件。主窗口依次执行：① 遍历 `registrations` 调用可选 `reloadData(this)` 重载已初始化的业务数据存储；② 调用 `settingsManager.reloadAfterExternalChange()` 重读配置；③ 若 `"core"` 发生变更则调用 `manager.reconcileFromLoadedSettings()` 协调启停，对发生变更的 Feature 调用 `manager.notifySettingsChanged(id)`；④ 调用 `refreshDock()` 刷新侧边栏视图。独立设置窗口仅执行 `settingsManager.reloadAfterExternalChange()` 驱动界面更新与冲突提示。
+  - **主窗口启动与卸载**：在主工作区窗口中初始化 `Platform`（注入 `getFrontend`）、`Logger`、`SettingsManager`，并行加载 `omnikit-core.json` 与各 Feature 配置；实例化并向 `FeatureCatalog` 注册各 Feature，创建 `UiFeedback`、`MenuRegistry`、`PluginStatusBar`、`FeatureManager`、设置窗口、`MenuRouter` 与 `registerDock`（返回 `{ refresh, dispose }`），再调用 `manager.initialize()` 依次激活已启用且平台支持的功能；`onLayoutReady()` 等待 `ready` 后挂载 `PluginStatusBar` 与 `registerTopBar`；`onunload()` 标记 `unloading = true`，销毁状态栏与订阅，先调用 `manager.freezeAll()` 同步废止所有 `FeatureScope`，再销毁 `MenuRouter`、关闭设置弹窗并调用 `manager.disposeAll()` 按逆序执行各 Feature 的 `deactivate()`，最后在 `finally` 中调用 `dock.dispose()` 清理侧边栏组件实例；
+  - **外部数据同步 (`onDataChanged`)**：先等待 `ready` 完成且全程不回写文件。主窗口依次执行：① 遍历 `registrations` 调用可选 `reloadData(this)` 重载已初始化的业务数据存储；② 调用 `settingsManager.reloadAfterExternalChange()` 重读配置；③ 若 `"core"` 发生变更则调用 `manager.reconcileFromLoadedSettings()` 协调启停，对发生变更的 Feature 调用 `manager.notifySettingsChanged(id)`；④ 调用 `dock.refresh()` 刷新侧边栏视图。独立设置窗口仅执行 `settingsManager.reloadAfterExternalChange()` 驱动界面更新与冲突提示。
 
 ### 3.2 `FeatureCatalog`、`FeatureRegistration` 与 `FeatureManager`
 - **文件位置**：`src/core/framework/FeatureCatalog.ts`、`src/core/framework/FeatureRegistration.ts`、`src/core/framework/FeatureManager.ts`
@@ -260,9 +260,9 @@ export interface FeatureContext {
   - `withBlockWriteLease(notebook, blockID, signal, operation)` 以 `${notebook}/${blockID}` 为键在插件进程内串行排队；
   - 排队等待期间及获得租约进入临界区前均检查 `signal?.aborted`（已中止则立即抛出 `AbortError`）；因思源 `/api/block/updateBlock` 无原子 CAS，临界区内仍须通过内核读接口核验块归属与实时 DOM。
 - **`ProtyleAdapter` (`ProtyleAdapter.ts`)**：
-  - 提供无副作用纯函数提取器：`resolveEditorRootID`、`resolveNotebookID`、`resolveProtyleElement`、`resolveWysiwygElement`、`resolveProtyleRunner`（兼容直接实例、`IProtyle` 包装与 `getInstance()`）、`listEditorsSafe`（安全包装 `getAllEditor`）与 `combineSignals`（基于 `AbortSignal.any` 组合多中止信号）。
+  - 提供无副作用纯函数提取器与编辑器适配器：`resolveEditorRootID`、`resolveNotebookID`、`resolveProtyleElement`、`resolveWysiwygElement`、`resolveProtyleRunner`（兼容直接实例、`IProtyle` 包装与 `getInstance()`）、`isProtyleReadOnly`（检测编辑器 `disabled`、`wysiwyg` 只读标记与块级 `contenteditable="false"`）、`flushProtyleTransactions`、`listEditorsSafe`（安全包装 `getAllEditor`）与 `combineSignals`（基于原生 `AbortSignal.any` 组合多中止信号）。
 - **公共辅助模块 (`dom.ts`、`id.ts`、`describeError.ts`、`Platform.ts`、`Logger.ts`)**：
-  - `dom.ts`：导出 `PROTECTED_CONTAINER_SELECTOR`（`[data-type="NodeCodeBlock"], [data-type="NodeBlockQueryEmbed"], .protyle-wysiwyg__embed, pre, code`）与 `isInsideProtectedContainer(node)`；
+  - `dom.ts`：导出 `PROTECTED_CONTAINER_SELECTOR`（`[data-type="NodeCodeBlock"], [data-type="NodeBlockQueryEmbed"], [data-type="NodeAttributeView"], [data-type="NodeMathBlock"], [data-type="NodeHTMLBlock"], .protyle-wysiwyg__embed, .av, .render-node, pre, code`）与 `isInsideProtectedContainer(node)`；
   - `id.ts`：导出 `createRuntimeId(prefix)`，使用时间戳与进程内单调计数器生成唯一 ID，兼容非 HTTPS（`window.isSecureContext === false`）无 `crypto.randomUUID()` 的局域网环境；
   - `describeError.ts`：将 `Error`、思源 `{ msg, code }` 响应或字符串格式化为可读文本，消除 `[object Object]`；
   - `Platform.ts`：通过注入的 `getFrontend()` 探测前端环境（回退 DOM `#sidebar` 与 UA 推断），导出与思源内核 `IsTargetSupported` 逻辑一致的 `isFrontendSupported(declared, current)` 及 `isMobileFrontend()`；
@@ -270,17 +270,17 @@ export interface FeatureContext {
 
 ### 3.6 统一 UI 容器与反馈服务 (`src/ui/` & `src/core/feedback/`)
 - **统一侧边栏容器 (`src/ui/dock/registerDock.ts`)**：
-  - 仅注册 1 个思源侧边栏槽位（`type: "omnikit-dock"`，`position: "RightBottom"`）；
+  - 仅注册 1 个思源侧边栏槽位（`type: "omnikit-dock"`，`position: "RightBottom"`），返回 `{ refresh, dispose }` 句柄；
   - `views()` 动态筛选 `manager.isRunning(id)` 且通过 `filterSupportedDockViews` 的特性视图；`dockViewState` 控制多视图显示 Tab 栏、单视图隐藏 Tab 栏独占、零视图显示 `dock.empty` 空状态指引与底部「打开设置」按钮；
-  - 缓存当前挂载的 `mountedID`、`mountedComponent` 与 `lastTabsSignature`，同一视图保持激活时复用 Svelte 5 实例，切换或停用时调用 `unmount`；宿主 Dock `update()` 触发时派发 `window` `"omnikit-dock-tab-activated"` 事件通知活动视图刷新。
-- **统一设置面板与草稿协议 (`src/ui/settings/SettingsRoot.svelte`、`mountSettings.ts`、`DraftParticipant.ts`)**：
+  - 缓存当前挂载的 `mountedID`、`mountedComponent` 与 `lastTabsSignature`，同一视图保持激活时复用 Svelte 5 实例，切换或停用时调用 `unmount`；宿主 Dock `update()` 触发时派发 `window` `"omnikit-dock-tab-activated"` 事件通知活动视图刷新；`dispose()` 在插件卸载时幂等卸载已挂载视图，并在移动端调用 `plugin.removeDock` 清理宿主侧栏注册项。
+- **统一设置面板与草稿协议 (`src/ui/settings/SettingsRoot.svelte`、`SettingsSidebar.svelte`、`GeneralSettingsCard.svelte`、`FeatureSettingsCard.svelte`、`SettingsSaveBar.svelte`、`mountSettings.ts`、`DraftParticipant.ts`)**：
   - `createSettingsWindow` 使用思源 `Dialog`（`860px × 600px`）挂载 `SettingsRoot.svelte`；`close()` 在调用 `dialog.destroy()` 前先清空实例引用，防止思源异步 `destroyCallback` 误清理新实例；
-  - 采用双栏联动布局（左侧「通用设置」`general.title` 与「功能模块」`nav.features` 导航，右侧 `.omnikit-settings-scroller` 单页平滑滚动卡片）；
-  - **全界面草稿协议 (`DraftParticipant`)**：通用设置、各功能启用开关与各 Feature 专属设置面板（通过 `registerDraft` 注册 `{ id, isDirty, validate, save, resetToDefaults, isReadOnly, hasConflict }`）统一编辑内存草稿，仅在底部保留唯一全局浮动操作栏（「恢复默认值」与「保存设置」）；
-  - **只读隔离、冲突检测与保存序**：全局「恢复默认值」仅重置未处于 `needsRecovery` 且当前平台支持的可写草稿，不写盘；点击「保存设置」按“校验全部脏草稿 → 依次保存各变更 Feature Store → 保存 Core Store → `manager.reconcileFromLoadedSettings()` → `manager.notifySettingsChanged(id)`”顺序执行；当外部同步与未保存草稿冲突（或抛出 `SettingsConflictError`）时显示冲突横幅并提供「放弃草稿并载入」；`User-Agent` 输入框通过 `data-omnikit-field="user-agent"` 焦点检测与脏状态保护防止编辑中被外部同步覆盖；
+  - 采用双栏联动布局（`SettingsSidebar.svelte` 渲染左侧「通用设置」`general.title` 与「功能模块」`nav.features` 导航，右侧 `.omnikit-settings-scroller` 单页平滑滚动 `GeneralSettingsCard.svelte` 与各 `FeatureSettingsCard.svelte` 卡片，含滚动触底末尾卡片高亮判定）；
+  - **全界面草稿协议 (`DraftParticipant`)**：通用设置、各功能启用开关与各 Feature 专属设置面板（通过 `registerDraft` 注册 `{ id, isDirty, validate, save, resetToDefaults, isReadOnly, hasConflict }`）统一编辑内存草稿，仅在底部保留唯一全局浮动操作栏 `SettingsSaveBar.svelte`（「恢复默认值」与「保存设置」）；
+  - **只读隔离、恢复协调、冲突检测与保存序**：全局「恢复默认值」仅重置未处于 `needsRecovery` 且当前平台支持的可写草稿，不写盘；点击「保存设置」按“校验全部脏草稿 → 依次保存各变更 Feature Store → 保存 Core Store → `manager.reconcileFromLoadedSettings()` → `manager.notifySettingsChanged(id)`”顺序执行；核心或功能配置从 `needsRecovery` 执行备份恢复解除只读后自动调用 `manager.reconcileFromLoadedSettings()` 协调运行态；当外部同步与未保存草稿冲突（或抛出 `SettingsConflictError`）时显示冲突横幅并提供「放弃草稿并载入」；`User-Agent` 输入框通过 `data-omnikit-field="user-agent"` 焦点检测与脏状态保护防止编辑中被外部同步覆盖；
   - **不支持平台卡片呈现**：`unsupported` 特性的设置卡片保持渲染，总开关置灰禁用并展示 `runtime.unsupported` 与支持平台说明，但卡片内专属设置组件仍允许预调并保存至该特性独立的 `feature-*-settings.json`。
 - **统一顶栏入口 (`src/ui/topbar/registerTopBar.ts`)**：
-  - 注册唯一顶栏图标（`id: "omnikit-core"`）；左键单击与右键菜单第一项固定为「OmniKit 设置」，随后插入 `separator_settings` 分隔线并调用 `menus.render("topbar", ...)` 渲染已启用 Feature 的顶栏动作（左键菜单在渲染项数为 `0` 时自动移除尾部悬空分隔线）；桌面端按图标（或 `#barMore` / `#barPlugins`）坐标锚定弹出，移动端调用 `menu.fullscreen()`。
+  - 注册唯一顶栏图标（`id: "omnikit-core"`）；左键单击与右键菜单第一项固定为「OmniKit 设置」，随后插入 `separator_settings` 分隔线并调用 `menus.render("topbar", ...)` 渲染已启用 Feature 的顶栏动作（左键菜单在渲染项数为 `0` 时自动移除尾部悬空分隔线）；从 `getActiveEditor()` 提取当前文档 `rootID` 与 `protyle`（桌面布局端焦点位于侧边栏面板时从 `getAllModels().editor` 选取最近活动的可见主文档页签）；桌面端按图标（或 `#barMore` / `#barPlugins`）坐标锚定弹出，移动端调用 `menu.fullscreen()`。
 - **统一菜单路由与注册表 (`src/core/feedback/MenuRouter.ts`、`MenuRegistry.ts`)**：
   - `MenuRouter` 监听 `click-editortitleicon`（`doc-title`）、`open-menu-doctree`（`doc-tree`）、`open-menu-image`（`image`）、`open-menu-link`（`link`）、`click-blockicon`（`blockicon`）5 类宿主事件，提取标准化 `HostMenuContext`（在 `doc-tree` 中通过 `extractDocTreeDocumentIDs` 过滤笔记本节点，仅保留文档节点）；
   - `MenuRegistry` 按 `location/owner/id` 管理各 Feature 在 `FeatureScope` 内注册的 `provider` 与可选 `matcher`；渲染与点击时双重核验 `scope.active && isFeatureRunning(owner)`（菜单展开期间若功能被停用，点击时触发 `menu.featureInactive` 轻量提示）；

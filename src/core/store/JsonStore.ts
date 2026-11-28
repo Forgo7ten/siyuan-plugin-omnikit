@@ -288,7 +288,7 @@ export class JsonStore<T> {
     const snapshot = this.snapshot();
     for (const listener of [...this.listeners]) {
       try { listener(snapshot); }
-      catch (error) { console.error("[OmniKit][error] 设置监听器执行失败", error); }
+      catch (error) { Logger.shared.error("设置监听器执行失败", error); }
     }
   }
 }

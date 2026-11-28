@@ -85,12 +85,12 @@ test("settings navigation features title uses dedicated i18n key in both locales
   const { readFile } = await import("node:fs/promises");
   const zh = JSON.parse(await readFile(new URL("../../src/i18n/zh-CN.json", import.meta.url), "utf8"));
   const en = JSON.parse(await readFile(new URL("../../src/i18n/en.json", import.meta.url), "utf8"));
-  const root = await readFile(new URL("../../src/ui/settings/SettingsRoot.svelte", import.meta.url), "utf8");
+  const sidebar = await readFile(new URL("../../src/ui/settings/SettingsSidebar.svelte", import.meta.url), "utf8");
 
   assert.equal(zh["nav.features"], "功能模块");
   assert.equal(en["nav.features"], "Features");
-  assert.match(root, /<div class="nav-section-title">\{t\("nav\.features"\)\}<\/div>/);
-  assert.doesNotMatch(root, /\{t\("status"\)\s*\?\s*"功能模块"\s*:\s*"Features"\}/);
+  assert.match(sidebar, /<div class="nav-section-title">\{t\("nav\.features"\)\}<\/div>/);
+  assert.doesNotMatch(sidebar, /\{t\("status"\)\s*\?\s*"功能模块"\s*:\s*"Features"\}/);
 });
 
 test("SettingsManager load settles all stores and reloadAfterExternalChange preserves core-first order", async () => {
@@ -172,14 +172,26 @@ test("SettingsConflictError carries stable code SETTINGS_CONFLICT", () => {
 
 test("SettingsRoot preserves recovery guards, UA dirty protection, and describeError formatting", async () => {
   const { readFile } = await import("node:fs/promises");
-  const root = await readFile(new URL("../../src/ui/settings/SettingsRoot.svelte", import.meta.url), "utf8");
+  const files = [
+    "SettingsRoot.svelte",
+    "SettingsSidebar.svelte",
+    "GeneralSettingsCard.svelte",
+    "FeatureSettingsCard.svelte",
+    "SettingsSaveBar.svelte",
+  ];
+  const combined = (
+    await Promise.all(files.map(f => readFile(new URL(`../../src/ui/settings/${f}`, import.meta.url), "utf8")))
+  ).join("\n");
 
-  assert.match(root, /disabled=\{globalSaving \|\| coreRecovery \|\| needsFeatureRecovery \|\| !isSupported\}/);
-  assert.match(root, /data-omnikit-field="user-agent"/);
-  assert.match(root, /coreDirty/);
-  assert.match(root, /coreConflict/);
-  assert.match(root, /discardCoreDraftAndReload/);
-  assert.match(root, /preferenceUnreadable/);
-  assert.match(root, /runtime\.preferenceUnreadable/);
-  assert.match(root, /describeError\(/);
+  assert.match(combined, /disabled=\{globalSaving \|\| coreRecovery \|\| needsFeatureRecovery \|\| !isSupported\}/);
+  assert.match(combined, /data-omnikit-field="user-agent"/);
+  assert.match(combined, /coreDirty/);
+  assert.match(combined, /coreConflict/);
+  assert.match(combined, /discardCoreDraftAndReload/);
+  assert.match(combined, /preferenceUnreadable/);
+  assert.match(combined, /runtime\.preferenceUnreadable/);
+  assert.match(combined, /describeError\(/);
+  assert.match(combined, /wasRecovering && !nowRecovering && !settings\.core\.needsRecovery && manager/);
+  assert.match(combined, /manager\.getStartupError\(id\)/);
+  assert.match(combined, /scrollerEl\.scrollTop \+ scrollerEl\.clientHeight >= scrollerEl\.scrollHeight - 4/);
 });

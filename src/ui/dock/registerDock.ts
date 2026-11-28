@@ -2,7 +2,7 @@ import type { Component } from "svelte";
 import { mount, unmount } from "svelte";
 import type { Plugin } from "siyuan";
 import type { FeatureContext } from "../../core/framework/FeatureContext.ts";
-import { isFrontendSupported, type SiyuanFrontend } from "../../core/host/Platform.ts";
+import { isFrontendSupported, isMobileFrontend, type SiyuanFrontend } from "../../core/host/Platform.ts";
 import { button, el } from "../common/dom.ts";
 
 export interface FeatureDockView {
@@ -22,6 +22,11 @@ export interface RegisterDockOptions {
   openSettings: () => void;
 }
 
+export interface DockHandle {
+  refresh: () => void;
+  dispose: () => void;
+}
+
 export function filterSupportedDockViews<T extends { frontends?: readonly SiyuanFrontend[] }>(
   views: readonly T[],
   currentFrontend?: string,
@@ -38,7 +43,7 @@ export function dockViewState<T extends { id: string }>(views: readonly T[], sel
 }
 
 /** A single host Dock switches between feature-owned views. */
-export function registerDock(plugin: Plugin, options: RegisterDockOptions): () => void {
+export function registerDock(plugin: Plugin, options: RegisterDockOptions): DockHandle {
   let element: HTMLElement | undefined;
   let heading: HTMLElement | undefined;
   let tabsHost: HTMLElement | undefined;
@@ -62,6 +67,23 @@ export function registerDock(plugin: Plugin, options: RegisterDockOptions): () =
     emptyHint = el("p", "omnikit-dock-empty", options.t("dock.empty"));
     settingsBtn = button(options.t("dock.openSettings"), options.openSettings);
     element.append(heading, tabsHost, viewHost, emptyHint, settingsBtn);
+  };
+
+  const cleanup = (): void => {
+    if (mounted) {
+      void unmount(mounted);
+      mounted = undefined;
+    }
+    mountedID = undefined;
+    mountedComponent = undefined;
+    lastTabsSignature = undefined;
+    element?.replaceChildren?.();
+    heading = undefined;
+    tabsHost = undefined;
+    viewHost = undefined;
+    emptyHint = undefined;
+    settingsBtn = undefined;
+    element = undefined;
   };
 
   const render = (): void => {
@@ -146,20 +168,16 @@ export function registerDock(plugin: Plugin, options: RegisterDockOptions): () =
     update: () => {
       window.dispatchEvent(new CustomEvent("omnikit-dock-tab-activated"));
     },
-    destroy: () => {
-      if (mounted) void unmount(mounted);
-      mounted = undefined;
-      mountedID = undefined;
-      mountedComponent = undefined;
-      lastTabsSignature = undefined;
-      heading = undefined;
-      tabsHost = undefined;
-      viewHost = undefined;
-      emptyHint = undefined;
-      settingsBtn = undefined;
-      element = undefined;
-    },
+    destroy: cleanup,
   });
 
-  return render;
+  return {
+    refresh: render,
+    dispose: () => {
+      cleanup();
+      if (isMobileFrontend()) {
+        (plugin as Plugin & { removeDock?: (type: string) => void }).removeDock?.(options.type);
+      }
+    },
+  };
 }

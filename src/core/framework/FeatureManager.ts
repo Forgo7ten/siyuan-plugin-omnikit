@@ -62,14 +62,6 @@ export class FeatureManager {
     }
   }
 
-  enable(id: string, persist = true): Promise<boolean> {
-    return this.setEnabled(id, true, persist);
-  }
-
-  disable(id: string, persist = true): Promise<boolean> {
-    return this.setEnabled(id, false, persist);
-  }
-
   /**
    * @safety Runtime is revoked before persistence. When a save fails, the previous runtime
    * state is restored; a failed activation never rewrites the user's preference.
@@ -130,7 +122,7 @@ export class FeatureManager {
           if (wasRunning && !this.frozen) {
             try { await current.activate(this.context); }
             catch (rollbackError) {
-              this.context.logger.debug?.(`回滚重新启用功能失败：${id}`, rollbackError);
+              this.context.logger.debug(`回滚重新启用功能失败：${id}`, rollbackError);
             }
           }
           return false;
@@ -163,7 +155,7 @@ export class FeatureManager {
       const desired = this.context.settings.getFeatureEnabled(feature.meta.id, feature.meta.defaultEnabled);
       await this.enqueue(feature.meta.id, async current => {
         if (this.frozen) return false;
-        this.context.logger.debug?.(`协调功能状态：${feature.meta.id}`, {
+        this.context.logger.debug(`协调功能状态：${feature.meta.id}`, {
           desired,
           running: current.enabled,
           status: current.status,

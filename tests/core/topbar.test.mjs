@@ -156,3 +156,73 @@ test("registerTopBar runtime creates settings item, removes dangling separator o
     globalThis.window = prevWin;
   }
 });
+
+
+test("registerTopBar resolves active main document tab via getAllModels().editor when focus is in sidebar or backlink", async () => {
+  const source = await read("../../src/ui/topbar/registerTopBar.ts");
+  const platformUrl = new URL("../../src/core/host/Platform.ts", import.meta.url).href;
+  const { setFrontendResolver } = await import(platformUrl);
+  const backlinkEditor = { protyle: { block: { rootID: "backlink-sub-editor" } } };
+  const docOldEditor = {
+    protyle: {
+      block: { rootID: "doc-older" },
+      element: { classList: { contains: () => false } },
+      model: { headElement: { classList: { contains: c => c === "item--focus" }, dataset: { activetime: "100" } } },
+    },
+  };
+  const docRecentEditor = {
+    protyle: {
+      block: { rootID: "doc-recent" },
+      element: { classList: { contains: () => false } },
+      model: { headElement: { classList: { contains: c => c === "item--focus" }, dataset: { activetime: "250" } } },
+    },
+  };
+  globalThis.__omnikitTopBarGetActive = () => backlinkEditor;
+  globalThis.__omnikitTopBarGetModels = () => ({
+    editor: [{ editor: docOldEditor }, { editor: docRecentEditor }],
+  });
+  const mockSiyuan = `
+    class Menu {
+      addItem() { return this; }
+      addSeparator() { return { remove() {} }; }
+      open() {}
+      fullscreen() {}
+    }
+    const getActiveEditor = () => globalThis.__omnikitTopBarGetActive();
+    const getAllModels = () => globalThis.__omnikitTopBarGetModels();
+  `;
+  const runnable = stripTypeScriptTypes(
+    source
+      .replace(/import\s*\{[^}]*\}\s*from\s*"siyuan";/, mockSiyuan)
+      .replace(/import\s+type\s*\{[^}]*\}\s*from\s*"\.\.\/\.\.\/core\/feedback\/MenuRegistry\.ts";/, "")
+      .replace(/from\s*"\.\.\/\.\.\/core\/host\/Platform\.ts"/, `from "${platformUrl}"`),
+  );
+  const { registerTopBar } = await import(`data:text/javascript,${encodeURIComponent(runnable)}`);
+
+  const prevDoc = globalThis.document;
+  const prevWin = globalThis.window;
+  globalThis.document = { querySelector: () => null };
+  globalThis.window = { innerWidth: 1280 };
+  try {
+    setFrontendResolver(() => "desktop");
+    let topBarDef;
+    const contexts = [];
+    registerTopBar(
+      { addTopBar: def => { topBarDef = def; return { getBoundingClientRect: () => ({ right: 80, bottom: 28, width: 24 }) }; } },
+      {
+        title: "OmniKit 设置",
+        menus: { render: (_loc, _menu, ctx) => { contexts.push(ctx); return 1; } },
+        openSettings: () => {},
+      },
+    );
+    topBarDef.callback();
+    assert.equal(contexts[0].rootID, "doc-recent");
+    assert.equal(contexts[0].protyle, docRecentEditor.protyle);
+  } finally {
+    setFrontendResolver(undefined);
+    delete globalThis.__omnikitTopBarGetActive;
+    delete globalThis.__omnikitTopBarGetModels;
+    globalThis.document = prevDoc;
+    globalThis.window = prevWin;
+  }
+});

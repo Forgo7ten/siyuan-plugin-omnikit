@@ -13,7 +13,7 @@ import { titledLinkRegistration } from "../features/titled-link/registration.ts"
 import { documentDiffRegistration } from "../features/document-diff/registration.ts";
 import { createSettingsWindow } from "../ui/settings/mountSettings.ts";
 import { registerTopBar } from "../ui/topbar/registerTopBar.ts";
-import { registerDock } from "../ui/dock/registerDock.ts";
+import { registerDock, type DockHandle } from "../ui/dock/registerDock.ts";
 import { OMNIKIT_ICONS } from "../ui/icons.ts";
 import { translate } from "../i18n/translate.ts";
 import { setFrontendResolver } from "./host/Platform.ts";
@@ -35,7 +35,7 @@ export class OmniKitPlugin extends Plugin {
   private menuRegistry?: MenuRegistry;
   private statusBar?: PluginStatusBar;
   private disposeMenuRouter?: () => void;
-  private refreshDock?: () => void;
+  private dock?: DockHandle;
   private disposeCoreSubscription?: () => void;
   private disposeStatusSubscription?: () => void;
   private settingsWindow?: ReturnType<typeof createSettingsWindow>;
@@ -104,7 +104,7 @@ export class OmniKitPlugin extends Plugin {
     };
     const manager = new FeatureManager(this.catalog, featureContext);
     this.manager = manager;
-    this.disposeStatusSubscription = manager.subscribeStatus(() => this.refreshDock?.());
+    this.disposeStatusSubscription = manager.subscribeStatus(() => this.dock?.refresh());
     this.settingsWindow = createSettingsWindow({
       registrations,
       settings,
@@ -112,7 +112,7 @@ export class OmniKitPlugin extends Plugin {
       t: (key, values) => this.t(key, values),
     });
     this.disposeMenuRouter = installMenuRouter(this, menus, this.logger);
-    this.refreshDock = registerDock(this, {
+    this.dock = registerDock(this, {
       type: "omnikit-dock",
       icon: "iconOmnikitMenu",
       title: "OmniKit",
@@ -126,7 +126,7 @@ export class OmniKitPlugin extends Plugin {
     });
     await manager.initialize();
     if (this.unloading) return;
-    this.refreshDock?.();
+    this.dock.refresh();
   }
 
   onLayoutReady(): void {
@@ -163,7 +163,7 @@ export class OmniKitPlugin extends Plugin {
       for (const id of changed) {
         if (id !== "core") await this.manager.notifySettingsChanged(id);
       }
-      this.refreshDock?.();
+      this.dock?.refresh();
       return;
     }
     await this.settingsManager.reloadAfterExternalChange();
@@ -181,6 +181,8 @@ export class OmniKitPlugin extends Plugin {
       await this.manager?.disposeAll();
     } catch (error) {
       this.logger.error("清理功能失败", error);
+    } finally {
+      this.dock?.dispose();
     }
   }
 }

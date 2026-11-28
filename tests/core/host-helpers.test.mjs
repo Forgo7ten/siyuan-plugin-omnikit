@@ -30,7 +30,7 @@ test("describeError formats Error, { msg, code }, string, and fallback", () => {
 test("PROTECTED_CONTAINER_SELECTOR and isInsideProtectedContainer check protected ancestors", () => {
   assert.equal(
     PROTECTED_CONTAINER_SELECTOR,
-    '[data-type="NodeCodeBlock"], [data-type="NodeBlockQueryEmbed"], .protyle-wysiwyg__embed, pre, code',
+    '[data-type="NodeCodeBlock"], [data-type="NodeBlockQueryEmbed"], [data-type="NodeAttributeView"], [data-type="NodeMathBlock"], [data-type="NodeHTMLBlock"], .protyle-wysiwyg__embed, .av, .render-node, pre, code',
   );
   let capturedSelector;
   const protectedNode = {

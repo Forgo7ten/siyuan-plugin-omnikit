@@ -1,5 +1,5 @@
 export const PROTECTED_CONTAINER_SELECTOR =
-  '[data-type="NodeCodeBlock"], [data-type="NodeBlockQueryEmbed"], .protyle-wysiwyg__embed, pre, code';
+  '[data-type="NodeCodeBlock"], [data-type="NodeBlockQueryEmbed"], [data-type="NodeAttributeView"], [data-type="NodeMathBlock"], [data-type="NodeHTMLBlock"], .protyle-wysiwyg__embed, .av, .render-node, pre, code';
 
 /**
  * Checks whether an element resides inside a code block or embed container

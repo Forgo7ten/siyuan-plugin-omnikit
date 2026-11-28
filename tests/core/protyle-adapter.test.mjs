@@ -6,6 +6,8 @@ import {
   resolveProtyleElement,
   resolveWysiwygElement,
   resolveProtyleRunner,
+  isProtyleReadOnly,
+  flushProtyleTransactions,
   listEditorsSafe,
   combineSignals,
 } from "../../src/core/host/ProtyleAdapter.ts";
@@ -190,4 +192,41 @@ test("combineSignals combines signals natively with AbortSignal.any", () => {
   const combinedAborted = combineSignals(c1.signal, c4.signal);
   assert.ok(combinedAborted);
   assert.equal(combinedAborted.aborted, true);
+});
+
+
+test("isProtyleReadOnly detects disabled editor, read-only wysiwyg, and non-editable block nodes", () => {
+  assert.equal(isProtyleReadOnly({ disabled: true }), true);
+  assert.equal(isProtyleReadOnly({ protyle: { disabled: true } }), true);
+  assert.equal(
+    isProtyleReadOnly({ protyle: { wysiwyg: { element: { getAttribute: k => (k === "data-readonly" ? "true" : null) } } } }),
+    true,
+  );
+  assert.equal(
+    isProtyleReadOnly({ protyle: { wysiwyg: { element: { getAttribute: k => (k === "contenteditable" ? "false" : null) } } } }),
+    true,
+  );
+  const roBlock = {
+    closest(sel) {
+      if (sel === "[contenteditable]") return { getAttribute: () => "false" };
+      return null;
+    },
+  };
+  assert.equal(isProtyleReadOnly({ protyle: { disabled: false } }, roBlock), true);
+  assert.equal(isProtyleReadOnly({ protyle: { disabled: false } }, { closest: () => null }), false);
+});
+
+test("flushProtyleTransactions flushes direct, nested, and IProtyle getInstance runners", async () => {
+  let count = 0;
+  await flushProtyleTransactions({
+    updateTransactionElement() {},
+    async flushPendingTransactions() { count += 1; },
+  });
+  await flushProtyleTransactions({
+    getInstance() {
+      return { async flushPendingTransactions() { count += 10; } };
+    },
+  });
+  await flushProtyleTransactions(null);
+  assert.equal(count, 11);
 });

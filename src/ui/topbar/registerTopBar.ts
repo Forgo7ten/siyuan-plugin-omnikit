@@ -1,4 +1,4 @@
-import { Menu, getActiveEditor, type Plugin } from "siyuan";
+import { Menu, getActiveEditor, getAllModels, type Plugin } from "siyuan";
 import type { HostMenu, MenuRegistry } from "../../core/feedback/MenuRegistry.ts";
 import { isMobileFrontend } from "../../core/host/Platform.ts";
 
@@ -6,6 +6,37 @@ export interface TopBarOptions {
   title: string;
   menus: MenuRegistry;
   openSettings: () => void;
+}
+
+function resolveActiveDocumentProtyle(): any {
+  if (isMobileFrontend()) {
+    return (getActiveEditor() as any)?.protyle;
+  }
+  const modelsGetter = typeof getAllModels === "function" ? getAllModels : undefined;
+  const editorModels: Array<{ editor?: any; parent?: any }> = modelsGetter?.()?.editor ?? [];
+  if (editorModels.length === 0) {
+    return (getActiveEditor() as any)?.protyle;
+  }
+  const mainEditors = new Set(editorModels.map(m => m?.editor).filter(Boolean));
+  const direct = getActiveEditor();
+  if (direct && mainEditors.has(direct)) {
+    return (direct as any).protyle;
+  }
+  let bestProtyle: any;
+  let bestTime = -1;
+  for (const model of editorModels) {
+    const protyle = model?.editor?.protyle;
+    const el = protyle?.element as HTMLElement | undefined;
+    if (!el || el.classList?.contains("fn__none")) continue;
+    const head = protyle?.model?.headElement ?? model?.parent?.headElement;
+    if (head?.classList && !head.classList.contains("item--focus")) continue;
+    const activeTime = Number(head?.dataset?.activetime ?? 0) || 0;
+    if (bestProtyle === undefined || activeTime > bestTime) {
+      bestTime = activeTime;
+      bestProtyle = protyle;
+    }
+  }
+  return bestProtyle;
 }
 
 /**
@@ -22,12 +53,12 @@ export function registerTopBar(plugin: Plugin, options: TopBarOptions): void {
     });
   };
   const renderTopBarItems = (menu: HostMenu): number => {
-    const protyle = (getActiveEditor() as any)?.protyle;
+    const protyle = resolveActiveDocumentProtyle();
     const rootID = protyle?.block?.rootID as string | undefined;
     return options.menus.render("topbar", menu, {
       location: "topbar",
       rootID,
-      selectedDocumentCount: rootID ? 1 : 0,
+      protyle,
       detail: { protyle },
     });
   };
