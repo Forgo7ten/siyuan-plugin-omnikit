@@ -3,17 +3,24 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 const dockPath = new URL("../../src/features/image-compressor/ui/ImageRecordsDock.svelte", import.meta.url);
+const cardPath = new URL("../../src/features/image-compressor/ui/ImageRecordCard.svelte", import.meta.url);
+const refsPath = new URL("../../src/features/image-compressor/ui/ImageRecordReferences.svelte", import.meta.url);
 
 test("ImageRecordsDock status badges use native theme CSS variables without hardcoded hex or rgba colors", async () => {
-  const dock = await readFile(dockPath, "utf8");
+  const [dock, card, refs] = await Promise.all([
+    readFile(dockPath, "utf8"),
+    readFile(cardPath, "utf8"),
+    readFile(refsPath, "utf8"),
+  ]);
+  const combined = [dock, card, refs].join("\n");
 
-  // Verify no hardcoded hex badge colors
-  assert.doesNotMatch(dock, /#388e3c/);
-  assert.doesNotMatch(dock, /#d32f2f/);
-  assert.doesNotMatch(dock, /#1976d2/);
+  // Verify no hardcoded hex badge colors across all Dock UI components
+  assert.doesNotMatch(combined, /#388e3c/);
+  assert.doesNotMatch(combined, /#d32f2f/);
+  assert.doesNotMatch(combined, /#1976d2/);
 
-  // Extract the badge styles block
-  const badgeSection = dock.slice(dock.indexOf(".image-records__badge"), dock.indexOf(".image-records__spinner"));
+  // Extract the badge styles block from ImageRecordCard.svelte
+  const badgeSection = card.slice(card.indexOf(".image-records__badge"), card.indexOf(".image-records__spinner"));
   assert.ok(badgeSection.length > 0, "Badge section should be present");
 
   // Verify badge styles do not contain any hex color (#...) or rgba(...)

@@ -1,13 +1,18 @@
 import { isAbortError } from "../../../core/feedback/UiFeedback.ts";
 import type { FeatureContext } from "../../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../../core/framework/FeatureScope.ts";
-import { combineSignals, listEditorsSafe, resolveEditorRootID, resolveNotebookID } from "../../../core/host/ProtyleAdapter.ts";
+import {
+  combineSignals,
+  flushProtyleTransactions,
+  listEditorsSafe,
+  resolveEditorRootID,
+  resolveNotebookID,
+} from "../../../core/host/ProtyleAdapter.ts";
 import { recordRewrittenReference, type CompressionBatchSummary, type CompressionProgress } from "../policy/CompressionResult.ts";
 import { isDocumentRootIdentity } from "../policy/DocumentIdentity.ts";
 import { localizeRemoteAsset, logReferenceStatus, type ImageProcessingServices } from "../services/ImageProcessingServices.ts";
-import { resolveImageOccurrence } from "../services/ImageOccurrenceResolver.ts";
-import { blockDOM } from "../services/references.ts";
-import { buildReplacementPath, resolveSource, type ImageSource } from "../policy/source.ts";
+import { recaptureReplacedImageOccurrence } from "../services/ImageOccurrenceResolver.ts";
+import { resolveSource, type ImageSource } from "../policy/source.ts";
 import type { OccurrenceTarget } from "../policy/contracts.ts";
 import { scanDocumentImages, type DocumentImageOccurrence } from "./scanDocumentImages.ts";
 
@@ -66,16 +71,15 @@ async function flushMatchingEditors(
     const runner = typeof item.getInstance === "function" ? item.getInstance() : item;
     if (!runner || typeof runner !== "object" || flushed.has(runner)) continue;
     const meta = runner.protyle ?? item.protyle ?? runner;
-    const editorRootID = meta?.block?.rootID ?? runner.block?.rootID ?? item.block?.rootID;
+    const editorRootID = resolveEditorRootID(runner) ?? resolveEditorRootID(item);
     if (requireRootMatch ? editorRootID !== targetRootID : (editorRootID !== undefined && editorRootID !== targetRootID)) {
       continue;
     }
     if (item.disabled || runner.disabled || meta?.disabled || item.destroyed || runner.destroyed || meta?.destroyed) {
       continue;
     }
-    if (typeof runner.flushPendingTransactions !== "function") continue;
     flushed.add(runner);
-    await runner.flushPendingTransactions();
+    await flushProtyleTransactions(item);
     if (signal.aborted || !scope.active) return false;
   }
   return true;
@@ -240,14 +244,6 @@ export async function compressDocumentImages(
             prepared++;
             report(source.raw);
           }
-        }
-        continue;
-      }
-
-      if (source.kind !== "asset") {
-        if (!signal.aborted && scope.active) {
-          prepared++;
-          report(source.raw);
         }
         continue;
       }
@@ -420,21 +416,19 @@ export async function compressDocumentImages(
             report(source.raw);
             continue;
           }
-          const expectedLocalPath = buildReplacementPath(target.oldPath, remotePrepared.localPath, services.origin);
-          const freshDOM = await blockDOM(services.kernel, target.blockID, target.notebook, signal);
-          const recaptured = resolveImageOccurrence(freshDOM, {
-            rootID: target.rootID,
-            notebook: target.notebook,
-            blockID: target.blockID,
-            imageOrdinal: target.imageOrdinal,
-            oldPath: expectedLocalPath,
-          });
+          const recaptured = await recaptureReplacedImageOccurrence(
+            services.kernel,
+            target,
+            remotePrepared.localPath,
+            services.origin,
+            signal,
+          );
           if (!recaptured) {
             summary.conflicts++;
             context.logger.debug("远程图片本地化重读后未能定位原图节点，判定冲突", {
               blockID: target.blockID,
               imageOrdinal: target.imageOrdinal,
-              path: expectedLocalPath,
+              path: remotePrepared.localPath,
             });
             summary.completed++;
             report(source.raw);
@@ -504,11 +498,6 @@ export async function compressDocumentImages(
         source.raw,
       );
       if (!continued) return cancelledSummary(summary);
-      continue;
-    }
-
-    if (source.kind !== "asset") {
-      for (const _item of locations) { summary.skipped++; summary.completed++; }
       continue;
     }
 

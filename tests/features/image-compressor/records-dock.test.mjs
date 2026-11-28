@@ -9,7 +9,11 @@ import {
 import { ImageCompressionRecordStore } from "../../../src/features/image-compressor/store/ImageCompressionRecordStore.ts";
 
 const dockPath = new URL("../../../src/features/image-compressor/ui/ImageRecordsDock.svelte", import.meta.url);
+const cardPath = new URL("../../../src/features/image-compressor/ui/ImageRecordCard.svelte", import.meta.url);
+const recordRefsPath = new URL("../../../src/features/image-compressor/ui/ImageRecordReferences.svelte", import.meta.url);
 const refsPath = new URL("../../../src/features/image-compressor/services/ImageReferences.ts", import.meta.url);
+const assetAvailPath = new URL("../../../src/features/image-compressor/services/assetAvailability.ts", import.meta.url);
+const boxLocatorPath = new URL("../../../src/features/image-compressor/services/boxReferenceLocator.ts", import.meta.url);
 const registrationPath = new URL("../../../src/features/image-compressor/registration.ts", import.meta.url);
 const zhJsonPath = new URL("../../../src/i18n/zh-CN.json", import.meta.url);
 const enJsonPath = new URL("../../../src/i18n/en.json", import.meta.url);
@@ -29,42 +33,51 @@ test("image records dock shares the feature record store and is registered as it
 });
 
 test("dock lookups and availability checks enforce D01/D06/D12/I-05/P3-6/B-3/P3-7 contracts", async () => {
-  const [dock, refs] = await Promise.all([
+  const [dock, card, recordRefs, refs, assetAvail, boxLocator] = await Promise.all([
     readFile(dockPath, "utf8"),
+    readFile(cardPath, "utf8"),
+    readFile(recordRefsPath, "utf8"),
     readFile(refsPath, "utf8"),
+    readFile(assetAvailPath, "utf8"),
+    readFile(boxLocatorPath, "utf8"),
   ]);
+  const dockUI = [dock, card, recordRefs].join("\n");
+  const refsAll = [refs, assetAvail, boxLocator].join("\n");
 
-  assert.match(dock, /onclick=\{\(\) => toggleOriginalReferences\(record\)\}/);
-  assert.match(dock, /onclick=\{\(\) => locateRestoreOccurrences\(record\)\}/);
-  assert.match(refs, /\/api\/asset\/findAssetReferences/);
-  assert.match(refs, /\/api\/block\/getBlockDOMs/);
-  assert.match(refs, /\/api\/block\/getBlockDOM/);
-  assert.match(refs, /\/api\/asset\/statAsset/);
-  assert.match(refs, /\/api\/file\/getFile/);
+  assert.match(card, /onclick=\{\(\) => onToggleOriginalReferences\(record\)\}/);
+  assert.match(card, /onclick=\{\(\) => onLocateRestoreOccurrences\(record\)\}/);
+  assert.match(dock, /onToggleOriginalReferences=\{rec => toggleOriginalReferences\(rec\)\}/);
+  assert.match(dock, /onLocateRestoreOccurrences=\{rec => locateRestoreOccurrences\(rec\)\}/);
+  assert.match(refsAll, /\/api\/asset\/findAssetReferences/);
+  assert.match(refsAll, /\/api\/block\/getBlockDOMs/);
+  assert.match(refsAll, /\/api\/block\/getBlockDOM/);
+  assert.match(refsAll, /\/api\/asset\/statAsset/);
+  assert.match(refsAll, /\/api\/file\/getFile/);
   assert.match(dock, /reconcileRecordPair/);
   assert.match(dock, /locateAssetOccurrences/);
-  assert.match(dock, /image\.records\.imageRefs/);
-  assert.match(dock, /image\.records\.linkRefs/);
-  assert.match(dock, /image\.records\.unsupportedRefs/);
+  assert.match(dockUI, /image\.records\.imageRefs/);
+  assert.match(dockUI, /image\.records\.linkRefs/);
+  assert.match(dockUI, /image\.records\.unsupportedRefs/);
   assert.match(dock, /image\.records\.skippedNotebooks/);
   assert.match(dock, /image\.records\.incompleteLookup/);
   assert.match(dock, /image\.records\.copyManual/);
+  assert.match(dock, /openCopyablePathDialog/);
   assert.match(dock, /const nextOp: OperationKind = lastLocateComplete && occurrences\.length === 0 && conflicts === 0 \? resolvedOp : "incomplete"/);
   assert.match(dock, /store\.markOperation\(record\.originalPath, record\.compressedPath, nextOp\)/);
   assert.match(dock, /references\.commitOccurrence\(target, nextPath,\s*signal\)/);
   assert.match(dock, /openTab\(/);
   assert.match(dock, /jumpToBlock\(/);
   assert.match(dock, /context\.feedback\.copyable\(/);
-  assert.doesNotMatch(dock, /\bshowMessage\b/);
+  assert.doesNotMatch(dockUI, /\bshowMessage\b/);
   assert.match(dock, /showManualCopyDialog/);
   assert.match(dock, /dockAbort\?\.abort\(\)/);
   assert.match(dock, /omnikit-dock-tab-activated/);
   assert.match(dock, /max-height:\s*56px/);
-  assert.doesNotMatch(dock, /relinkAsset|\/api\/asset\/removeAsset|removeAsset\(/);
-  assert.doesNotMatch(dock, /prunedNotice|noSafeOccurrences|MAX_RECORDS|CAPACITY_WARNING_COUNT|capacityBanner/);
+  assert.doesNotMatch(dockUI, /relinkAsset|\/api\/asset\/removeAsset|removeAsset\(/);
+  assert.doesNotMatch(dockUI, /prunedNotice|noSafeOccurrences|MAX_RECORDS|CAPACITY_WARNING_COUNT|capacityBanner/);
   // No statusCache: every activation or refresh re-checks asset availability directly
   assert.match(dock, /onclick=\{\(\) => refresh\(\)\}/);
-  assert.doesNotMatch(dock, /statusCache|STATUS_TTL_MS/);
+  assert.doesNotMatch(dockUI, /statusCache|STATUS_TTL_MS/);
   // P3-7: O(N) cleanup using nextPaths Set (no O(N^2) records.some inside key loop)
   assert.match(dock, /nextPaths\.has\(path\)/);
   // Phase 0 problem 2 contracts: single-pass cold start, per-record abort & stale pair guard, depth-counted busy lock
@@ -95,14 +108,18 @@ test("image records dock i18n defines contextual empty strings and omits obsolet
 });
 
 test("dock reference lookup distinguishes user_click and post_action, preserves action result, and auto-collapses on completion", async () => {
-  const dock = await readFile(dockPath, "utf8");
+  const [dock, recordRefs] = await Promise.all([
+    readFile(dockPath, "utf8"),
+    readFile(recordRefsPath, "utf8"),
+  ]);
 
   assert.match(dock, /async function locateOccurrences\(\s*record:\s*CompressionRecord,\s*mode:\s*"original"\s*\|\s*"compressed",\s*source:\s*"user_click"\s*\|\s*"post_action"\s*=\s*"user_click",?\s*\)/);
   assert.match(dock, /if\s*\(source === "user_click"\)\s*\{\s*message = "";\s*\}/);
   assert.match(dock, /if\s*\(!signal\?\.aborted && !isAbortError\(error\) && source === "user_click"\)/);
   assert.match(dock, /if\s*\(!located\.items\.length && !located\.unsupported\.length\)\s*\{\s*expanded = null;\s*occurrences = \[\];\s*unsupportedRefs = \[\];\s*\}/);
-  assert.match(dock, /applyOccurrenceAction\(record, expanded\.mode, \[item\]\)/);
-  assert.match(dock, /applyOccurrenceAction\(record, expanded\.mode, occurrences\)/);
+  assert.match(dock, /onApplyOccurrenceAction=\{\(rec, mode, items\) => applyOccurrenceAction\(rec, mode, items\)\}/);
+  assert.match(recordRefs, /onApplyOccurrenceAction\(record, mode, \[item\]\)/);
+  assert.match(recordRefs, /onApplyOccurrenceAction\(record, mode, occurrences\)/);
 });
 
 test("image records dock renders Option A brand hero card buffer and i18n hero titles", async () => {
@@ -398,6 +415,13 @@ test("ImageRecordsDock runtime avoids cold-start double verify, prevents stale p
       locateAssetOccurrences, reconcileRecordPair, resolveImageOccurrence,
       findLinkCandidates, sameSource, trySource, isRemoteRecordSource,
     } = __harness;
+    const openCopyablePathDialog = __harness.openCopyablePathDialog ?? ((scope, options) => {
+      if (!scope.active) return undefined;
+      let closed = false;
+      const dialog = new Dialog(options);
+      const release = scope.own(() => { if (!closed) { closed = true; dialog.destroy?.(); } });
+      return { close: () => { if (!closed) { closed = true; dialog.destroy?.(); release(); } } };
+    });
     ${stripped}
     return {
       getState: () => ({ records, assetStatuses, busy: getBusy(), busyDepth, loading, initialized, message }),
@@ -701,6 +725,7 @@ test("ImageRecordsDock runtime avoids cold-start double verify, prevents stale p
       const copyCalls = [];
       let copyResult = true;
       let dialogOpened = 0;
+      let dialogDestroyed = 0;
       const store = {
         store: { subscribe(fn) { fn({ records: [] }); return () => {}; } },
         snapshot: () => [],
@@ -730,6 +755,9 @@ test("ImageRecordsDock runtime avoids cold-start double verify, prevents stale p
             dialogOpened += 1;
             this.element = { querySelector: () => null };
           }
+          destroy() {
+            dialogDestroyed += 1;
+          }
         },
         openTab: () => {},
         isAbortError: e => e?.name === "AbortError",
@@ -756,7 +784,9 @@ test("ImageRecordsDock runtime avoids cold-start double verify, prevents stale p
       await dock.copyPath("assets/fail.png");
       assert.equal(dock.getState().message, "image.records.copyFailed");
       assert.equal(dialogOpened, 1);
+      assert.equal(dialogDestroyed, 0);
       mountCleanup?.();
+      assert.equal(dialogDestroyed, 1, "D-BUG-05: unmounting ImageRecordsDock must auto-destroy open manual copy dialog");
     }
 
     // 6. applyOccurrenceAction appends image.records.resultConflicts only when conflicts > 0
@@ -1070,6 +1100,223 @@ test("locateAssetOccurrences locates remote URLs via readonly SQL + live DOM ver
     const scopedRes = await locateAssetOccurrences(scopedKernel, "http://localhost:6806", normalizedURL, k => k, undefined, { scopeBox: boxID });
     assert.equal(scopedRes.ok, true);
     assert.equal(scopedRes.items.length, 2);
+  } finally {
+    globalThis.document = priorDoc;
+  }
+});
+
+test("D-BUG-01: ?box= locator reports open-but-locked encrypted notebook as encryptedUnavailable, passes showHidden: true, and handles boxDocEnabled existing vs absent root doc", async () => {
+  const boxID = "20260101000001-abcdef0";
+  const blockID = "20260101000002-abcdef0";
+  const searchPath = `assets/enc.png?box=${boxID}`;
+  const boxDocDOM = `<div data-node-id="${boxID}"><div data-node-id="${blockID}"><img data-src="${searchPath}" src="${searchPath}"></div></div>`;
+  const blockDOMStr = `<div data-node-id="${blockID}"><img data-src="${searchPath}" src="${searchPath}"></div>`;
+
+  // 1. Open but locked encrypted notebook (closed: false, encrypted: true, unlocked: false) -> encryptedUnavailable: true
+  {
+    const lockedOpenKernel = {
+      async post(url) {
+        if (url === "/api/notebook/lsNotebooks") {
+          return {
+            code: 0,
+            data: { notebooks: [{ id: boxID, closed: false, encrypted: true, unlocked: false, name: "Vault" }] },
+          };
+        }
+        throw new Error(`Must not call ${url} on locked encrypted notebook`);
+      },
+    };
+    const res = await locateAssetOccurrences(lockedOpenKernel, "http://localhost:6806", searchPath, k => k);
+    assert.equal(res.ok, false);
+    assert.equal(res.complete, false);
+    assert.equal(res.encryptedUnavailable, true);
+    assert.deepEqual(res.skippedNotebooks, [boxID]);
+  }
+
+  const priorDoc = globalThis.document;
+  const imgNode = {
+    hasAttribute: n => n === "data-src" || n === "src",
+    getAttribute: n => (n === "data-src" || n === "src" ? searchPath : null),
+    closest: sel => (sel === "[data-node-id]" ? { getAttribute: () => blockID, querySelector: () => null } : null),
+  };
+  const blockRoot = {
+    getAttribute: n => (n === "data-node-id" ? blockID : null),
+    querySelector: () => null,
+    querySelectorAll: sel => (sel === "img" ? [imgNode] : []),
+  };
+  globalThis.document = {
+    createElement: () => {
+      let currentHtml = "";
+      return {
+        content: {
+          get children() { return currentHtml === blockDOMStr ? [blockRoot] : []; },
+          querySelectorAll: sel => (currentHtml === boxDocDOM && sel === "img" ? [imgNode] : []),
+        },
+        set innerHTML(v) { currentHtml = v; },
+      };
+    },
+  };
+
+  try {
+    // 2. Unlocked encrypted notebook + boxDocEnabled with existing root doc -> showHidden: true + root doc scanned
+    const listBodies = [];
+    const existingBoxDocKernel = {
+      async post(url, body) {
+        if (url === "/api/notebook/lsNotebooks") {
+          return {
+            code: 0,
+            data: {
+              notebooks: [{ id: boxID, closed: false, encrypted: true, unlocked: true, boxDocEnabled: true, name: "Vault" }],
+            },
+          };
+        }
+        if (url === "/api/filetree/listDocsByPath") {
+          listBodies.push(body);
+          return { code: 0, data: { files: [] } };
+        }
+        if (url === "/api/block/getBlockInfo") {
+          assert.deepEqual(body, { id: boxID, notebook: boxID });
+          return { code: 0, data: { id: boxID, rootID: boxID, rootTitle: "Vault Root" } };
+        }
+        if (url === "/api/block/getBlockDOMs") {
+          if (body.ids.includes(boxID)) return { code: 0, data: { [boxID]: boxDocDOM } };
+          if (body.ids.includes(blockID)) return { code: 0, data: { [blockID]: blockDOMStr } };
+          return { code: 0, data: {} };
+        }
+        if (url === "/api/filetree/getFullHPathByID") {
+          return { code: 0, data: "/Vault Root" };
+        }
+        throw new Error(url);
+      },
+    };
+    const existingRes = await locateAssetOccurrences(existingBoxDocKernel, "http://localhost:6806", searchPath, k => k);
+    assert.equal(listBodies.length, 1);
+    assert.equal(listBodies[0].showHidden, true);
+    assert.equal(existingRes.ok, true);
+    assert.equal(existingRes.complete, true);
+    assert.equal(existingRes.items.length, 1);
+    assert.equal(existingRes.items[0].target.rootID, boxID);
+
+    // 3. boxDocEnabled with uncreated (non-existent) root doc -> must NOT mark complete = false
+    const absentBoxDocKernel = {
+      async post(url, body) {
+        if (url === "/api/notebook/lsNotebooks") {
+          return {
+            code: 0,
+            data: {
+              boxDocEnabled: true,
+              notebooks: [{ id: boxID, closed: false, encrypted: true, unlocked: true, name: "Vault" }],
+            },
+          };
+        }
+        if (url === "/api/filetree/listDocsByPath") {
+          assert.equal(body.showHidden, true);
+          return { code: 0, data: { files: [] } };
+        }
+        if (url === "/api/block/getBlockInfo") {
+          throw Object.assign(new Error("Block not found"), { outcome: "rejected", code: -1 });
+        }
+        if (url === "/api/block/getBlockDOMs") {
+          return { code: 0, data: {} };
+        }
+        throw new Error(url);
+      },
+    };
+    const absentRes = await locateAssetOccurrences(absentBoxDocKernel, "http://localhost:6806", searchPath, k => k);
+    assert.equal(absentRes.ok, true);
+    assert.equal(absentRes.complete, true, "uncreated notebook root doc must not degrade complete to false");
+    assert.equal(absentRes.items.length, 0);
+  } finally {
+    globalThis.document = priorDoc;
+  }
+});
+
+test("D-BUG-02: locateAssetOccurrences routes avID, html, title-image, and empty-DOM references into unsupported with complete === false", async () => {
+  const rootID = "20260101000000-abcdef0";
+  const boxID = "20260101000001-abcdef0";
+  const blockImgAndTitle = "20260101000002-abcdef0";
+  const blockHtml = "20260101000003-abcdef0";
+  const blockAv = "20260101000004-abcdef0";
+  const blockUnmappable = "20260101000005-abcdef0";
+
+  const priorDoc = globalThis.document;
+  const imgNode = {
+    tagName: "IMG",
+    hasAttribute: n => n === "data-src" || n === "src",
+    getAttribute: n => (n === "data-src" || n === "src" ? "assets/a.png" : null),
+    closest: () => null,
+  };
+  globalThis.document = {
+    createElement: () => {
+      let html = "";
+      return {
+        set innerHTML(v) { html = v; },
+        get content() {
+          const isImgBlock = html.includes(blockImgAndTitle);
+          const id = isImgBlock ? blockImgAndTitle : blockUnmappable;
+          return {
+            children: [{
+              getAttribute: n => (n === "data-node-id" ? id : null),
+              querySelector: () => null,
+              querySelectorAll: sel => (isImgBlock && sel === "img" ? [imgNode] : []),
+            }],
+            querySelectorAll: () => [],
+          };
+        },
+      };
+    },
+  };
+
+  try {
+    const domRequestedIds = [];
+    const kernel = {
+      async post(url, body) {
+        if (url === "/api/asset/findAssetReferences") {
+          return {
+            code: 0,
+            data: {
+              references: [
+                // Same blockID has both a title-image AND a normal image -> neither must shadow the other!
+                { type: "title-image", rootID, notebook: boxID, blockID: blockImgAndTitle, relinkable: true, reference: "assets/a.png" },
+                { type: "image", rootID, notebook: boxID, blockID: blockImgAndTitle, relinkable: true, reference: "assets/a.png" },
+                // AV cell with relinkable: true and avID
+                { type: "av-asset", rootID, notebook: boxID, blockID: blockAv, avID: "20260101000099-av12345", relinkable: true, reference: "assets/a.png" },
+                // HTML block with relinkable: true
+                { type: "html", rootID, notebook: boxID, blockID: blockHtml, relinkable: true, reference: "assets/a.png" },
+                // Orphan AV without rootID -> counted into unavailableAttributeViews
+                { type: "av-url", rootID: "", avID: "20260101000098-av00000", relinkable: true, reference: "assets/a.png" },
+                // Ordinary block that yields 0 DOM occurrences (e.g. file annotation / protected container)
+                { type: "annotation", rootID, notebook: boxID, blockID: blockUnmappable, relinkable: true, reference: "assets/a.png" },
+              ],
+              skippedNotebooks: [],
+              unavailableAttributeViews: [],
+            },
+          };
+        }
+        if (url === "/api/block/getBlockDOMs") {
+          domRequestedIds.push(...body.ids);
+          return {
+            code: 0,
+            data: {
+              [blockImgAndTitle]: `<div data-node-id="${blockImgAndTitle}"><img data-src="assets/a.png" src="assets/a.png"></div>`,
+              [blockUnmappable]: `<div data-node-id="${blockUnmappable}"><span data-type="file-annotation-ref">ref</span></div>`,
+            },
+          };
+        }
+        if (url === "/api/filetree/getFullHPathByID") {
+          return { code: 0, data: "/Test Doc" };
+        }
+        throw new Error(url);
+      },
+    };
+
+    const res = await locateAssetOccurrences(kernel, "http://localhost:6806", "assets/a.png", k => k);
+    assert.equal(res.ok, true);
+    assert.equal(res.complete, false, "non-DOM references must set complete === false so record is never falsely marked replaced");
+    assert.equal(res.items.length, 1);
+    assert.equal(res.items[0].target.blockID, blockImgAndTitle);
+    assert.equal(res.unavailableAttributeViews, 1, "unsupported row without rootID must increment unavailableAttributeViews");
+    assert.deepEqual(domRequestedIds, [blockImgAndTitle, blockUnmappable], "avID and html rows must not fetch block DOM");
+    assert.equal(res.unsupported.length, 4, "title-image, avID, html, and 0-item block must all appear in unsupported");
   } finally {
     globalThis.document = priorDoc;
   }

@@ -3,16 +3,16 @@ import { ImageCompressorFeature } from "./ImageCompressorFeature.ts";
 import { reloadLoadedImageRecords } from "./store/ImageCompressionRecordStore.ts";
 import ImageRecordsDock from "./ui/ImageRecordsDock.svelte";
 import ImageSettingsBridge from "./ui/ImageSettingsBridge.svelte";
-import { defaultImageFeatureConfig, parseImageConfig, type ImageFeatureConfig } from "./policy/parseImageConfig.ts";
+import { defaultImageFeatureConfig, IMAGE_FEATURE_ID, parseImageConfig, type ImageFeatureConfig } from "./policy/parseImageConfig.ts";
 export type { ImageFeatureConfig, PagePermission } from "./policy/parseImageConfig.ts";
 
 export const imageCompressorRegistration = defineFeature<ImageFeatureConfig>({
-  id: "imageCompressor",
+  id: IMAGE_FEATURE_ID,
   titleKey: "feature.imageCompressor.title",
   descriptionKey: "feature.imageCompressor.description",
   defaultEnabled: true,
   frontends: ["all"],
-  file: featureConfigFile("imageCompressor"),
+  file: featureConfigFile(IMAGE_FEATURE_ID),
   codec: { defaults: defaultImageFeatureConfig, parse: parseImageConfig },
   create: (plugin, settings) => new ImageCompressorFeature(plugin, settings),
   settingsView: ImageSettingsBridge,

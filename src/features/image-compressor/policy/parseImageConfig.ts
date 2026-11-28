@@ -1,3 +1,4 @@
+export const IMAGE_FEATURE_ID = "imageCompressor";
 export const MiB = 1024 * 1024;
 export const WEBP_MAX_DIMENSION = 16_383;
 export const NODE_ID = /^\d{14}-[a-z0-9]{7}$/;
@@ -90,6 +91,7 @@ export function parseImageConfig(raw: unknown): ImageConfig {
   };
 }
 
-export function autoAllowed(config: ImageConfig, rootID: string): boolean {
-  return NODE_ID.test(rootID) && (config.auto.globalEnabled || Object.hasOwn(config.auto.pageAllowlist, rootID));
+export function autoAllowed(config: ImageConfig, rootID: string | undefined, featureEnabled = true): boolean {
+  return featureEnabled && typeof rootID === "string" && NODE_ID.test(rootID) &&
+    (config.auto.globalEnabled || Object.hasOwn(config.auto.pageAllowlist, rootID));
 }

@@ -41,9 +41,6 @@ export class SourceReader {
     abort(options.signal);
     const provided = options.providedFiles?.get(source.key);
     if (provided) { if (provided.size > options.maxBytes) throw new Error("Selected file exceeds byte limit"); return { blob: provided, name: provided.name }; }
-    if (source.kind === "file") {
-      throw new Error("Local file sources are not supported");
-    }
     if (source.kind === "remote") {
       requireRemotePermission(source.url);
       if (this.desktop) return this.desktop.download(source.url, options);

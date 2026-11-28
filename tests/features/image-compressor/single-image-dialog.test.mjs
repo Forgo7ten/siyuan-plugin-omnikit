@@ -608,7 +608,7 @@ test("D02 + P1-3: remote localization unknown aborts WebP replacement and compre
       { rootID, notebook },
       mockServices,
     );
-    assert.deepEqual(failedOutcome, { kind: "notify", key: "image.single.failed" });
+    assert.deepEqual(failedOutcome, { kind: "notify", key: "image.single.failed", type: "error" });
   } finally {
     scope.dispose();
     globalThis.document = priorDoc;
@@ -669,7 +669,7 @@ test("SingleImageAction rejects local file:// sources as image.single.unmappable
       { rootID, notebook },
       mockServices,
     );
-    assert.deepEqual(quickOutcome, { kind: "notify", key: "image.single.unmappable" });
+    assert.deepEqual(quickOutcome, { kind: "notify", key: "image.single.unmappable", type: "error" });
 
     const customOutcome = await compressSelectedImageCustom(
       { element: imgElement },
@@ -678,11 +678,67 @@ test("SingleImageAction rejects local file:// sources as image.single.unmappable
       { rootID, notebook },
       mockServices,
     );
-    assert.deepEqual(customOutcome, { kind: "notify", key: "image.single.unmappable" });
+    assert.deepEqual(customOutcome, { kind: "notify", key: "image.single.unmappable", type: "error" });
     assert.equal(touchedDownstream, false);
   } finally {
     scope.dispose();
     globalThis.document = priorDoc;
+  }
+});
+
+test("D-BUG-05: SingleImageAction and ImageController propagate error notification level on invalidTarget, unmappable, and failed", async () => {
+  const { ImageController } = await import("../../../src/features/image-compressor/ImageController.ts");
+  const { TaskRegistry } = await import("../../../src/features/image-compressor/policy/TaskRegistry.ts");
+  const { compressSelectedImageQuick } = await import("../../../src/features/image-compressor/actions/SingleImageAction.ts");
+
+  const scope = new FeatureScope();
+  const feedbackCalls = [];
+  const ctx = {
+    plugin: {
+      i18n: {
+        "image.single.invalidTarget": "Invalid target",
+        "image.single.unmappable": "Unmappable target",
+        "image.single.failed": "Compression failed",
+        "image.single.noBenefit": "No benefit",
+      },
+    },
+    feedback: {
+      notify(msg, type, opts) { feedbackCalls.push({ msg, type, opts }); },
+    },
+    logger: { warn() {}, error() {}, debug() {} },
+  };
+  const services = {
+    origin: "https://siyuan.test",
+    config: () => defaultImageFeatureConfig(),
+    kernel: { post: async () => { throw new Error("boom"); } },
+    ui: { notify() {}, copyablePath() {}, progress: () => ({ close() {} }) },
+  };
+  const controller = new ImageController(ctx, scope, services, new TaskRegistry());
+
+  try {
+    const disabledOutcome = await compressSelectedImageQuick({}, ctx, scope, {
+      rootID: "20240101000000-abcdefg",
+      notebook: "20240101000000-hijklmn",
+      disabled: true,
+    }, services);
+    assert.deepEqual(disabledOutcome, { kind: "notify", key: "image.single.invalidTarget", type: "error" });
+
+    controller.present(disabledOutcome);
+    controller.present({ kind: "notify", key: "image.single.unmappable", type: "error" });
+    controller.present({ kind: "notify", key: "image.single.failed", type: "error" });
+    controller.present({ kind: "notify", key: "image.single.noBenefit" });
+
+    assert.deepEqual(
+      feedbackCalls.map(c => [c.msg, c.type]),
+      [
+        ["Invalid target", "error"],
+        ["Unmappable target", "error"],
+        ["Compression failed", "error"],
+        ["No benefit", "info"],
+      ],
+    );
+  } finally {
+    scope.dispose();
   }
 });
 

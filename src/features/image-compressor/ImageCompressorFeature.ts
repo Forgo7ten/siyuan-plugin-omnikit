@@ -15,20 +15,17 @@ import {
   resolveNotebookID,
   resolveProtyleElement,
 } from "../../core/host/ProtyleAdapter.ts";
-import { NODE_ID } from "./policy/parseImageConfig.ts";
+import { autoAllowed, IMAGE_FEATURE_ID, NODE_ID } from "./policy/parseImageConfig.ts";
 import { TaskRegistry } from "./policy/TaskRegistry.ts";
-import { IMAGE_FEATURE_ID } from "./policy/settings.ts";
 import type { ImageFeatureConfig } from "./registration.ts";
 import { registerAutoUpload } from "./actions/AutoUploadHandler.ts";
-import { shouldAutoCompress } from "./policy/AutoPolicy.ts";
 import { imageMenuContributions } from "./actions/menuContributions.ts";
 import { type SingleImageEditorContext } from "./actions/SingleImageAction.ts";
 import { ImageController } from "./ImageController.ts";
 import { translate } from "../../i18n/translate.ts";
 import { createImageServices } from "./services/createImageServices.ts";
 import type { ImageProcessingServices } from "./services/ImageProcessingServices.ts";
-import { watchRemoteImages, type RemoteWatcherHandle } from "./actions/RemoteImageWatcher.ts";
-import type { DocumentRow } from "./services/references.ts";
+import { watchRemoteImages, type DocumentRow, type RemoteWatcherHandle } from "./actions/RemoteImageWatcher.ts";
 
 export type ResolveDocumentResult = { status: "ok" | "invalid" | "error" | "aborted" };
 
@@ -97,12 +94,7 @@ export class ImageCompressorFeature extends BaseFeature {
         const config = this.config(ctx);
         const featureEnabled = scope.active && ctx.settings.getFeatureEnabled(this.meta.id, this.meta.defaultEnabled);
         const allowlisted = Boolean(config.auto.pageAllowlist[rootID]);
-        const allowed = shouldAutoCompress({
-          featureEnabled,
-          rootID,
-          globalEnabled: config.auto.globalEnabled,
-          allowlisted,
-        });
+        const allowed = autoAllowed(config, rootID, featureEnabled);
         ctx.logger.debug("自动压缩策略检查完成", {
           rootID,
           featureEnabled,
@@ -137,9 +129,14 @@ export class ImageCompressorFeature extends BaseFeature {
     };
     const attach = (protyle: any) => {
       const element = resolveProtyleElement(protyle);
+      if (!element) return;
       const rootID = resolveEditorRootID(protyle);
       const notebook = resolveNotebookID(protyle);
-      if (!element || !rootID || !notebook || protyle?.disabled) return;
+      if (!rootID || !notebook || protyle?.disabled) {
+        disposeEntry(editors.get(element));
+        editors.delete(element);
+        return;
+      }
       const prior = editors.get(element);
       if (prior && prior.rootID === rootID && prior.notebook === notebook) {
         if (prior.handle) void prior.handle.reconcile();
@@ -148,7 +145,7 @@ export class ImageCompressorFeature extends BaseFeature {
       disposeEntry(prior);
       const entry: EditorEntry = { rootID, notebook, initAbort: new AbortController() };
       editors.set(element, entry);
-      const doc: DocumentRow = { id: rootID, root_id: rootID, box: notebook };
+      const doc: DocumentRow = { id: rootID, box: notebook };
       void watchRemoteImages(element, doc, scope, services, {
         warn: (message, data) => ctx.logger.warn(message, data),
         debug: (message, data) => ctx.logger.debug(message, data),

@@ -1,16 +1,29 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { shouldAutoCompress } from "../../../src/features/image-compressor/policy/AutoPolicy.ts";
+import { autoAllowed, defaultImageFeatureConfig, IMAGE_FEATURE_ID } from "../../../src/features/image-compressor/policy/parseImageConfig.ts";
 import { extractDocTreeDocumentIDs } from "../../../src/core/feedback/MenuRouter.ts";
 
-const basic = { featureEnabled: true, globalEnabled: false, allowlisted: false, rootID: "20250101000000-abcdefg" };
-test("OmniKit auto-compression truth table", () => {
-  for (const globalEnabled of [false, true]) for (const allowlisted of [false, true]) {
-    const expected = globalEnabled || allowlisted;
-    assert.equal(shouldAutoCompress({ ...basic, globalEnabled, allowlisted }), expected);
+const rootID = "20250101000000-abcdefg";
+
+test("OmniKit auto-compression truth table via parseImageConfig.autoAllowed", () => {
+  assert.equal(IMAGE_FEATURE_ID, "imageCompressor");
+  for (const globalEnabled of [false, true]) {
+    for (const allowlisted of [false, true]) {
+      const cfg = defaultImageFeatureConfig();
+      cfg.auto.globalEnabled = globalEnabled;
+      if (allowlisted) cfg.auto.pageAllowlist[rootID] = { grantedAt: 1 };
+      const expected = globalEnabled || allowlisted;
+      assert.equal(autoAllowed(cfg, rootID, true), expected);
+      assert.equal(autoAllowed(cfg, rootID), expected);
+    }
   }
-  assert.equal(shouldAutoCompress({ ...basic, featureEnabled: false, globalEnabled: true, allowlisted: true }), false);
-  assert.equal(shouldAutoCompress({ ...basic, rootID: "", globalEnabled: true }), false);
+  const enabledCfg = defaultImageFeatureConfig();
+  enabledCfg.auto.globalEnabled = true;
+  enabledCfg.auto.pageAllowlist[rootID] = { grantedAt: 1 };
+  assert.equal(autoAllowed(enabledCfg, rootID, false), false);
+  assert.equal(autoAllowed(enabledCfg, "", true), false);
+  assert.equal(autoAllowed(enabledCfg, undefined, true), false);
+  assert.equal(autoAllowed(enabledCfg, "not-a-node-id", true), false);
 });
 
 test("extractDocTreeDocumentIDs handles SiYuan navigation.ts payloads and boxDocEnabled documents", () => {

@@ -10,14 +10,13 @@
   import { SettingsConflictError, isSettingsConflictError } from "../../../core/store/SettingsConflictError.ts";
   import type { RegisterDraftParticipant } from "../../../ui/settings/DraftParticipant.ts";
   import type { ImageFeatureConfig } from "../policy/parseImageConfig.ts";
-  import { defaultImageFeatureConfig, NODE_ID, parseImageConfig } from "../policy/parseImageConfig.ts";
-  import { IMAGE_FEATURE_ID } from "../policy/settings.ts";
+  import { defaultImageFeatureConfig, IMAGE_FEATURE_ID, NODE_ID, parseImageConfig } from "../policy/parseImageConfig.ts";
   import { resolveAllowlistPaths } from "../services/allowlistPaths.ts";
   import {
     getCachedSmartCompressionSupport,
     probeSmartCompressionSupport,
     type SmartCompressionSupport,
-  } from "../services/image.ts";
+  } from "../services/smartCompressionProbe.ts";
 
   interface Props {
     store: JsonStore<ImageFeatureConfig>;

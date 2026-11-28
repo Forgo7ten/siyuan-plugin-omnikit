@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { resolveImageOccurrence } from "../../../src/features/image-compressor/services/ImageOccurrenceResolver.ts";
+import {
+  DEFAULT_PERSISTENCE_RETRY_DELAYS_MS,
+  recaptureReplacedImageOccurrence,
+  resolveImageOccurrence,
+  waitForPersistedImageOccurrence,
+} from "../../../src/features/image-compressor/services/ImageOccurrenceResolver.ts";
 import {
   commitOneImage,
   commitOneImageDetailed,
@@ -388,7 +393,66 @@ test("writer supports bidirectional restore to HTTP(S) URLs for both images and 
   for (const unsafe of ["javascript:alert(1)", "file:///etc/passwd", "https://user:pass@cdn.example/a.png"]) {
     await assert.rejects(
       commitOneImageDetailed(kernel, imgTarget, unsafe, "http://localhost:6806"),
-      /Only HTTP\(S\) image links are supported|Replacement path must be an asset or remote URL/,
+      /Only HTTP\(S\) image links are supported|Local file sources are not supported/,
     );
   }
+}));
+
+test("D-BUG-03 + D-CLEAN-04: waitForPersistedImageOccurrence supports progressive backoff, zero-delay first hit, legacy numeric attempts, and recaptureReplacedImageOccurrence", async () => withDocument(async () => {
+  assert.deepEqual(DEFAULT_PERSISTENCE_RETRY_DELAYS_MS, [60, 100, 160, 250, 400, 600]);
+  const evidence = { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "assets/new.png" };
+
+  // 1. Immediate hit on first attempt incurs zero retry delay
+  let calls = 0;
+  const instantStart = Date.now();
+  const instantTarget = await waitForPersistedImageOccurrence(
+    { async post() { calls++; return { data: { id: blockID, dom: blockDOM(["assets/new.png"]) } }; } },
+    evidence,
+  );
+  assert.equal(calls, 1);
+  assert.equal(instantTarget?.oldPath, "assets/new.png");
+  assert.ok(Date.now() - instantStart < 50);
+
+  // 2. Progressive delay schedule resolves once txQueue flushes on later attempt
+  let delayedCalls = 0;
+  const delayedTarget = await waitForPersistedImageOccurrence(
+    {
+      async post() {
+        delayedCalls++;
+        if (delayedCalls < 4) return { data: { id: blockID, dom: blockDOM(["assets/old.png"]) } };
+        return { data: { id: blockID, dom: blockDOM(["assets/new.png"]) } };
+      },
+    },
+    evidence,
+    [5, 10, 15, 20],
+  );
+  assert.equal(delayedCalls, 4);
+  assert.equal(delayedTarget?.oldPath, "assets/new.png");
+
+  // 3. Legacy numeric attempts compatibility
+  let numericCalls = 0;
+  const missTarget = await waitForPersistedImageOccurrence(
+    { async post() { numericCalls++; return { data: { id: blockID, dom: blockDOM([]) } }; } },
+    evidence,
+    2,
+  );
+  assert.equal(missTarget, undefined);
+  assert.equal(numericCalls, 2);
+
+  // 4. recaptureReplacedImageOccurrence builds expected replacement path (preserving ?box=) and re-reads fresh block DOM
+  const remotePrevious = { rootID, notebook, blockID, imageOrdinal: 0, oldPath: "https://cdn.example/pic.png?token=1#sec" };
+  const localizedPath = `assets/pic.png?box=${notebook}`;
+  const recaptured = await recaptureReplacedImageOccurrence(
+    { async post() { return { data: { id: blockID, dom: blockDOM([localizedPath]) } }; } },
+    remotePrevious,
+    localizedPath,
+    "http://localhost:6806",
+  );
+  assert.deepEqual(recaptured, {
+    rootID,
+    notebook,
+    blockID,
+    imageOrdinal: 0,
+    oldPath: localizedPath,
+  });
 }));

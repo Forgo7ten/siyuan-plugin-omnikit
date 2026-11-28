@@ -16,7 +16,7 @@ function setup() {
     off(name) { listeners.delete(name); },
   } };
   const scope = new FeatureScope();
-  const services = { origin: "https://siyuan.test", config: () => ({}) };
+  const services = { origin: "https://siyuan.test", config: () => defaultImageFeatureConfig() };
   let compressCalls = 0;
   services.compressOccurrence = async () => { compressCalls++; return { status: "skipped" }; };
   registerAutoUpload(plugin, scope, () => true, services,
@@ -108,7 +108,7 @@ test("unauthorized document upload remains completely silent without emitting no
   let compressCalls = 0;
   const services = {
     origin: "https://siyuan.test",
-    config: () => ({}),
+    config: () => defaultImageFeatureConfig(),
     compressOccurrence: async () => { compressCalls++; return { status: "skipped" }; },
   };
   const notices = [];
@@ -157,7 +157,7 @@ test("upload where all images are skipped via observed insertion remains complet
   let compressCalls = 0;
   const services = {
     origin: "https://siyuan.test",
-    config: () => ({}),
+    config: () => defaultImageFeatureConfig(),
     kernel: {
       async post(url) {
         if (url === "/api/block/getBlockDOM") {
@@ -280,7 +280,7 @@ test("I-03: without new MutationObserver evidence or on pre-existing img attribu
   let updateBlockCalls = 0;
   const services = {
     origin: "https://siyuan.test",
-    config: () => ({}),
+    config: () => defaultImageFeatureConfig(),
     kernel: {
       async post(url) {
         if (url === "/api/block/updateBlock") updateBlockCalls++;
@@ -367,7 +367,7 @@ test("P1-3: single auto-upload with reference === unknown emits singleReason unk
   const notices = [];
   const services = {
     origin: "https://siyuan.test",
-    config: () => ({}),
+    config: () => defaultImageFeatureConfig(),
     kernel: {
       async post(url) {
         if (url === "/api/block/getBlockDOM") {
@@ -464,7 +464,7 @@ test("multi-image auto-upload (1 replaced + 1 unknown) counts unknown independen
   const notices = [];
   const services = {
     origin: "https://siyuan.test",
-    config: () => ({}),
+    config: () => defaultImageFeatureConfig(),
     kernel: {
       async post(url, body) {
         if (url === "/api/block/getBlockDOM") {
@@ -595,7 +595,7 @@ test("synchronously unauthorized document upload does not register onComplete or
     plugin,
     scope,
     () => false, // synchronous false
-    { origin: "https://siyuan.test", config: () => ({}) },
+    { origin: "https://siyuan.test", config: () => defaultImageFeatureConfig() },
     { warn() {}, debug() {} },
   );
   listeners.get("before-upload-assets")({
@@ -745,7 +745,7 @@ test("H1: before-upload-assets listener disconnects MutationObserver and swallow
       plugin,
       scope,
       () => true,
-      { origin: "https://siyuan.test", config: () => ({}) },
+      { origin: "https://siyuan.test", config: () => defaultImageFeatureConfig() },
       { warn(msg, data) { warnings.push({ msg, data }); }, debug() {} },
     );
 
@@ -771,4 +771,59 @@ test("H1: before-upload-assets listener disconnects MutationObserver and swallow
     globalThis.MutationObserver = priorObserver;
     scope.dispose();
   }
+});
+
+test("D-BUG-03: waitForObservedImages filters out SpinBlockDOM detached transient nodes and refreshes live ordinal", async () => {
+  const oldTransientImg = {
+    closest: () => ({ dataset: { nodeId: "block-old" }, querySelectorAll: () => [oldTransientImg], closest: () => null }),
+  };
+  const siblingImg = {};
+  const liveImg = {
+    closest: sel => sel === "[data-node-id]"
+      ? {
+          dataset: { nodeId: "block-split" },
+          querySelectorAll: s => (s === "img" ? [siblingImg, liveImg] : []),
+          closest: () => null,
+        }
+      : null,
+  };
+  const connected = new Set([liveImg]);
+  const fakeEditor = {
+    contains: node => connected.has(node),
+  };
+
+  const observed = [
+    {
+      rootID: "20240101000000-abcdefg",
+      notebook: "20240101000000-box1234",
+      blockID: "block-old",
+      imageOrdinal: 0,
+      oldPath: "assets/new.png",
+      key: "asset:assets/new.png",
+      element: oldTransientImg,
+    },
+  ];
+
+  // Insert live replacement node after 25ms (simulating SpinBlockDOM after native onComplete)
+  setTimeout(() => {
+    observed.push({
+      rootID: "20240101000000-abcdefg",
+      notebook: "20240101000000-box1234",
+      blockID: "block-initial",
+      imageOrdinal: 0,
+      oldPath: "assets/new.png",
+      key: "asset:assets/new.png",
+      element: liveImg,
+    });
+  }, 25);
+
+  const matches = await waitForObservedImages(
+    observed,
+    "asset:assets/new.png",
+    new AbortController().signal,
+    fakeEditor,
+  );
+  assert.equal(matches.length, 1, "detached SpinBlockDOM node must be discarded so live node remains unique");
+  assert.equal(matches[0].blockID, "block-split");
+  assert.equal(matches[0].imageOrdinal, 1, "ordinal must be re-verified from current live block DOM");
 });

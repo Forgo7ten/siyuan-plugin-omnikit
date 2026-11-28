@@ -13,9 +13,9 @@ const read = path => readFile(new URL(path, import.meta.url), "utf8");
 test("SingleImageAction separates quiet cancellation from error handling", async () => {
   const action = await read("../../../src/features/image-compressor/actions/SingleImageAction.ts");
 
-  assert.match(action, /const signal = scope\.signal;\s*if \(!scope\.active \|\| signal\.aborted\) return;\s*if \(editor\.disabled\) return \{ kind: "notify", key: "image\.single\.invalidTarget" \};/);
-  assert.match(action, /let target = await resolveSelectedOccurrence\(menuDetail, editor, services, signal\);\s*if \(!scope\.active \|\| signal\.aborted\) return;\s*if \(!target\) return \{ kind: "notify", key: "image\.single\.unmappable" \};/);
-  assert.match(action, /const target = await resolveSelectedOccurrence\(menuDetail, editor, services, signal\);\s*if \(!scope\.active \|\| signal\.aborted\) return;\s*if \(!target\) return \{ kind: "notify", key: "image\.single\.unmappable" \};/);
+  assert.match(action, /const signal = scope\.signal;\s*if \(!scope\.active \|\| signal\.aborted\) return;\s*if \(editor\.disabled\) return \{ kind: "notify", key: "image\.single\.invalidTarget", type: "error" \};/);
+  assert.match(action, /let target = await resolveSelectedOccurrence\(menuDetail, editor, services, signal\);\s*if \(!scope\.active \|\| signal\.aborted\) return;\s*if \(!target\) return \{ kind: "notify", key: "image\.single\.unmappable", type: "error" \};/);
+  assert.match(action, /const target = await resolveSelectedOccurrence\(menuDetail, editor, services, signal\);\s*if \(!scope\.active \|\| signal\.aborted\) return;\s*if \(!target\) return \{ kind: "notify", key: "image\.single\.unmappable", type: "error" \};/);
 
   const quickBody = action.slice(action.indexOf("export async function compressSelectedImageQuick"), action.indexOf("export async function compressSelectedImageCustom"));
   assert.doesNotMatch(quickBody, /services\.ui\.notify/);

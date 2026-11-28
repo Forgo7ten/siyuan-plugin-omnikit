@@ -80,10 +80,11 @@ test('source resolver separates 100%.png vs 100%25.png, preserves case sensitivi
   assert.equal(sameSource('file:///tmp/a.png', 'file:///tmp/a.png', 'https://kernel.example'), false);
 });
 
-test('source resolver handles Windows and file URLs but rejects network shares', () => {
-  assert.equal(resolveSource('C:\\images\\cat.png', 'https://kernel.example').kind, 'file');
-  assert.equal(resolveSource('file:///C:/images/cat.png', 'https://kernel.example').kind, 'file');
-  assert.throws(() => resolveSource('\\\\server\\share\\cat.png', 'https://kernel.example'));
+test('source resolver rejects Windows drive paths, file:// URLs, UNC shares, and non-asset absolute paths', () => {
+  assert.throws(() => resolveSource('C:\\images\\cat.png', 'https://kernel.example'), /Local file sources are not supported/);
+  assert.throws(() => resolveSource('file:///C:/images/cat.png', 'https://kernel.example'), /Local file sources are not supported/);
+  assert.throws(() => resolveSource('\\\\server\\share\\cat.png', 'https://kernel.example'), /Local file sources are not supported/);
+  assert.throws(() => resolveSource('/tmp/local.png', 'https://kernel.example'), /Local file sources are not supported/);
   assert.equal(outputName('../圖 表?.png'), '圖 表_.webp');
 });
 

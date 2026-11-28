@@ -1,20 +1,21 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import { Dialog, openTab } from "siyuan";
+  import { openTab } from "siyuan";
   import { isAbortError } from "../../../core/feedback/UiFeedback.ts";
   import { KernelClient } from "../../../core/host/KernelClient.ts";
   import { imageRecordsFor, isRemoteRecordSource } from "../store/ImageCompressionRecordStore.ts";
-  import { ReferenceService } from "../services/references.ts";
+  import { ReferenceService } from "../services/SafeBlockWriter.ts";
+  import { checkAssetAvailability, reconcileRecordPair } from "../services/assetAvailability.ts";
   import {
-    checkAssetAvailability,
     locateAssetOccurrences,
-    reconcileRecordPair,
     type OccurrenceItem,
     type UnsupportedReferenceItem,
   } from "../services/ImageReferences.ts";
   import { sameSource, trySource } from "../policy/source.ts";
   import type { FeatureContext } from "../../../core/framework/FeatureContext.ts";
   import type { AssetAvailability, CompressionRecord, OperationKind } from "../policy/contracts.ts";
+  import { openCopyablePathDialog, type ImageTaskScope } from "./ImageTaskUI.ts";
+  import ImageRecordCard from "./ImageRecordCard.svelte";
 
   interface Props {
     context: FeatureContext;
@@ -41,9 +42,16 @@
   let initialized = false;
   let lastLocateOk = false;
   let lastLocateComplete = false;
+  let unmounted = false;
 
-  let imageItems = $derived(occurrences.filter(item => item.target.kind !== "link"));
-  let linkItems = $derived(occurrences.filter(item => item.target.kind === "link"));
+  const dockDisposers = new Set<() => void>();
+  const dockScope: ImageTaskScope = {
+    get active() { return !unmounted; },
+    own(dispose: () => void) {
+      dockDisposers.add(dispose);
+      return () => { dockDisposers.delete(dispose); };
+    },
+  };
 
   function format(key: string, values: Record<string, string | number>): string {
     return t(key, values);
@@ -51,25 +59,6 @@
 
   function notifyDock(text: string, type: "info" | "error" = "info", timeout = 3000): void {
     context.feedback.notify(text, type, { timeout });
-  }
-
-  function previewSrc(path: string): string {
-    const parsed = trySource(path, origin);
-    return parsed?.kind === "asset" ? parsed.fetchURL : `/${path}`;
-  }
-
-  function badgeVariant(status: DisplayStatus | undefined): "checking" | "present" | "missing" | "unknown" {
-    if (status === "checking") return "checking";
-    if (status === "present") return "present";
-    if (status === "missing-confirmed") return "missing";
-    return "unknown";
-  }
-
-  function badgeTextKey(status: DisplayStatus | undefined): string {
-    if (status === "checking") return "image.records.assetStatus.checking";
-    if (status === "present") return "image.records.assetStatus.present";
-    if (status === "missing-confirmed") return "image.records.assetStatus.missing";
-    return "image.records.assetStatus.unknown";
   }
 
   function jumpToBlock(blockID: string): void {
@@ -218,6 +207,9 @@
     window.addEventListener("omnikit-dock-tab-activated", handleTabActivate);
     void refresh();
     return () => {
+      unmounted = true;
+      for (const dispose of [...dockDisposers]) dispose();
+      dockDisposers.clear();
       cancelAllRecordVerifications();
       dockAbort?.abort();
       unsubscribe();
@@ -480,20 +472,12 @@
   }
 
   function showManualCopyDialog(path: string): void {
-    const dialog = new Dialog({
+    openCopyablePathDialog(dockScope, {
       title: t("image.records.title"),
-      content: '<div class="b3-dialog__content"><p class="omnikit-manual-copy-label"></p><input class="b3-text-field omnikit-manual-copy-input" readonly /></div>',
+      reasonText: t("image.records.copyManual"),
+      path,
       width: "min(520px, 92vw)",
     });
-    const label = dialog.element.querySelector<HTMLElement>(".omnikit-manual-copy-label");
-    const input = dialog.element.querySelector<HTMLInputElement>(".omnikit-manual-copy-input");
-    if (label) label.textContent = t("image.records.copyManual");
-    if (input) {
-      input.value = path;
-      input.onclick = () => input.select();
-      input.focus();
-      input.select();
-    }
   }
 
   async function copyPath(path: string): Promise<void> {
@@ -581,230 +565,23 @@
   {:else}
     <ul class="image-records__list">
       {#each records as record (record.originalPath)}
-        {@const isRemote = isRemoteRecordSource(record.originalPath)}
-        {@const origStatus = assetStatuses[record.originalPath] ?? "checking"}
-        {@const compStatus = assetStatuses[record.compressedPath] ?? "checking"}
-        <li class="image-records__card">
-          <div class="image-records__card-preview">
-            <img
-              class="image-records__img"
-              src={previewSrc(record.compressedPath)}
-              alt={t("image.records.previewAlt")}
-              loading="lazy"
-            />
-          </div>
-
-          <div class="image-records__card-body">
-            <div class="image-records__row">
-              <span class="image-records__label">{t("image.records.original")}</span>
-              <button
-                type="button"
-                class="image-records__path-btn"
-                title={t("image.records.clickToCopy")}
-                onclick={() => copyPath(record.originalPath)}
-              >
-                <code class="image-records__path">{record.originalPath}</code>
-                <svg class="image-records__copy-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-                  <path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z" />
-                  <path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z" />
-                </svg>
-              </button>
-              {#if !isRemote}
-                <span
-                  class={`image-records__badge image-records__badge--${badgeVariant(origStatus)}`}
-                  title={t("image.records.originalStatus")}
-                >
-                  {#if origStatus === "checking"}
-                    <span class="image-records__spinner image-records__spinner--small" aria-hidden="true"></span>
-                  {/if}
-                  {t(badgeTextKey(origStatus))}
-                </span>
-              {/if}
-            </div>
-
-            <div class="image-records__row">
-              <span class="image-records__label">{t("image.records.compressed")}</span>
-              <button
-                type="button"
-                class="image-records__path-btn"
-                title={t("image.records.clickToCopy")}
-                onclick={() => copyPath(record.compressedPath)}
-              >
-                <code class="image-records__path">{record.compressedPath}</code>
-                <svg class="image-records__copy-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-                  <path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z" />
-                  <path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z" />
-                </svg>
-              </button>
-              <span
-                class={`image-records__badge image-records__badge--${badgeVariant(compStatus)}`}
-                title={t("image.records.compressedStatus")}
-              >
-                {#if compStatus === "checking"}
-                  <span class="image-records__spinner image-records__spinner--small" aria-hidden="true"></span>
-                {/if}
-                {t(badgeTextKey(compStatus))}
-              </span>
-            </div>
-
-            <div class="image-records__meta">
-              <span class="image-records__meta-item">
-                {new Date(record.updatedAt).toLocaleString()}
-              </span>
-              <span class="image-records__meta-tag">
-                {t(`image.records.operation.${record.lastOperation}`)}
-              </span>
-            </div>
-
-            <div class="image-records__actions">
-              <button
-                type="button"
-                class="b3-button b3-button--outline"
-                disabled={busy || (!isRemote && origStatus !== "present")}
-                onclick={() => locateRestoreOccurrences(record)}
-              >
-                {expanded?.path === record.originalPath && expanded.mode === "compressed"
-                  ? t("image.records.hideReferences")
-                  : t("image.records.findCompressedReferences")}
-              </button>
-              <button
-                type="button"
-                class="b3-button b3-button--outline"
-                disabled={busy}
-                onclick={() => toggleOriginalReferences(record)}
-              >
-                {expanded?.path === record.originalPath && expanded.mode === "original"
-                  ? t("image.records.hideReferences")
-                  : t("image.records.findOriginalReferences")}
-              </button>
-              <button
-                type="button"
-                class="b3-button b3-button--cancel"
-                disabled={busy}
-                onclick={() => removeRecord(record)}
-              >
-                {t("image.records.remove")}
-              </button>
-            </div>
-
-            {#if expanded?.path === record.originalPath}
-              <div class="image-records__references">
-                <div class="image-records__ref-header">
-                  <h4 class="image-records__ref-title">
-                    {expanded.mode === "original"
-                      ? t("image.records.originalReferences")
-                      : t("image.records.compressedReferences")}
-                  </h4>
-                  <p class="image-records__ref-desc">
-                    {expanded.mode === "original"
-                      ? t("image.records.originalReferencesDesc")
-                      : t("image.records.compressedReferencesDesc")}
-                  </p>
-                </div>
-
-                {#if imageItems.length}
-                  <div class="image-records__ref-group">
-                    <span class="image-records__ref-group-title">{t("image.records.imageRefs", { count: imageItems.length })}</span>
-                    <div class="image-records__occurrences">
-                      {#each imageItems as item (item.key)}
-                        <div class="image-records__occurrence-row">
-                          <button
-                            type="button"
-                            class="image-records__jump-btn"
-                            title={item.label}
-                            onclick={() => jumpToBlock(item.target.blockID)}
-                          >
-                            <svg class="image-records__jump-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-                              <path d="M4.75 3a.75.75 0 0 0-.75.75v8.5c0 .414.336.75.75.75h6.5a.75.75 0 0 0 .75-.75v-8.5a.75.75 0 0 0-.75-.75h-6.5ZM2.5 3.75A2.25 2.25 0 0 1 4.75 1.5h6.5A2.25 2.25 0 0 1 13.5 3.75v8.5a2.25 2.25 0 0 1-2.25 2.25h-6.5A2.25 2.25 0 0 1 2.5 12.25v-8.5Z"/>
-                            </svg>
-                            <span class="image-records__jump-text">{item.label}</span>
-                          </button>
-                          <button
-                            type="button"
-                            class="b3-button b3-button--outline image-records__action-btn"
-                            disabled={busy}
-                            onclick={() => expanded && applyOccurrenceAction(record, expanded.mode, [item])}
-                          >
-                            {expanded.mode === "original" ? t("image.records.replaceThis") : t("image.records.restoreThis")}
-                          </button>
-                        </div>
-                      {/each}
-                    </div>
-                  </div>
-                {/if}
-
-                {#if linkItems.length}
-                  <div class="image-records__ref-group">
-                    <span class="image-records__ref-group-title">{t("image.records.linkRefs", { count: linkItems.length })}</span>
-                    <div class="image-records__occurrences">
-                      {#each linkItems as item (item.key)}
-                        <div class="image-records__occurrence-row">
-                          <button
-                            type="button"
-                            class="image-records__jump-btn"
-                            title={item.label}
-                            onclick={() => jumpToBlock(item.target.blockID)}
-                          >
-                            <svg class="image-records__jump-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-                              <path d="M4.75 3a.75.75 0 0 0-.75.75v8.5c0 .414.336.75.75.75h6.5a.75.75 0 0 0 .75-.75v-8.5a.75.75 0 0 0-.75-.75h-6.5ZM2.5 3.75A2.25 2.25 0 0 1 4.75 1.5h6.5A2.25 2.25 0 0 1 13.5 3.75v8.5a2.25 2.25 0 0 1-2.25 2.25h-6.5A2.25 2.25 0 0 1 2.5 12.25v-8.5Z"/>
-                            </svg>
-                            <span class="image-records__jump-text">{item.label}</span>
-                          </button>
-                          <button
-                            type="button"
-                            class="b3-button b3-button--outline image-records__action-btn"
-                            disabled={busy}
-                            onclick={() => expanded && applyOccurrenceAction(record, expanded.mode, [item])}
-                          >
-                            {expanded.mode === "original" ? t("image.records.replaceThis") : t("image.records.restoreThis")}
-                          </button>
-                        </div>
-                      {/each}
-                    </div>
-                  </div>
-                {/if}
-
-                {#if unsupportedRefs.length}
-                  <div class="image-records__ref-group">
-                    <span class="image-records__ref-group-title">{t("image.records.unsupportedRefs", { count: unsupportedRefs.length })}</span>
-                    <div class="image-records__occurrences">
-                      {#each unsupportedRefs as item (item.key)}
-                        <div class="image-records__occurrence-row">
-                          <button
-                            type="button"
-                            class="image-records__jump-btn"
-                            title={item.label}
-                            onclick={() => jumpToBlock(item.blockID || item.rootID)}
-                          >
-                            <svg class="image-records__jump-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
-                              <path d="M4.75 3a.75.75 0 0 0-.75.75v8.5c0 .414.336.75.75.75h6.5a.75.75 0 0 0 .75-.75v-8.5a.75.75 0 0 0-.75-.75h-6.5ZM2.5 3.75A2.25 2.25 0 0 1 4.75 1.5h6.5A2.25 2.25 0 0 1 13.5 3.75v8.5a2.25 2.25 0 0 1-2.25 2.25h-6.5A2.25 2.25 0 0 1 2.5 12.25v-8.5Z"/>
-                            </svg>
-                            <span class="image-records__jump-text">{item.label}</span>
-                          </button>
-                        </div>
-                      {/each}
-                    </div>
-                  </div>
-                {/if}
-
-                {#if occurrences.length}
-                  <div class="image-records__batch-actions">
-                    <button
-                      type="button"
-                      class="b3-button"
-                      disabled={busy || !occurrences.length}
-                      onclick={() => expanded && applyOccurrenceAction(record, expanded.mode, occurrences)}
-                    >
-                      {expanded.mode === "original" ? t("image.records.replaceAll") : t("image.records.restoreAll")}
-                    </button>
-                  </div>
-                {:else if !busy && !unsupportedRefs.length}
-                  <p class="image-records__empty-refs">{expanded?.mode === "original" ? t("image.records.noOriginalReferences") : t("image.records.noCompressedReferences")}</p>
-                {/if}
-              </div>
-            {/if}
-          </div>
-        </li>
+        <ImageRecordCard
+          {record}
+          {origin}
+          origStatus={assetStatuses[record.originalPath] ?? "checking"}
+          compStatus={assetStatuses[record.compressedPath] ?? "checking"}
+          expandedMode={expanded?.path === record.originalPath ? expanded.mode : null}
+          {occurrences}
+          {unsupportedRefs}
+          {busy}
+          {t}
+          onCopyPath={path => copyPath(path)}
+          onToggleOriginalReferences={rec => toggleOriginalReferences(rec)}
+          onLocateRestoreOccurrences={rec => locateRestoreOccurrences(rec)}
+          onRemoveRecord={rec => removeRecord(rec)}
+          onJumpToBlock={blockID => jumpToBlock(blockID)}
+          onApplyOccurrenceAction={(rec, mode, items) => applyOccurrenceAction(rec, mode, items)}
+        />
       {/each}
     </ul>
   {/if}
@@ -936,110 +713,6 @@
     flex-direction: column;
     gap: 12px;
   }
-  .image-records__card {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    padding: 12px;
-    background: var(--b3-theme-surface);
-    border: 1px solid var(--b3-theme-surface-lighter);
-    border-radius: 8px;
-    box-shadow: 0 1px 3px color-mix(in srgb, var(--b3-theme-on-background) 6%, transparent);
-  }
-  .image-records__card-preview {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    max-height: 140px;
-    background: var(--b3-theme-background);
-    border-radius: 6px;
-    overflow: hidden;
-  }
-  .image-records__img {
-    max-width: 100%;
-    max-height: 140px;
-    object-fit: contain;
-  }
-  .image-records__card-body {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .image-records__row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    min-width: 0;
-  }
-  .image-records__label {
-    flex-shrink: 0;
-    color: var(--b3-theme-on-surface);
-    opacity: 0.75;
-    font-size: 11px;
-    width: 48px;
-  }
-  .image-records__path-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    flex: 1;
-    min-width: 0;
-    padding: 2px 6px;
-    background: var(--b3-theme-surface-lighter);
-    border: 1px solid transparent;
-    border-radius: 4px;
-    cursor: pointer;
-    text-align: left;
-    transition: all 0.15s ease;
-  }
-  .image-records__path-btn:hover {
-    border-color: var(--b3-theme-primary);
-    background: var(--b3-theme-background);
-  }
-  .image-records__path {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: var(--b3-font-family-code);
-    font-size: 11px;
-    color: var(--b3-theme-primary);
-  }
-  .image-records__copy-icon {
-    flex-shrink: 0;
-    opacity: 0.6;
-  }
-  .image-records__path-btn:hover .image-records__copy-icon {
-    opacity: 1;
-    color: var(--b3-theme-primary);
-  }
-  .image-records__badge {
-    flex-shrink: 0;
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
-    padding: 1px 6px;
-    border-radius: 4px;
-    font-size: 11px;
-    font-weight: 500;
-  }
-  .image-records__badge--present {
-    background: color-mix(in srgb, var(--b3-theme-primary) 12%, transparent);
-    color: var(--b3-theme-primary);
-  }
-  .image-records__badge--missing {
-    background: color-mix(in srgb, var(--b3-theme-error) 12%, transparent);
-    color: var(--b3-theme-error);
-  }
-  .image-records__badge--checking {
-    background: color-mix(in srgb, var(--b3-theme-secondary) 12%, transparent);
-    color: var(--b3-theme-secondary);
-  }
-  .image-records__badge--unknown {
-    background: var(--b3-theme-surface-lighter);
-    color: var(--b3-theme-on-surface);
-    opacity: 0.7;
-  }
   .image-records__spinner {
     display: inline-block;
     width: 12px;
@@ -1049,136 +722,7 @@
     border-radius: 50%;
     animation: image-records-spin 0.75s linear infinite;
   }
-  .image-records__spinner--small {
-    width: 9px;
-    height: 9px;
-    border-width: 1.5px;
-  }
   @keyframes image-records-spin {
     to { transform: rotate(360deg); }
-  }
-  .image-records__meta {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    font-size: 11px;
-    color: var(--b3-theme-on-surface);
-    opacity: 0.65;
-    padding: 2px 0;
-  }
-  .image-records__meta-tag {
-    background: var(--b3-theme-surface-lighter);
-    padding: 1px 6px;
-    border-radius: 3px;
-  }
-  .image-records__actions {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
-    margin-top: 4px;
-  }
-  .image-records__actions button {
-    font-size: 11px;
-    padding: 3px 8px;
-  }
-  .image-records__references {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding: 8px;
-    margin-top: 6px;
-    background: var(--b3-theme-background);
-    border-radius: 6px;
-  }
-  .image-records__ref-header {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-  .image-records__ref-title {
-    margin: 0;
-    font-size: 12px;
-    font-weight: 600;
-  }
-  .image-records__ref-desc {
-    margin: 0;
-    font-size: 11px;
-    color: var(--b3-theme-on-surface);
-    opacity: 0.7;
-  }
-  .image-records__ref-group {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    margin-top: 4px;
-  }
-  .image-records__ref-group-title {
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--b3-theme-on-surface);
-    opacity: 0.8;
-  }
-  .image-records__occurrences {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    margin-top: 2px;
-  }
-  .image-records__occurrence-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    padding: 2px 0;
-  }
-  .image-records__jump-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    flex: 1;
-    min-width: 0;
-    background: transparent;
-    border: none;
-    padding: 3px 6px;
-    border-radius: 4px;
-    cursor: pointer;
-    text-align: left;
-    color: var(--b3-theme-on-surface);
-    transition: background 0.15s ease, color 0.15s ease;
-  }
-  .image-records__jump-btn:hover {
-    background: var(--b3-theme-surface-lighter);
-    color: var(--b3-theme-primary);
-  }
-  .image-records__jump-icon {
-    flex-shrink: 0;
-    opacity: 0.7;
-  }
-  .image-records__jump-text {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 11px;
-  }
-  .image-records__action-btn {
-    flex-shrink: 0;
-    font-size: 11px;
-    padding: 2px 8px;
-  }
-  .image-records__batch-actions {
-    display: flex;
-    justify-content: flex-end;
-    margin-top: 6px;
-  }
-  .image-records__batch-actions button {
-    font-size: 11px;
-    padding: 3px 10px;
-  }
-  .image-records__empty-refs {
-    margin: 4px 0 0 0;
-    font-size: 11px;
-    color: var(--b3-theme-on-surface);
-    opacity: 0.7;
   }
 </style>

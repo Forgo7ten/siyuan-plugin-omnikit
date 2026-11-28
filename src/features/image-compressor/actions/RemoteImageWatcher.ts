@@ -6,14 +6,20 @@ import {
   localizeRemoteAsset,
   type ImageProcessingServices,
 } from "../services/ImageProcessingServices.ts";
-import { isSmartCompressionEffective } from "../services/image.ts";
+import { recaptureReplacedImageOccurrence } from "../services/ImageOccurrenceResolver.ts";
+import { isSmartCompressionEffective } from "../services/smartCompressionProbe.ts";
+import { blockDOM } from "../services/SafeBlockWriter.ts";
 import type { OccurrenceTarget } from "../policy/contracts.ts";
 import { autoAllowed, type ImageConfig } from "../policy/parseImageConfig.ts";
-import { blockDOM, type DocumentRow } from "../services/references.ts";
 import { parseSingleLeafBlock, scanImageRefs } from "../policy/dom.ts";
-import { buildReplacementPath, imageSourceAttribute, resolveSource, type ImageSource } from "../policy/source.ts";
+import { imageSourceAttribute, resolveSource, trySource, type ImageSource } from "../policy/source.ts";
 import { classifyImageCandidate } from "../policy/ImageCandidateClassifier.ts";
-import type { AutoUploadNotice } from "./AutoUploadHandler.ts";
+import { buildAutoUploadNotice, type AutoUploadNotice } from "./AutoUploadHandler.ts";
+
+export interface DocumentRow {
+  id: string;
+  box: string;
+}
 
 type RemoteProcessOutcome =
   | { kind: "replaced"; originalBytes?: number; compressedBytes?: number }
@@ -86,6 +92,7 @@ export async function watchRemoteImages(
     const dom = await blockDOM(services.kernel, doc.id, doc.box, readSignal);
     const result = new Map<string, Candidate>();
     for (const { blockID, source } of scanImageRefs(dom, services.origin)) {
+      if (source.kind !== "remote") continue;
       const identity = keyOf(blockID, source.key), found = result.get(identity);
       if (found) found.count++;
       else result.set(identity, { blockID, source, count: 1 });
@@ -93,24 +100,47 @@ export async function watchRemoteImages(
     return result;
   };
 
-  const hasUnprotectedImage = (node: Node): boolean => {
-    if (!(node instanceof Element) || isInsideProtectedContainer(node)) return false;
-    if (node.matches("img")) return true;
-    return [...node.querySelectorAll("img")].some(img => !isInsideProtectedContainer(img));
+  const isRemoteSourceRaw = (raw: string | null | undefined): boolean => {
+    if (!raw) return false;
+    return trySource(raw, services.origin)?.kind === "remote";
   };
+
+  const isUnprotectedRemoteImage = (img: Element): boolean => {
+    if (isInsideProtectedContainer(img)) return false;
+    return isRemoteSourceRaw(imageSourceAttribute(img));
+  };
+
+  const hasUnprotectedRemoteImage = (node: Node): boolean => {
+    if (!(node instanceof Element) || isInsideProtectedContainer(node)) return false;
+    if (typeof node.matches === "function" && node.matches("img")) {
+      return isUnprotectedRemoteImage(node);
+    }
+    if (typeof node.querySelectorAll !== "function") return false;
+    return [...node.querySelectorAll("img")].some(isUnprotectedRemoteImage);
+  };
+
   const observer = new MutationObserver(records => {
     let hasInsert = false;
     let hasRemoval = false;
     for (const record of records) {
       if (record.type === "attributes") {
-        if (record.target instanceof HTMLImageElement && !isInsideProtectedContainer(record.target)) {
-          hasInsert = true;
+        const target = record.target;
+        if (
+          target instanceof Element &&
+          (target.tagName === "IMG" || (typeof target.matches === "function" && target.matches("img"))) &&
+          !isInsideProtectedContainer(target)
+        ) {
+          if (isUnprotectedRemoteImage(target)) {
+            hasInsert = true;
+          } else if (previous.size > 0 && isRemoteSourceRaw(record.oldValue)) {
+            hasRemoval = true;
+          }
         }
         continue;
       }
       if (record.target instanceof Element && isInsideProtectedContainer(record.target)) continue;
-      if ([...record.addedNodes].some(hasUnprotectedImage)) hasInsert = true;
-      else if ([...record.removedNodes].some(hasUnprotectedImage)) hasRemoval = true;
+      if ([...record.addedNodes].some(hasUnprotectedRemoteImage)) hasInsert = true;
+      else if (previous.size > 0 && [...record.removedNodes].some(hasUnprotectedRemoteImage)) hasRemoval = true;
     }
     if (hasInsert) schedule(450, true);
     else if (hasRemoval) schedule(450, false);
@@ -118,7 +148,13 @@ export async function watchRemoteImages(
   const observe = () => {
     if (observing || disposed || paused || !scope.active || signal.aborted) return;
     observing = true;
-    observer.observe(editor, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "data-src"] });
+    observer.observe(editor, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeOldValue: true,
+      attributeFilter: ["src", "data-src"],
+    });
   };
 
   const stopWatching = () => {
@@ -274,22 +310,20 @@ export async function watchRemoteImages(
         return localized === "aborted" ? undefined : { kind: "skipped" };
       }
 
-      const refreshedDOM = await blockDOM(services.kernel, target.blockID, target.notebook, task.signal);
-      const expectedLocalPath = buildReplacementPath(target.oldPath, localOriginal, services.origin);
-      const refreshedBlock = parseSingleLeafBlock(refreshedDOM, target.blockID);
-      if (!refreshedBlock) {
-        logger.debug?.("本地化重读块结构异常，跳过压缩", { blockID: target.blockID });
+      const nextTarget = await recaptureReplacedImageOccurrence(
+        services.kernel,
+        target,
+        localOriginal,
+        services.origin,
+        task.signal,
+      );
+      if (!nextTarget) {
+        logger.debug?.("本地化后块内图片路径已变化或块结构异常，跳过压缩", {
+          blockID: target.blockID,
+          imageOrdinal: target.imageOrdinal,
+        });
         return { kind: "skipped" };
       }
-      const refreshedImg = [...refreshedBlock.querySelectorAll("img")][target.imageOrdinal];
-      if (!refreshedImg || imageSourceAttribute(refreshedImg) !== expectedLocalPath) {
-        logger.debug?.("本地化后块内图片路径已变化，跳过压缩", { blockID: target.blockID, imageOrdinal: target.imageOrdinal });
-        return { kind: "skipped" };
-      }
-      const nextTarget: OccurrenceTarget = {
-        ...target,
-        oldPath: expectedLocalPath,
-      };
       if (!scope.active || task.signal.aborted) return;
 
       // prepareImage persists the Dock mapping before a compressed path is eligible for
@@ -299,7 +333,7 @@ export async function watchRemoteImages(
       const compressed = await services.compressOccurrence(nextTarget, currentConfig, task.signal,
         { mode: "auto", replace: true, providedFile });
       if (compressed.status === "skipped") {
-        logger.debug?.("本地化后的外链图片压缩跳过，保留本地原图", { blockID: nextTarget.blockID, path: expectedLocalPath });
+        logger.debug?.("本地化后的外链图片压缩跳过，保留本地原图", { blockID: nextTarget.blockID, path: nextTarget.oldPath });
         return { kind: "skipped" };
       }
       if (compressed.reference === "replaced") {
@@ -399,22 +433,16 @@ export async function watchRemoteImages(
         await Promise.all(workers);
       }
 
-      const total = successful + skipped + failed + unknownCount;
-      if (total > 0 && scope.active && !(successful === 0 && failed === 0 && unknownCount === 0)) {
-        const notice: AutoUploadNotice = {
-          total,
+      if (scope.active) {
+        const notice = buildAutoUploadNotice({
           successful,
           skipped,
           failed,
-          ...(unknownCount > 0 ? { unknown: unknownCount } : {}),
-          singleReason: total === 1
-            ? (successful === 1 ? "success" : failed === 1 ? "failed" : "unknown")
-            : undefined,
-          ...(total === 1 && successful === 1 && singleOriginalBytes !== undefined && singleCompressedBytes !== undefined
-            ? { originalBytes: singleOriginalBytes, compressedBytes: singleCompressedBytes }
-            : {}),
-        };
-        onNotice?.(notice);
+          unknownCount,
+          singleOriginalBytes,
+          singleCompressedBytes,
+        });
+        if (notice) onNotice?.(notice);
       }
     } catch (error) {
       if (!readSignal.aborted && !isAbortError(error) && scope.active) logger.warn("读取持久化图片状态失败", error);

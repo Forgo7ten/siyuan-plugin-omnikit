@@ -1,5 +1,5 @@
 import type { SettingsManager } from "../../../core/store/SettingsManager.ts";
-import { IMAGE_FEATURE_ID } from "./settings.ts";
+import { IMAGE_FEATURE_ID } from "./parseImageConfig.ts";
 import type { ImageFeatureConfig } from "../registration.ts";
 
 /**

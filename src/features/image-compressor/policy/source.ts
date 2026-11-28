@@ -8,8 +8,7 @@ export interface AssetAddress {
 
 export type ImageSource =
   | (AssetAddress & { kind: "asset"; path: string; name: string })
-  | { kind: "remote"; raw: string; key: string; url: string; name: string }
-  | { kind: "file"; raw: string; key: string; fileURL: string; name: string };
+  | { kind: "remote"; raw: string; key: string; url: string; name: string };
 
 const ID = /^\d{14}-[a-z0-9]{7}$/;
 
@@ -91,14 +90,8 @@ export function resolveSource(raw: string, kernelOrigin: string): ImageSource {
   if (!raw || raw !== raw.trim() || /[\u0000-\u001f\u007f]/.test(raw)) throw new Error("Invalid image source");
   if (/^(?:\.\\)?assets\\/.test(raw)) return asset(raw, kernelOrigin, raw.replace(/\\/g, "/"), false);
   if (/^(?:\.\/*)?assets\//.test(raw) || /^\/assets\//.test(raw)) return asset(raw, kernelOrigin, raw, false);
-  if (/^[a-zA-Z]:[\\/]/.test(raw) || /^file:/i.test(raw) || /^\\\\/.test(raw) || raw.startsWith("/") && !raw.startsWith("//")) {
-    if (/^\\\\/.test(raw)) throw new Error("UNC/network file reads are disabled");
-    let u: URL;
-    if (/^[a-zA-Z]:[\\/]/.test(raw)) u = new URL(`file:///${raw.replace(/\\/g, "/").split("/").map((part, i) => i ? encodeURIComponent(part) : part.toUpperCase()).join("/")}`);
-    else if (raw.startsWith("/")) u = new URL("file://" + raw.split("/").map(encodeURIComponent).join("/"));
-    else { const normalized = raw.replace(/^file:\/\/([a-zA-Z]:[\\/])/i, "file:///$1").replace(/\\/g, "/"); if (/%(?:2f|5c|00)/i.test(normalized)) throw new Error("Encoded file separator refused"); u = new URL(normalized); }
-    if (u.protocol !== "file:" || u.search || u.hash || u.username || u.password || u.hostname && u.hostname !== "localhost") throw new Error("Invalid or network file URL");
-    return { kind: "file", raw, key: `file:${u.href}`, fileURL: u.href, name: urlNameOf(u.pathname) };
+  if (/^[a-zA-Z]:[\\/]/.test(raw) || /^file:/i.test(raw) || /^\\\\/.test(raw) || (raw.startsWith("/") && !raw.startsWith("//"))) {
+    throw new Error("Local file sources are not supported");
   }
   const u = new URL(raw.startsWith("//") ? `https:${raw}` : raw);
   if (u.origin === kernelOrigin && u.pathname.startsWith("/assets/")) return asset(raw, kernelOrigin, u.pathname + u.search + u.hash, true);
@@ -121,21 +114,20 @@ export function sameAsset(left: string, right: string, origin: string): boolean 
 export function sameSource(left: string, right: string, origin: string): boolean {
   const a = trySource(left, origin);
   const b = trySource(right, origin);
-  return Boolean(a && b && a.kind === b.kind && (a.kind === "asset" || a.kind === "remote") && a.key === b.key);
+  return Boolean(a && b && a.kind === b.kind && a.key === b.key);
 }
 
 /**
  * Builds the DOM replacement attribute value for a new kernel asset path or remote URL.
  * Restoring to an HTTP(S) URL returns its normalized URL verbatim.
- * Replacing with a local `assets/` path keeps only the new `?box=<notebookID>` for remote,
- * `file://`, and invalid local sources, or `?box=<notebookID>` + original `#fragment` for valid local sources.
+ * Replacing with a local `assets/` path keeps only the new `?box=<notebookID>` for remote
+ * or invalid local sources, or `?box=<notebookID>` + original `#fragment` for valid local sources.
  */
 export function buildReplacementPath(oldRaw: string, newPath: string, origin: string): string {
   const next = resolveSource(newPath, origin);
   if (next.kind === "remote") {
     return next.url;
   }
-  if (next.kind !== "asset") throw new Error("Replacement path must be an asset or remote URL");
   const nextSuffix = next.box ? `?box=${next.box}` : "";
   const old = trySource(oldRaw, origin);
   if (old?.kind !== "asset") {

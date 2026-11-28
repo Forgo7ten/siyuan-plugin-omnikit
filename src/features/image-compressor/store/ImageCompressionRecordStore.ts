@@ -2,7 +2,7 @@ import type { Plugin } from "siyuan";
 import { featureDataFile } from "../../../core/framework/FeatureRegistration.ts";
 import { JsonStore, type StoreCodec } from "../../../core/store/JsonStore.ts";
 import type { CompressionRecord, OperationKind } from "../policy/contracts.ts";
-import { IMAGE_FEATURE_ID } from "../policy/settings.ts";
+import { IMAGE_FEATURE_ID } from "../policy/parseImageConfig.ts";
 
 interface RecordsFile {
   schemaVersion: 1;

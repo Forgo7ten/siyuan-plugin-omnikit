@@ -2,20 +2,36 @@ import { isAbortError } from "../../../core/feedback/UiFeedback.ts";
 import { isInsideProtectedContainer } from "../../../core/host/dom.ts";
 import { Logger } from "../../../core/host/Logger.ts";
 import type { KernelClient } from "../../../core/host/KernelClient.ts";
-import { combineSignals } from "../../../core/host/ProtyleAdapter.ts";
-import type { AssetAvailability, CompressionRecord, OccurrenceTarget } from "../policy/contracts.ts";
+import type { OccurrenceTarget } from "../policy/contracts.ts";
 import { findLinkCandidates, parseSingleLeafBlock } from "../policy/dom.ts";
 import { imageSourceAttribute, sameSource, trySource } from "../policy/source.ts";
-import { isRemoteRecordSource, type ImageCompressionRecordStore } from "../store/ImageCompressionRecordStore.ts";
 import { resolveDocumentTitle } from "./documentTitle.ts";
+import { locateBoxScopedOccurrences } from "./boxReferenceLocator.ts";
+
+export {
+  checkAssetAvailability,
+  reconcileRecordPair,
+  verifyOrdinaryAssetViaGetFile,
+} from "./assetAvailability.ts";
+export { locateBoxScopedOccurrences } from "./boxReferenceLocator.ts";
 
 const DOM_BATCH_SIZE = 50;
+
+const NON_DOM_REWRITABLE_TYPES = new Set([
+  "av-asset",
+  "av-url",
+  "html",
+  "attribute",
+  "title-image",
+  "pdf-annotation",
+]);
 
 export interface LocatedAssetReference {
   type: string;
   rootID: string;
   notebook?: string;
   blockID?: string;
+  avID?: string;
   reference: string;
   relinkable: boolean;
   reason?: string;
@@ -45,119 +61,11 @@ export interface LocateReferencesResult {
   metadataIncomplete: boolean;
 }
 
-const GET_FILE_TIMEOUT_MS = 30_000;
-
-function readKernelCode(raw: string): number | undefined {
-  try {
-    const parsed = JSON.parse(raw) as { code?: unknown } | null;
-    return typeof parsed?.code === "number" ? parsed.code : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-async function verifyOrdinaryAssetViaGetFile(
-  kernelPath: string,
-  signal?: AbortSignal,
-  fetchFn?: typeof fetch,
-): Promise<AssetAvailability> {
-  const fetcher = fetchFn ?? globalThis.fetch;
-  if (typeof fetcher !== "function") return "unknown";
-  const timeoutController = new AbortController();
-  const timer = setTimeout(() => timeoutController.abort(new Error("getFile timed out")), GET_FILE_TIMEOUT_MS);
-  const effectiveSignal = combineSignals(signal, timeoutController.signal) ?? timeoutController.signal;
-  try {
-    const response = await fetcher("/api/file/getFile", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: `data/${kernelPath}` }),
-      signal: effectiveSignal,
-    });
-    if (response.status === 200) {
-      await response.body?.cancel?.().catch(() => undefined);
-      return "present";
-    }
-    if (response.status === 202) {
-      const text = await response.text();
-      const code = readKernelCode(text);
-      if (code === 404) return "missing-confirmed";
-      Logger.shared.debug("getFile 返回 202 但非 404，资源状态降级为 unknown", { kernelPath, code });
-      return "unknown";
-    }
-    await response.body?.cancel?.().catch(() => undefined);
-    Logger.shared.debug("getFile 返回非预期状态码，资源状态降级为 unknown", { kernelPath, status: response.status });
-    return "unknown";
-  } catch (error) {
-    if (signal?.aborted || isAbortError(error)) {
-      if (signal?.aborted) throw error;
-    }
-    Logger.shared.debug("getFile 请求异常，资源状态降级为 unknown", { kernelPath, error });
-    return "unknown";
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Checks asset availability via `/api/asset/statAsset` while preserving `?box=` parameters.
- * When an ordinary asset (without `?box=`) returns ambiguous `code === 1`, falls back to
- * `/api/file/getFile`: HTTP 200 confirms `"present"`, while HTTP 202 + `code: 404` confirms
- * `"missing-confirmed"`. Encrypted `?box=` assets and all other errors stay `"unknown"`.
- */
-export async function checkAssetAvailability(
-  kernel: KernelClient,
-  path: string,
-  signal?: AbortSignal,
-  options?: { fetchFn?: typeof fetch; origin?: string },
-): Promise<AssetAvailability> {
-  let statCodeOne = false;
-  try {
-    const res = await kernel.post<unknown>("/api/asset/statAsset", { path }, { signal });
-    if (res.code === 0) return "present";
-    statCodeOne = res.code === 1;
-  } catch (error) {
-    if (signal?.aborted || isAbortError(error)) throw error;
-    statCodeOne = (error as { code?: unknown })?.code === 1;
-  }
-
-  if (!statCodeOne) return "unknown";
-  const parsed = trySource(path, options?.origin ?? "http://127.0.0.1:6806");
-  if (!parsed || parsed.kind !== "asset" || parsed.box) {
-    return "unknown";
-  }
-  return verifyOrdinaryAssetViaGetFile(parsed.kernelPath, signal, options?.fetchFn);
-}
-
-/**
- * Reconciles one record's original and latest compressed asset availability.
- * Removes ONLY that single record (via atomic `compareAndRemove`) when either asset
- * is proven `"missing-confirmed"`. Never deletes physical files or cascades across chains.
- */
-export async function reconcileRecordPair(
-  record: CompressionRecord,
-  checkAsset: (path: string, signal?: AbortSignal) => Promise<AssetAvailability>,
-  records: Pick<ImageCompressionRecordStore, "compareAndRemove">,
-  signal?: AbortSignal,
-): Promise<{ original: AssetAvailability; compressed: AssetAvailability; removed: boolean }> {
-  if (isRemoteRecordSource(record.originalPath)) {
-    const compressed = await checkAsset(record.compressedPath, signal);
-    if (signal?.aborted) return { original: "present", compressed, removed: false };
-    if (compressed === "missing-confirmed") {
-      const removed = await records.compareAndRemove(record.originalPath, record.compressedPath);
-      return { original: "present", compressed, removed };
-    }
-    return { original: "present", compressed, removed: false };
-  }
-  const [original, compressed] = await Promise.all([
-    checkAsset(record.originalPath, signal),
-    checkAsset(record.compressedPath, signal),
-  ]);
-  if (signal?.aborted) return { original, compressed, removed: false };
-  if (original === "missing-confirmed" || compressed === "missing-confirmed") {
-    const removed = await records.compareAndRemove(record.originalPath, record.compressedPath);
-    return { original, compressed, removed };
-  }
-  return { original, compressed, removed: false };
+function isUnsupportedAssetReferenceRow(row: LocatedAssetReference): boolean {
+  if (!row.blockID || !row.rootID || !row.notebook || !row.relinkable) return true;
+  if (row.avID) return true;
+  if (NON_DOM_REWRITABLE_TYPES.has(row.type)) return true;
+  return false;
 }
 
 export async function findAssetReferences(
@@ -184,7 +92,8 @@ export async function findAssetReferences(
     const valid = typeof item.rootID === "string"
       && (item.relinkable === undefined || typeof item.relinkable === "boolean")
       && (item.notebook === undefined || typeof item.notebook === "string")
-      && (item.blockID === undefined || typeof item.blockID === "string");
+      && (item.blockID === undefined || typeof item.blockID === "string")
+      && (item.avID === undefined || typeof item.avID === "string");
     if (!valid) rowFiltered = true;
     return valid;
   });
@@ -249,12 +158,12 @@ export async function loadBatchBlockDOMs(
   return { doms, incomplete };
 }
 
-function matchesSearchAsset(raw: string | null | undefined, searchPath: string, origin: string): boolean {
+export function matchesSearchAsset(raw: string | null | undefined, searchPath: string, origin: string): boolean {
   if (!raw) return false;
   return raw === searchPath || sameSource(raw, searchPath, origin);
 }
 
-function extractBlockOccurrences(
+export function extractBlockOccurrences(
   dom: string,
   meta: { rootID: string; notebook: string; blockID: string; docTitle: string },
   searchPath: string,
@@ -314,174 +223,6 @@ function extractBlockOccurrences(
   }
 
   return { items, nestedOrInvalid: false };
-}
-
-/**
- * Resolves references to a `?box=` encrypted-notebook asset exclusively via
- * authorized, unlocked notebook document/block read APIs without stripping `?box=`.
- */
-async function locateBoxScopedOccurrences(
-  kernel: KernelClient,
-  boxID: string,
-  searchPath: string,
-  origin: string,
-  t: (key: string, values?: Record<string, string | number>) => string,
-  signal?: AbortSignal,
-): Promise<LocateReferencesResult> {
-  const lsRes = await kernel.post<{ notebooks?: Array<{ id?: string; closed?: boolean; name?: string }> }>(
-    "/api/notebook/lsNotebooks",
-    {},
-    { signal },
-  );
-  const notebooks = lsRes.data?.notebooks;
-  const targetNotebook = Array.isArray(notebooks)
-    ? notebooks.find(nb => nb?.id === boxID)
-    : undefined;
-  if (!targetNotebook || targetNotebook.closed === true) {
-    return {
-      ok: false,
-      complete: false,
-      encryptedUnavailable: true,
-      items: [],
-      unsupported: [],
-      skippedNotebooks: [boxID],
-      unavailableAttributeViews: 0,
-      metadataIncomplete: false,
-    };
-  }
-
-  interface DocEntry { id: string; path: string; name: string }
-  const docs: DocEntry[] = [];
-  const queue: string[] = ["/"];
-  const visitedPaths = new Set<string>();
-  let complete = true;
-
-  while (queue.length > 0) {
-    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-    const currentPath = queue.shift()!;
-    if (visitedPaths.has(currentPath)) continue;
-    visitedPaths.add(currentPath);
-
-    let listData: { files?: Array<{ id?: string; path?: string; name?: string; subFileCount?: number }> } | undefined;
-    try {
-      const listRes = await kernel.post<{ files?: Array<{ id?: string; path?: string; name?: string; subFileCount?: number }> }>(
-        "/api/filetree/listDocsByPath",
-        { notebook: boxID, path: currentPath, ignoreMaxListHint: true, maxListCount: 10_000 },
-        { signal },
-      );
-      listData = listRes.data;
-    } catch (error) {
-      if (signal?.aborted || isAbortError(error)) throw error;
-      if (currentPath === "/") {
-        return {
-          ok: false,
-          complete: false,
-          encryptedUnavailable: true,
-          items: [],
-          unsupported: [],
-          skippedNotebooks: [boxID],
-          unavailableAttributeViews: 0,
-          metadataIncomplete: false,
-        };
-      }
-      complete = false;
-      continue;
-    }
-
-    const files = Array.isArray(listData?.files) ? listData.files : [];
-    for (const file of files) {
-      if (!file?.id || !file?.path) continue;
-      docs.push({ id: file.id, path: file.path, name: file.name || file.id });
-      if ((file.subFileCount ?? 0) > 0) {
-        queue.push(file.path);
-      }
-    }
-  }
-
-  const docDOMs = await loadBatchBlockDOMs(kernel, boxID, docs.map(d => d.id), signal);
-  if (docDOMs.incomplete) complete = false;
-
-  const matchedBlocks = new Map<string, { rootID: string; blockID: string }>();
-  const unsupported: UnsupportedReferenceItem[] = [];
-  const docTitleCache = new Map<string, string>();
-
-  for (const doc of docs) {
-    const dom = docDOMs.doms.get(doc.id);
-    if (!dom) continue;
-    const template = document.createElement("template");
-    template.innerHTML = dom;
-
-    const matchCandidate = (node: Element, raw: string | null | undefined) => {
-      if (isInsideProtectedContainer(node)) return;
-      if (!matchesSearchAsset(raw, searchPath, origin)) return;
-      const owner = node.closest("[data-node-id]");
-      const blockID = owner?.getAttribute("data-node-id");
-      if (!blockID || owner?.querySelector("[data-node-id]")) {
-        const key = `unsupported/${boxID}/${doc.id}/${blockID || "doc"}`;
-        if (!unsupported.some(u => u.key === key)) {
-          unsupported.push({
-            key,
-            rootID: doc.id,
-            blockID: blockID || doc.id,
-            label: `${doc.name || doc.id} · ${blockID || doc.id}`,
-          });
-        }
-        return;
-      }
-      if (!matchedBlocks.has(blockID)) {
-        matchedBlocks.set(blockID, { rootID: doc.id, blockID });
-      }
-    };
-
-    for (const img of template.content.querySelectorAll("img")) {
-      matchCandidate(img, imageSourceAttribute(img));
-    }
-    for (const link of findLinkCandidates(template.content)) {
-      matchCandidate(link.element, link.element.getAttribute(link.attribute));
-    }
-  }
-
-  const blockDOMResult = matchedBlocks.size > 0
-    ? await loadBatchBlockDOMs(kernel, boxID, [...matchedBlocks.keys()], signal)
-    : { doms: new Map<string, string>(), incomplete: false };
-  if (blockDOMResult.incomplete) complete = false;
-
-  const items: OccurrenceItem[] = [];
-  for (const [blockID, meta] of matchedBlocks) {
-    const dom = blockDOMResult.doms.get(blockID);
-    if (!dom) {
-      complete = false;
-      continue;
-    }
-    const docTitle = await resolveDocumentTitle(kernel, meta.rootID, { cache: docTitleCache, signal });
-    const extracted = extractBlockOccurrences(dom, { ...meta, notebook: boxID, docTitle }, searchPath, origin, t);
-    if (extracted.nestedOrInvalid) {
-      complete = false;
-      unsupported.push({
-        key: `unsupported/${boxID}/${blockID}`,
-        rootID: meta.rootID,
-        blockID,
-        label: `${docTitle} · ${blockID}`,
-      });
-      continue;
-    }
-    for (const item of extracted.items) {
-      if (!items.some(existing => existing.key === item.key)) {
-        items.push(item);
-      }
-    }
-  }
-
-  return {
-    ok: true,
-    complete,
-    encryptedUnavailable: false,
-    items,
-    unsupported,
-    skippedNotebooks: [],
-    unavailableAttributeViews: 0,
-    metadataIncomplete: false,
-  };
 }
 
 function escapeSqlLikeLiteral(value: string): string {
@@ -609,7 +350,8 @@ async function locateRemoteOccurrences(
 
 /**
  * Locates both `<img>` and resource link references for an asset or remote URL, grouping
- * non-relinkable or unmappable positions (e.g. attribute views) into `unsupported` for read-only navigation.
+ * non-relinkable or unmappable positions (e.g. attribute views, HTML blocks, title images)
+ * into `unsupported` for read-only navigation.
  */
 export async function locateAssetOccurrences(
   kernel: KernelClient,
@@ -620,7 +362,7 @@ export async function locateAssetOccurrences(
   options?: { scopeBox?: string },
 ): Promise<LocateReferencesResult> {
   const parsed = trySource(searchPath, origin);
-  if (!parsed || (parsed.kind !== "asset" && parsed.kind !== "remote")) {
+  if (!parsed) {
     throw new Error("Invalid asset path for reference lookup");
   }
   if (parsed.kind === "remote") {
@@ -635,7 +377,8 @@ export async function locateAssetOccurrences(
 
   const { references: rows, skippedNotebooks, unavailableAttributeViews, metadataIncomplete } =
     await findAssetReferences(kernel, parsed.kernelPath, signal);
-  let complete = skippedNotebooks.length === 0 && unavailableAttributeViews === 0 && !metadataIncomplete;
+  let effectiveUnavailableAVs = unavailableAttributeViews;
+  let complete = skippedNotebooks.length === 0 && effectiveUnavailableAVs === 0 && !metadataIncomplete;
 
   const distinctRows: Array<LocatedAssetReference & { blockID: string; notebook: string }> = [];
   const seen = new Set<string>();
@@ -644,13 +387,13 @@ export async function locateAssetOccurrences(
   const docTitleCache = new Map<string, string>();
 
   for (const row of rows) {
-    if (!row.blockID || !row.rootID || !row.notebook || !row.relinkable) {
+    if (isUnsupportedAssetReferenceRow(row)) {
       complete = false;
       if (row.rootID) {
         const docTitle = await resolveDocumentTitle(kernel, row.rootID, { cache: docTitleCache, signal });
         const targetId = row.blockID || row.rootID;
-        const suffix = row.reason || row.type || "readonly";
-        const key = `unsupported/${row.notebook ?? ""}/${row.rootID}/${targetId}/${suffix}`;
+        const suffix = row.reason || row.type || (row.avID ? "attribute-view" : "readonly");
+        const key = `unsupported/${row.notebook ?? ""}/${row.rootID}/${targetId}/${row.avID ?? ""}/${suffix}`;
         if (!unsupported.some(u => u.key === key)) {
           unsupported.push({
             key,
@@ -659,6 +402,8 @@ export async function locateAssetOccurrences(
             label: `${docTitle} · ${suffix}`,
           });
         }
+      } else {
+        effectiveUnavailableAVs += 1;
       }
       continue;
     }
@@ -666,9 +411,9 @@ export async function locateAssetOccurrences(
     if (seen.has(identityKey)) continue;
     seen.add(identityKey);
     distinctRows.push(row as LocatedAssetReference & { blockID: string; notebook: string });
-    const list = idsByNotebook.get(row.notebook) ?? [];
-    list.push(row.blockID);
-    idsByNotebook.set(row.notebook, list);
+    const list = idsByNotebook.get(row.notebook!) ?? [];
+    list.push(row.blockID!);
+    idsByNotebook.set(row.notebook!, list);
   }
 
   const domsByNotebook = new Map<string, Map<string, string>>();
@@ -690,14 +435,17 @@ export async function locateAssetOccurrences(
       origin,
       t,
     );
-    if (extracted.nestedOrInvalid) {
+    if (extracted.nestedOrInvalid || extracted.items.length === 0) {
       complete = false;
-      unsupported.push({
-        key: `unsupported/${row.notebook}/${row.blockID}`,
-        rootID: row.rootID,
-        blockID: row.blockID,
-        label: `${docTitle} · ${row.blockID}`,
-      });
+      const key = `unsupported/${row.notebook}/${row.blockID}`;
+      if (!unsupported.some(u => u.key === key)) {
+        unsupported.push({
+          key,
+          rootID: row.rootID,
+          blockID: row.blockID,
+          label: `${docTitle} · ${row.blockID}`,
+        });
+      }
       continue;
     }
     for (const item of extracted.items) {
@@ -714,7 +462,7 @@ export async function locateAssetOccurrences(
     items,
     unsupported,
     skippedNotebooks,
-    unavailableAttributeViews,
+    unavailableAttributeViews: effectiveUnavailableAVs,
     metadataIncomplete,
   };
 }

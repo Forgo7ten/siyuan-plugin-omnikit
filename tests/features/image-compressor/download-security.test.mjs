@@ -5,7 +5,8 @@ import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { readFile } from 'node:fs/promises';
 import { createDesktopBridge } from '../../../src/features/image-compressor/services/desktop.ts';
-import { SourceReader, requireRemotePermission } from '../../../src/features/image-compressor/services/download.ts';
+import { requireRemotePermission } from '../../../src/features/image-compressor/services/download.ts';
+import { resolveSource } from '../../../src/features/image-compressor/policy/source.ts';
 import { assertImagePayload } from '../../../src/features/image-compressor/services/ImageProcessingServices.ts';
 import { prepareImage } from '../../../src/features/image-compressor/services/ImageProcessingServices.ts';
 import { defaultImageFeatureConfig } from '../../../src/features/image-compressor/policy/parseImageConfig.ts';
@@ -247,18 +248,16 @@ test('image compressor downloaders read userAgent from services.userAgent instea
   assert.match(servicesCode, /userAgent:\s*\(\)\s*=>\s*context\.settings\.getUserAgent\(\)/);
 });
 
-test('desktop bridge omits readFile/fs/url and SourceReader rejects local file sources', async () => {
+test('desktop bridge omits readFile/fs/url and resolveSource rejects all local file paths', async () => {
   const { bridge, loaded } = bridgeFor();
   assert.equal('readFile' in bridge, false);
   assert.equal(loaded.includes('node:fs/promises'), false);
   assert.equal(loaded.includes('node:url'), false);
 
-  const reader = new SourceReader(fetch, bridge);
-  await assert.rejects(
-    reader.read(
-      { kind: 'file', raw: 'file:///tmp/a.png', key: 'file:file:///tmp/a.png', fileURL: 'file:///tmp/a.png', name: 'a.png' },
-      options,
-    ),
-    /Local file sources are not supported/,
-  );
+  for (const localRaw of ['file:///tmp/a.png', 'C:\\tmp\\a.png', '\\\\server\\share\\a.png', '/tmp/a.png']) {
+    assert.throws(
+      () => resolveSource(localRaw, 'http://localhost:6806'),
+      /Local file sources are not supported/,
+    );
+  }
 });

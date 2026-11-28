@@ -3,8 +3,12 @@ import { Logger } from "../../../core/host/Logger.ts";
 import { isAbortError } from "../../../core/feedback/UiFeedback.ts";
 import type { FeatureContext } from "../../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../../core/framework/FeatureScope.ts";
-import { blockDOM } from "../services/references.ts";
-import { resolveImageOccurrence, type ImageOccurrenceEvidence } from "../services/ImageOccurrenceResolver.ts";
+import { blockDOM, type CommitResult } from "../services/SafeBlockWriter.ts";
+import {
+  recaptureReplacedImageOccurrence,
+  resolveImageOccurrence,
+  type ImageOccurrenceEvidence,
+} from "../services/ImageOccurrenceResolver.ts";
 import type { OccurrenceTarget } from "../policy/contracts.ts";
 import {
   assertImagePayload,
@@ -15,16 +19,15 @@ import {
   type ImageProcessingServices,
 } from "../services/ImageProcessingServices.ts";
 import type { Downloaded } from "../services/download.ts";
-import { probeSmartCompressionSupport } from "../services/image.ts";
+import { probeSmartCompressionSupport } from "../services/smartCompressionProbe.ts";
 import { NODE_ID } from "../policy/parseImageConfig.ts";
-import { buildReplacementPath, imageSourceAttribute, resolveSource, trySource } from "../policy/source.ts";
+import { imageSourceAttribute, resolveSource, trySource } from "../policy/source.ts";
 import { classifyImageCandidate } from "../policy/ImageCandidateClassifier.ts";
-import type { CommitResult } from "../services/SafeBlockWriter.ts";
 import { translate } from "../../../i18n/translate.ts";
 import { buildCompressionNoticeValues } from "../policy/formatStats.ts";
 
 export type ImageActionOutcome =
-  | { kind: "notify"; key: string; values?: Record<string, string | number> }
+  | { kind: "notify"; key: string; values?: Record<string, string | number>; type?: "info" | "error" }
   | { kind: "copyable-path"; path: string; key: string }
   | { kind: "silent" };
 
@@ -101,25 +104,6 @@ export async function resolveSelectedOccurrence(
   return resolved;
 }
 
-/**
- * 本地化后通过内核接口重读目标块，核验单块无嵌套并重建更新了 oldPath 的 OccurrenceTarget。
- */
-export async function revalidateAndRecaptureTarget(
-  previous: OccurrenceTarget,
-  expectedNewPath: string,
-  services: ImageProcessingServices,
-  signal: AbortSignal,
-): Promise<OccurrenceTarget | undefined> {
-  const dom = await blockDOM(services.kernel, previous.blockID, previous.notebook, signal);
-  return resolveImageOccurrence(dom, {
-    rootID: previous.rootID,
-    notebook: previous.notebook,
-    blockID: previous.blockID,
-    imageOrdinal: previous.imageOrdinal,
-    oldPath: expectedNewPath,
-  });
-}
-
 /** The quick action uses defaults and changes only the clicked occurrence. */
 export async function compressSelectedImageQuick(
   menuDetail: unknown,
@@ -130,14 +114,14 @@ export async function compressSelectedImageQuick(
 ): Promise<ImageActionOutcome | void> {
   const signal = scope.signal;
   if (!scope.active || signal.aborted) return;
-  if (editor.disabled) return { kind: "notify", key: "image.single.invalidTarget" };
+  if (editor.disabled) return { kind: "notify", key: "image.single.invalidTarget", type: "error" };
   try {
     let target = await resolveSelectedOccurrence(menuDetail, editor, services, signal);
     if (!scope.active || signal.aborted) return;
-    if (!target) return { kind: "notify", key: "image.single.unmappable" };
+    if (!target) return { kind: "notify", key: "image.single.unmappable", type: "error" };
     const source = trySource(target.oldPath, services.origin);
-    if (!source || (source.kind !== "asset" && source.kind !== "remote")) {
-      return { kind: "notify", key: "image.single.unmappable" };
+    if (!source) {
+      return { kind: "notify", key: "image.single.unmappable", type: "error" };
     }
     const candidateDecision = classifyImageCandidate({
       path: target.oldPath,
@@ -178,11 +162,10 @@ export async function compressSelectedImageQuick(
         values: buildCompressionNoticeValues(result.originalBytes, result.compressedBytes),
       };
     }
-    const outcomeKey = ref === "unknown"
-      ? "image.single.unknown"
-      : ref === "failed"
-        ? "image.single.failed"
-        : "image.single.conflict";
+    if (ref === "failed") {
+      return { kind: "notify", key: "image.single.failed", type: "error" };
+    }
+    const outcomeKey = ref === "unknown" ? "image.single.unknown" : "image.single.conflict";
     return { kind: "notify", key: outcomeKey };
   } catch (error) {
     if (error instanceof RecordPersistenceError) {
@@ -200,7 +183,7 @@ export async function compressSelectedImageQuick(
           : { kind: "notify", key: "image.single.unknown" };
       }
       if (error.outcome === "failed") {
-        return { kind: "notify", key: "image.single.failed" };
+        return { kind: "notify", key: "image.single.failed", type: "error" };
       }
       return { kind: "notify", key: "image.single.conflict" };
     }
@@ -209,6 +192,7 @@ export async function compressSelectedImageQuick(
       return {
         kind: "notify",
         key: "image.single.failed",
+        type: "error",
       };
     }
   }
@@ -224,14 +208,14 @@ export async function compressSelectedImageCustom(
 ): Promise<ImageActionOutcome | void> {
   const signal = scope.signal;
   if (!scope.active || signal.aborted) return;
-  if (editor.disabled) return { kind: "notify", key: "image.single.invalidTarget" };
+  if (editor.disabled) return { kind: "notify", key: "image.single.invalidTarget", type: "error" };
   try {
     const target = await resolveSelectedOccurrence(menuDetail, editor, services, signal);
     if (!scope.active || signal.aborted) return;
-    if (!target) return { kind: "notify", key: "image.single.unmappable" };
+    if (!target) return { kind: "notify", key: "image.single.unmappable", type: "error" };
     const source = trySource(target.oldPath, services.origin);
-    if (!source || (source.kind !== "asset" && source.kind !== "remote")) {
-      return { kind: "notify", key: "image.single.unmappable" };
+    if (!source) {
+      return { kind: "notify", key: "image.single.unmappable", type: "error" };
     }
     const candidateDecision = classifyImageCandidate({
       path: target.oldPath,
@@ -356,7 +340,7 @@ export async function compressSelectedImageCustom(
                 return;
               }
               if (error.outcome === "failed") {
-                services.ui.notify(translate(context.plugin.i18n as Record<string, unknown>, "image.single.failed"));
+                services.ui.notify(translate(context.plugin.i18n as Record<string, unknown>, "image.single.failed"), "error");
                 return;
               }
               services.ui.notify(translate(context.plugin.i18n as Record<string, unknown>, "image.single.conflict"));
@@ -421,6 +405,7 @@ export async function compressSelectedImageCustom(
       return {
         kind: "notify",
         key: "image.single.failed",
+        type: "error",
       };
     }
   }
@@ -463,8 +448,13 @@ export async function localizeRemoteOccurrence(
   if (committed !== "replaced") {
     throw new LocalizationOutcomeError("conflict", localPath);
   }
-  const expectedLocalPath = buildReplacementPath(target.oldPath, localPath, services.origin);
-  const recaptured = await revalidateAndRecaptureTarget(target, expectedLocalPath, services, signal);
+  const recaptured = await recaptureReplacedImageOccurrence(
+    services.kernel,
+    target,
+    localPath,
+    services.origin,
+    signal,
+  );
   if (!recaptured) {
     throw new LocalizationOutcomeError("conflict", localPath);
   }

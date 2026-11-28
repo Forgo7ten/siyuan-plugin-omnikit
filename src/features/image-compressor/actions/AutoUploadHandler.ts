@@ -3,7 +3,7 @@ import type { FeatureScope } from "../../../core/framework/FeatureScope.ts";
 import { isInsideProtectedContainer } from "../../../core/host/dom.ts";
 import { resolveEditorRootID, resolveNotebookID } from "../../../core/host/ProtyleAdapter.ts";
 import { logSkippedImage, type ImageProcessingServices } from "../services/ImageProcessingServices.ts";
-import { isSmartCompressionEffective } from "../services/image.ts";
+import { isSmartCompressionEffective } from "../services/smartCompressionProbe.ts";
 import { waitForPersistedImageOccurrence, type ImageOccurrenceEvidence } from "../services/ImageOccurrenceResolver.ts";
 import { resolveSource, trySource } from "../policy/source.ts";
 import { classifyImageCandidate } from "../policy/ImageCandidateClassifier.ts";
@@ -31,7 +31,11 @@ interface UploadSuccess {
   succFiles?: Array<{ index: number; name?: string; path?: string }>;
   succMap?: Record<string, string>;
 }
-interface InsertedImage extends ImageOccurrenceEvidence { key: string }
+
+export interface InsertedImage extends ImageOccurrenceEvidence {
+  key: string;
+  element?: Element;
+}
 
 export type UploadInput =
   | { kind: "files"; files: File[] }
@@ -45,18 +49,62 @@ export interface UploadDetail {
   onComplete?: (callback: (result: UploadSuccess) => void) => void;
 }
 
+const DEFAULT_OBSERVED_IMAGE_DELAYS_MS: readonly number[] = [20, 40, 80, 140, 220];
+
+function waitWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted || ms <= 0) return Promise.resolve();
+  return new Promise(resolve => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export function buildAutoUploadNotice(counts: {
+  successful: number;
+  skipped: number;
+  failed: number;
+  unknownCount: number;
+  singleOriginalBytes?: number;
+  singleCompressedBytes?: number;
+}): AutoUploadNotice | undefined {
+  const { successful, skipped, failed, unknownCount, singleOriginalBytes, singleCompressedBytes } = counts;
+  const total = successful + skipped + failed + unknownCount;
+  if (total <= 0 || (successful === 0 && failed === 0 && unknownCount === 0)) {
+    return undefined;
+  }
+  return {
+    total,
+    successful,
+    skipped,
+    failed,
+    ...(unknownCount > 0 ? { unknown: unknownCount } : {}),
+    singleReason: total === 1
+      ? (successful === 1 ? "success" : failed === 1 ? "failed" : "unknown")
+      : undefined,
+    ...(total === 1 && successful === 1 && singleOriginalBytes !== undefined && singleCompressedBytes !== undefined
+      ? { originalBytes: singleOriginalBytes, compressedBytes: singleCompressedBytes }
+      : {}),
+  };
+}
+
 export function hasCompressibleInput(input: UploadInput | undefined, config: ImageConfig): boolean {
   if (!input) return true;
   const paths = input.kind === "files"
     ? (Array.isArray(input.files) ? input.files.map(file => file.name) : [])
     : (Array.isArray(input.files) ? input.files.filter(f => !f.isDir).map(f => f.path) : []);
   if (paths.length === 0) return false;
-  const excluded = config?.compression?.excludedExtensions ?? ["gif", "svg", "webp"];
   return paths.some(path => classifyImageCandidate({
     path,
     mode: "auto",
-    excludedExtensions: excluded,
-    smartEnabled: isSmartCompressionEffective(config?.compression?.smartEnabled),
+    excludedExtensions: config.compression.excludedExtensions,
+    smartEnabled: isSmartCompressionEffective(config.compression.smartEnabled),
   }).eligible);
 }
 
@@ -159,7 +207,7 @@ export function registerAutoUpload(
         // onComplete may run before editor DOM mutation and kernel persistence. Keep the
         // observer briefly and retry only the exact successful paths from this request.
         queueMicrotask(() => {
-          void processCompletedUpload(result, rootID, observed, scope, shouldCompress,
+          void processCompletedUpload(result, rootID, observed, editor, scope, shouldCompress,
             services, logger, onNotice).finally(() => releaseObserver?.());
         });
       });
@@ -219,14 +267,22 @@ function collectNewImages(
     const raw = image.hasAttribute("data-src") ? image.getAttribute("data-src") : image.getAttribute("src");
     const owner = image.closest<HTMLElement>("[data-node-id]");
     if (!raw || !owner || isInsideProtectedContainer(owner)) continue;
-    const blockID = owner.dataset.nodeId;
+    const blockID = owner.dataset?.nodeId ?? owner.getAttribute?.("data-node-id") ?? undefined;
     if (!blockID) continue;
     let key: string;
     try { key = resolveSource(raw.replaceAll("\\", "/"), origin).key; } catch { continue; }
     if (!key.startsWith("asset:")) continue;
     const ordinal = [...owner.querySelectorAll("img")].indexOf(image);
-    if (ordinal < 0 || observed.some(item => item.blockID === blockID && item.imageOrdinal === ordinal && item.key === key)) continue;
-    observed.push({ rootID, notebook, blockID, imageOrdinal: ordinal, oldPath: raw.replaceAll("\\", "/"), key });
+    if (ordinal < 0 || observed.some(item => item.element === image && item.key === key)) continue;
+    observed.push({
+      rootID,
+      notebook,
+      blockID,
+      imageOrdinal: ordinal,
+      oldPath: raw.replaceAll("\\", "/"),
+      key,
+      element: image,
+    });
   }
 }
 
@@ -234,6 +290,7 @@ async function processCompletedUpload(
   result: UploadSuccess,
   rootID: string,
   observed: InsertedImage[],
+  editor: HTMLElement | undefined,
   scope: FeatureScope,
   shouldCompress: (rootID: string) => boolean,
   services: ImageProcessingServices,
@@ -263,12 +320,11 @@ async function processCompletedUpload(
     if (!scope.active || scope.signal.aborted) break;
     const path = rawPath.replaceAll("\\", "/");
     const currentConfig = services.config();
-    const excluded = currentConfig?.compression?.excludedExtensions ?? ["gif", "svg", "webp"];
     const decision = classifyImageCandidate({
       path,
       mode: "auto",
-      excludedExtensions: excluded,
-      smartEnabled: isSmartCompressionEffective(currentConfig?.compression?.smartEnabled),
+      excludedExtensions: currentConfig.compression.excludedExtensions,
+      smartEnabled: isSmartCompressionEffective(currentConfig.compression.smartEnabled),
     });
     if (!decision.eligible) {
       if (decision.reason === "animated-format" || decision.reason === "vector-format" || decision.reason === "excluded-extension") {
@@ -286,7 +342,7 @@ async function processCompletedUpload(
         skipped++;
         continue;
       }
-      const candidates = await waitForObservedImages(observed, source.key, scope.signal);
+      const candidates = await waitForObservedImages(observed, source.key, scope.signal, editor);
       if (!scope.active || scope.signal.aborted) break;
       logger.debug?.("检索图片插入位置候选", { path, key: source.key, candidateCount: candidates.length });
 
@@ -296,7 +352,7 @@ async function processCompletedUpload(
         continue;
       }
       const evidence = candidates[0];
-      const target = await waitForPersistedImageOccurrence(services.kernel, evidence, 2, scope.signal);
+      const target = await waitForPersistedImageOccurrence(services.kernel, evidence, undefined, scope.signal);
       if (!scope.active || scope.signal.aborted) break;
       if (!target) {
         logger.debug?.("未能在思源内核中核验到块持久化位置，跳过", { path });
@@ -334,24 +390,19 @@ async function processCompletedUpload(
 
   const total = successful + skipped + failed + unknownCount;
   if (total > 0 && scope.active) {
-    if (successful === 0 && failed === 0 && unknownCount === 0) {
+    const notice = buildAutoUploadNotice({
+      successful,
+      skipped,
+      failed,
+      unknownCount,
+      singleOriginalBytes,
+      singleCompressedBytes,
+    });
+    if (!notice) {
       logger.debug?.("所有图片均已跳过，静默结束", { total, skipped });
       return;
     }
     try {
-      const notice: AutoUploadNotice = {
-        total,
-        successful,
-        skipped,
-        failed,
-        ...(unknownCount > 0 ? { unknown: unknownCount } : {}),
-        singleReason: total === 1
-          ? (successful === 1 ? "success" : failed === 1 ? "failed" : "unknown")
-          : undefined,
-        ...(total === 1 && successful === 1 && singleOriginalBytes !== undefined && singleCompressedBytes !== undefined
-          ? { originalBytes: singleOriginalBytes, compressedBytes: singleCompressedBytes }
-          : {}),
-      };
       onNotice?.(notice);
     } catch (error) {
       logger.warn("无法显示自动压缩提示", error);
@@ -359,14 +410,45 @@ async function processCompletedUpload(
   }
 }
 
+function resolveConnectedItem(item: InsertedImage, editor?: HTMLElement): InsertedImage | undefined {
+  const connected = !item.element || typeof editor?.contains !== "function" || editor.contains(item.element);
+  if (!connected) return undefined;
+  if (!item.element || typeof item.element.closest !== "function") return item;
+  const owner = item.element.closest<HTMLElement>("[data-node-id]");
+  const blockID = owner?.dataset?.nodeId ?? owner?.getAttribute?.("data-node-id") ?? undefined;
+  if (!owner || !blockID || isInsideProtectedContainer(owner)) return undefined;
+  if (typeof owner.querySelectorAll === "function") {
+    const ordinal = [...owner.querySelectorAll("img")].indexOf(item.element as HTMLImageElement);
+    if (ordinal < 0) return undefined;
+    return { ...item, blockID, imageOrdinal: ordinal };
+  }
+  return { ...item, blockID };
+}
+
 export async function waitForObservedImages(
-  observed: InsertedImage[], key: string, signal: AbortSignal,
+  observed: InsertedImage[],
+  key: string,
+  signal: AbortSignal,
+  editor?: HTMLElement,
+  delays: readonly number[] = DEFAULT_OBSERVED_IMAGE_DELAYS_MS,
 ): Promise<InsertedImage[]> {
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
     if (signal.aborted) return [];
-    const matches = observed.filter(item => item.key === key);
-    if (matches.length) return matches;
-    if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 30));
+    const seen = new Set<string>();
+    const matches: InsertedImage[] = [];
+    for (const item of observed) {
+      if (item.key !== key) continue;
+      const live = resolveConnectedItem(item, editor);
+      if (!live) continue;
+      const dedupKey = `${live.blockID}\n${live.imageOrdinal}\n${live.key}`;
+      if (seen.has(dedupKey)) continue;
+      seen.add(dedupKey);
+      matches.push(live);
+    }
+    if (matches.length > 0) return matches;
+    if (attempt < delays.length) {
+      await waitWithAbort(delays[attempt], signal);
+    }
   }
   return [];
 }

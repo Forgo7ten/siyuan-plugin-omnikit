@@ -12,7 +12,7 @@ import { AdaptiveImageCompressor } from "../similarity/AdaptiveImageCompressor.t
 import { compressOccurrence, savePreview, type ImageProcessingServices } from "./ImageProcessingServices.ts";
 import { imageRecordsFor } from "../store/ImageCompressionRecordStore.ts";
 import type { ImageConfig } from "../policy/parseImageConfig.ts";
-import { ReferenceService } from "./references.ts";
+import { ReferenceService } from "./SafeBlockWriter.ts";
 
 export function createImageServices(context: FeatureContext, scope: FeatureScope): ImageProcessingServices {
   const origin = location.origin;

@@ -13,7 +13,7 @@ import {
   type SmartSearchSummary,
 } from "./image.ts";
 import type { ImageConfig } from "../policy/parseImageConfig.ts";
-import type { ReferenceService } from "./references.ts";
+import type { ReferenceService } from "./SafeBlockWriter.ts";
 import type { ImageCompressionRecordStore } from "../store/ImageCompressionRecordStore.ts";
 import type { CompressionMode, OccurrenceTarget } from "../policy/contracts.ts";
 import { resolveSource, type ImageSource } from "../policy/source.ts";

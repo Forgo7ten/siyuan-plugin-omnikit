@@ -92,7 +92,7 @@ test('watchRemoteImages guards against unauthorized documents and reconciles on 
       removeEventListener: (event, fn) => listeners.delete(event),
     });
 
-    const doc = { id: rootID, root_id: rootID, box: 'box-1' };
+    const doc = { id: rootID, box: 'box-1' };
     const scope = {
       signal: new AbortController().signal,
       active: true,
@@ -144,6 +144,8 @@ test('RemoteImageWatcher removes record capacity throttling and resolves persist
 
   assert.doesNotMatch(watcher, /capacityReached|isRecordCapacityError|lastRecordCount|unsubscribeRecords/);
   assert.doesNotMatch(watcher, /resolveImageOccurrence/);
+  assert.match(watcher, /recaptureReplacedImageOccurrence/);
+  assert.match(watcher, /buildAutoUploadNotice/);
   assert.match(watcher, /const target: OccurrenceTarget = \{/);
 });
 
@@ -258,7 +260,7 @@ test('watchRemoteImages processes >20 added remote images across consecutive bat
       removeEventListener() {},
       closest: () => null,
     });
-    const doc = { id: rootID, root_id: rootID, box: 'box-1' };
+    const doc = { id: rootID, box: 'box-1' };
     const scope = { signal: new AbortController().signal, active: true, own: fn => fn };
 
     const handle = await watchRemoteImages(editor, doc, scope, services, { warn() {} });
@@ -268,7 +270,10 @@ test('watchRemoteImages processes >20 added remote images across consecutive bat
     });
 
     const addedImg = Object.assign(new FakeHTMLElement(), {
+      tagName: 'IMG',
       matches: selector => selector === 'img',
+      hasAttribute: name => name === 'src',
+      getAttribute: name => (name === 'src' ? 'https://cdn.example/trigger.png' : null),
       closest: () => null,
       querySelectorAll: () => [],
     });
@@ -344,7 +349,7 @@ test('RemoteImageWatcher ignores unrelated config reconcile when observing, abor
       removeEventListener() {},
       closest: () => null,
     });
-    const doc = { id: rootID, root_id: rootID, box: 'box-1' };
+    const doc = { id: rootID, box: 'box-1' };
 
     // 1. Unrelated config change while observing must NOT trigger sweep / getBlockDOM
     {
@@ -481,7 +486,10 @@ test('RemoteImageWatcher ignores unrelated config reconcile when observing, abor
       const handle = await watchRemoteImages(editor, doc, scope, services, { warn: (...args) => warnings.push(args) });
       docDom = `<div data-node-id="${blk}"><img src="https://cdn.example/abort-case.png" /></div>`;
       const addedImg = Object.assign(new FakeHTMLElement(), {
+        tagName: 'IMG',
         matches: selector => selector === 'img',
+        hasAttribute: name => name === 'src',
+        getAttribute: name => (name === 'src' ? 'https://cdn.example/trigger.png' : null),
         closest: () => null,
         querySelectorAll: () => [],
       });
@@ -577,7 +585,10 @@ test('RemoteImageWatcher ignores unrelated config reconcile when observing, abor
 
       const handle = await watchRemoteImages(editor, doc, scope, services, { warn() {} }, undefined, n => notices.push(n));
       const addedImg = Object.assign(new FakeHTMLElement(), {
+        tagName: 'IMG',
         matches: selector => selector === 'img',
+        hasAttribute: name => name === 'src',
+        getAttribute: name => (name === 'src' ? 'https://cdn.example/trigger.png' : null),
         closest: () => null,
         querySelectorAll: () => [],
       });
@@ -671,7 +682,10 @@ test('RemoteImageWatcher ignores unrelated config reconcile when observing, abor
 
       const handle = await watchRemoteImages(editor, doc, scope, services, { warn() {} });
       const addedImg = Object.assign(new FakeHTMLElement(), {
+        tagName: 'IMG',
         matches: selector => selector === 'img',
+        hasAttribute: name => name === 'src',
+        getAttribute: name => (name === 'src' ? 'https://cdn.example/trigger.png' : null),
         closest: () => null,
         querySelectorAll: () => [],
       });
@@ -748,8 +762,6 @@ test('ImageCompressorFeature attaches all editors via getAllEditor and skips reb
   const protyleAdapterUrl = new URL('../../../src/core/host/ProtyleAdapter.ts', import.meta.url).href;
   const parseCfgUrl = new URL('../../../src/features/image-compressor/policy/parseImageConfig.ts', import.meta.url).href;
   const taskRegUrl = new URL('../../../src/features/image-compressor/policy/TaskRegistry.ts', import.meta.url).href;
-  const settingsUrl = new URL('../../../src/features/image-compressor/policy/settings.ts', import.meta.url).href;
-  const autoPolicyUrl = new URL('../../../src/features/image-compressor/policy/AutoPolicy.ts', import.meta.url).href;
   const translateUrl = new URL('../../../src/i18n/translate.ts', import.meta.url).href;
 
   const runnable = stripTypeScriptTypes(src
@@ -768,8 +780,6 @@ test('ImageCompressorFeature attaches all editors via getAllEditor and skips reb
     .replace(/from\s*["'][^"']*ProtyleAdapter\.ts["']/, `from "${protyleAdapterUrl}"`)
     .replace(/from\s*["'][^"']*parseImageConfig\.ts["']/, `from "${parseCfgUrl}"`)
     .replace(/from\s*["'][^"']*TaskRegistry\.ts["']/, `from "${taskRegUrl}"`)
-    .replace(/from\s*["'][^"']*settings\.ts["']/, `from "${settingsUrl}"`)
-    .replace(/from\s*["'][^"']*AutoPolicy\.ts["']/, `from "${autoPolicyUrl}"`)
     .replace(/from\s*["'][^"']*translate\.ts["']/, `from "${translateUrl}"`),
   );
 
@@ -826,13 +836,118 @@ test('ImageCompressorFeature attaches all editors via getAllEditor and skips reb
     assert.equal(watchCalls[0].initSignal.aborted, true);
     assert.deepEqual(disposedWatches, [1]);
 
+    // D-BUG-04: Switching el2 into a read-only (disabled: true) document must dispose its prior watcher without creating a new one
+    const protyle2ReadOnly = { element: el2, disabled: true, block: { rootID: '20260101000000-doc4', box: 'box-2' } };
+    plugin.eventBus.emit('switch-protyle', { protyle: protyle2ReadOnly });
+    await Promise.resolve();
+    assert.equal(watchCalls.length, 3, 'read-only protyle must not spawn a new watcher');
+    assert.equal(watchCalls[1].initSignal.aborted, true, 'prior watcher initSignal on el2 must be aborted on disabled attach');
+    assert.deepEqual(disposedWatches, [1, 2], 'prior watcher handle on el2 must be disposed when switching to read-only tab');
+
     await feature.deactivate();
-    assert.equal(watchCalls[1].initSignal.aborted, true);
     assert.equal(watchCalls[2].initSignal.aborted, true);
   } finally {
     delete globalThis.__omnikitTestAllEditors;
     delete globalThis.__omnikitTestWatchRemoteImages;
     globalThis.HTMLElement = prevHTMLElement;
+  }
+});
+
+test('D-BUG-04: watchRemoteImages ignores local assets/ edits and lazy-load mutations without re-reading document DOM', async () => {
+  const observers = [];
+  let observeOptions;
+  class MockMutationObserver {
+    constructor(callback) {
+      this.callback = callback;
+      observers.push(this);
+    }
+    observe(_target, opts) { observeOptions = opts; }
+    disconnect() {}
+  }
+
+  const prevHTMLElement = globalThis.HTMLElement;
+  const prevElement = globalThis.Element;
+  const prevMutationObserver = globalThis.MutationObserver;
+  const prevDocument = globalThis.document;
+
+  class FakeElement {}
+  class FakeHTMLElement extends FakeElement {}
+  globalThis.Element = FakeElement;
+  globalThis.HTMLElement = FakeHTMLElement;
+  globalThis.MutationObserver = MockMutationObserver;
+  globalThis.document = {
+    createElement: () => ({
+      _html: '',
+      set innerHTML(val) { this._html = val; },
+      get content() {
+        return { children: [], querySelectorAll: () => [] };
+      },
+    }),
+  };
+
+  try {
+    const { watchRemoteImages } = await import('../../../src/features/image-compressor/actions/RemoteImageWatcher.ts');
+    let docReads = 0;
+    const services = {
+      config: () => config(),
+      origin: 'http://127.0.0.1:6806',
+      mobile: false,
+      userAgent: () => 'TestUA',
+      kernel: {
+        post: async (_path, body) => {
+          if (body.id === rootID) docReads += 1;
+          return { code: 0, data: { id: body.id, dom: `<div data-node-id="${body.id}"></div>` } };
+        },
+      },
+    };
+    const editor = Object.assign(new FakeHTMLElement(), {
+      addEventListener() {},
+      removeEventListener() {},
+      closest: () => null,
+    });
+    const scope = { signal: new AbortController().signal, active: true, own: fn => fn };
+
+    const handle = await watchRemoteImages(editor, { id: rootID, box: 'box-1' }, scope, services, { warn() {} });
+    assert.equal(docReads, 1, 'initial baseline read');
+    assert.equal(observeOptions?.attributeOldValue, true);
+
+    const localImg = Object.assign(new FakeHTMLElement(), {
+      tagName: 'IMG',
+      matches: sel => sel === 'img',
+      hasAttribute: n => n === 'data-src' || n === 'src',
+      getAttribute: n => (n === 'data-src' || n === 'src' ? 'assets/local-photo.png' : null),
+      closest: () => null,
+      querySelectorAll: () => [],
+    });
+
+    // 1. SpinBlockDOM replacing local image paragraph + lazy-load attribute change on local image -> zero sweeps
+    observers.at(-1).callback([
+      { type: 'childList', target: editor, addedNodes: [localImg], removedNodes: [localImg] },
+      { type: 'attributes', target: localImg, attributeName: 'src', oldValue: 'data:image/svg+xml;utf8,<svg></svg>' },
+    ]);
+    await new Promise(resolve => setTimeout(resolve, 550));
+    assert.equal(docReads, 1, 'local assets/ mutations must NOT trigger getBlockDOM');
+
+    // 2. Remote image insertion DOES trigger sweep
+    const remoteImg = Object.assign(new FakeHTMLElement(), {
+      tagName: 'IMG',
+      matches: sel => sel === 'img',
+      hasAttribute: n => n === 'src',
+      getAttribute: n => (n === 'src' ? 'https://cdn.example/new-remote.png' : null),
+      closest: () => null,
+      querySelectorAll: () => [],
+    });
+    observers.at(-1).callback([
+      { type: 'childList', target: editor, addedNodes: [remoteImg], removedNodes: [] },
+    ]);
+    await new Promise(resolve => setTimeout(resolve, 520));
+    assert.equal(docReads, 2, 'remote image insertion must trigger sweep');
+    handle.dispose();
+  } finally {
+    globalThis.HTMLElement = prevHTMLElement;
+    globalThis.Element = prevElement;
+    globalThis.MutationObserver = prevMutationObserver;
+    globalThis.document = prevDocument;
   }
 });
 

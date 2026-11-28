@@ -1,18 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { ReferenceService } from "../../../src/features/image-compressor/services/references.ts";
+import { ReferenceService } from "../../../src/features/image-compressor/services/SafeBlockWriter.ts";
 
 const id = n => `${String(n).padStart(14, "0")}-abcdef0`;
 
 test("reference rewriting never calls workspace-wide relink", async () => {
-  const source = await readFile(new URL("../../../src/features/image-compressor/services/references.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../../../src/features/image-compressor/services/SafeBlockWriter.ts", import.meta.url), "utf8");
   assert.doesNotMatch(source, /relinkAsset/);
   assert.match(source, /commitOccurrence\(target: OccurrenceTarget/);
 });
 
 test("reference service does not perform SQL writes or workspace-wide relinking", async () => {
-  const source = await readFile(new URL("../../../src/features/image-compressor/services/references.ts", import.meta.url), "utf8");
+  const source = await readFile(new URL("../../../src/features/image-compressor/services/SafeBlockWriter.ts", import.meta.url), "utf8");
   assert.doesNotMatch(source, /relinkAsset/);
   assert.doesNotMatch(source, /mode:\s*["']write["']/);
   assert.doesNotMatch(source, /\/api\/query\/sql/);

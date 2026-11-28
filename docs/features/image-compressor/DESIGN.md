@@ -20,26 +20,28 @@
 │        ImageController (准入判定、activeDocuments、进度弹窗与统一反馈) │
 ├──────────────────┬───────────────────────┬───────────────────────────┤
 │ actions/         │ policy/               │ services/                 │
-│ ├─ AutoUpload    │ ├─ AutoPolicy         │ ├─ allowlistPaths         │
-│ ├─ SingleImage   │ ├─ Classifier         │ ├─ assets / download      │
-│ ├─ DocBatch      │ ├─ CompressionResult  │ ├─ desktop                │
-│ ├─ RemoteWatcher │ ├─ contracts          │ ├─ documentTitle          │
-│ ├─ menuContrib   │ ├─ DocumentIdentity   │ ├─ image (CanvasWebpCodec)│
-│ └─ scanDocImages │ ├─ dom / source       │ ├─ ImageOccurrenceResolver│
-│                  │ ├─ formatStats        │ ├─ ImageProcessingServices│
-│                  │ ├─ PageAllowlist      │ ├─ createImageServices    │
-│                  │ ├─ parseImageConfig   │ ├─ SafeBlockWriter        │
-│                  │ ├─ settings           │ ├─ references (写回包装)  │
-│                  │ └─ TaskRegistry       │ └─ ImageReferences (定位) │
+│ ├─ AutoUpload    │ ├─ Classifier         │ ├─ allowlistPaths         │
+│ ├─ SingleImage   │ ├─ CompressionResult  │ ├─ assets / download      │
+│ ├─ DocBatch      │ ├─ contracts          │ ├─ desktop                │
+│ ├─ RemoteWatcher │ ├─ DocumentIdentity   │ ├─ documentTitle          │
+│ ├─ menuContrib   │ ├─ dom / source       │ ├─ image / Probe / Header │
+│ └─ scanDocImages │ ├─ formatStats        │ ├─ ImageOccurrenceResolver│
+│                  │ ├─ PageAllowlist      │ ├─ ImageProcessingServices│
+│                  │ ├─ parseImageConfig   │ ├─ createImageServices    │
+│                  │ └─ TaskRegistry       │ ├─ SafeBlockWriter        │
+│                  │                       │ ├─ assetAvailability      │
+│                  │                       │ ├─ boxReferenceLocator    │
+│                  │                       │ └─ ImageReferences (定位) │
 ├──────────────────┼───────────────────────┼───────────────────────────┤
 │ store/           │ ui/                   │ similarity/               │
 │ └─ ImageRecord   │ ├─ ImageRecordsDock   │ ├─ AdaptiveImageCompressor│
-│    Store         │ ├─ ImageSettingsPanel │ ├─ similarity-policy      │
-│                  │ ├─ ImageSettingsBridge│ ├─ ms-ssim                │
-│                  │ ├─ ImageCompressionDlg│ ├─ patch-selector         │
-│                  │ ├─ ImageTaskPanel     │ ├─ adaptive-quality-search│
-│                  │ └─ ImageTaskUI        │ ├─ SimilarityWorkerSession│
-│                  │                       │ └─ similarity.worker      │
+│    Store         │ ├─ ImageRecordCard    │ ├─ similarity-policy      │
+│                  │ ├─ ImageRecordRefs    │ ├─ ms-ssim                │
+│                  │ ├─ ImageSettingsPanel │ ├─ patch-selector         │
+│                  │ ├─ ImageSettingsBridge│ ├─ adaptive-quality-search│
+│                  │ ├─ ImageCompressionDlg│ ├─ SimilarityWorkerSession│
+│                  │ ├─ ImageTaskPanel     │ └─ similarity.worker      │
+│                  │ └─ ImageTaskUI        │                           │
 └──────────────────┴───────────────────────┴───────────────────────────┘
 ```
 
@@ -50,14 +52,14 @@
 | `ImageCompressorFeature.ts` & `actions/menuContributions.ts` | `ImageCompressorFeature` & `imageMenuContributions` | Feature 入口（ID: `imageCompressor`）；通过 `/api/block/getBlockInfo` + `isDocumentRootIdentity` 校验文档身份；`doc-title` / `doc-tree` / `topbar` 白名单菜单项校验 `ctx.rootID` 后声明固定文案键 `menu.whitelistDocument` 与 `checked: deps.isAllowlisted(ctx)`（读取 `PageAllowlist.hasCached(rootID)`，独立于 `globalEnabled`），交由 `MenuRegistry` 渲染整行复选框视觉态；批量压缩前遍历 `getAllEditor()` 对同 `rootID` 且未销毁的活动编辑器执行 `flushPendingTransactions()` |
 | `ImageController.ts` | `ImageController` | 唯一业务控制器；检查全局开关与白名单，维护 `activeDocuments: Set<string>` 并在 `compressDocument` 中将任务创建、进度弹窗与批处理调用纳入 `try/finally`；委托 `ImageTaskUI.ts` 管理 `ImageTaskPanel` 模态框，将 Action 返回的纯数据结构化结果转换为语义文案，通过 Core `UiFeedback` 显示通知、通过 `PluginStatusBar` 更新底栏任务文本 |
 | `policy/ImageCandidateClassifier.ts` | `classifyImageCandidate` | 按路径与正则提取的末段扩展名判定准入（无扩展名或点号结尾返回 `""`）；跳过视频、GIF/APNG、SVG、Excalidraw 及 `/(?:^\|[\\/])drawings?[\\/]/i` 绘图目录（不跳过 `drawings_v2.png` 等普通文件名）；静态 WebP 在手动模式始终放行，在 `auto`/`document` 模式仅当 `smartEnabled === true` 时放行 |
-| `actions/AutoUploadHandler.ts` | `AutoUploadHandler` | 监听 Protyle `before-upload-assets` 事件；同步检查授权与可处理图片，不满足时直接退出（不建 `MutationObserver`）；仅采纳本次上传观察到的新节点，等待块落盘后定位并返回 `AutoUploadNotice` |
-| `actions/RemoteImageWatcher.ts` | `RemoteImageWatcher` | 监听已授权文档中新插入的 HTTP/HTTPS 图片；跳过受保护容器；按每批最多 20 张顺序推进，桌面端默认并发 3（`concurrencyDesktop`）、移动端并发 1，同块内通过尾承诺串行排序写入任务 |
-| `services/ImageOccurrenceResolver.ts` & `policy/source.ts` | `AssetAddress` / `ImageOccurrenceResolver` / `buildReplacementPath` / `sameSource` | 分离 `raw`、`kernelPath`、`key`（大小写敏感 + `box`）、`fetchURL` 与 `box` 并保护 `%25` 字面路径；`sameSource` 比对本地 `asset` 或规范化 `remote` URL；建立 `OccurrenceTarget` |
-| `services/image.ts` & `similarity/` | `CanvasWebpEncoder` & `AdaptiveImageCompressor` | 宿主原生 `OffscreenCanvas` / `HTMLCanvasElement` WebP 编码引擎、智能压缩能力探测 `probeSmartCompressionSupport`、统一目标尺寸计算 `computeTargetDimensions`；`similarity/` 提供无宿主/DOM 依赖的 5 尺度亮度 $L_4$ MS-SSIM、双向梯度抗边框 1:1 选区、体积单调早停搜索与单会话内联 Worker |
+| `actions/AutoUploadHandler.ts` | `AutoUploadHandler` | 监听 Protyle `before-upload-assets` 事件；同步检查授权（`parseImageConfig.autoAllowed`）与可处理图片，不满足时直接退出（不建 `MutationObserver`）；仅采纳本次观察到且仍在编辑器树内（`editor.contains`）的新节点，经渐进退避等待块落盘后定位并返回 `AutoUploadNotice` |
+| `actions/RemoteImageWatcher.ts` | `RemoteImageWatcher` | 监听已授权文档中新插入的 `kind === "remote"` HTTP/HTTPS 外链图片（忽略本地 `assets/` 图片编辑与懒加载）；跳过受保护容器；按每批最多 20 张顺序推进，桌面端默认并发 3（`concurrencyDesktop`）、移动端并发 1，同块内通过尾承诺串行排序写入任务 |
+| `services/ImageOccurrenceResolver.ts` & `policy/source.ts` | `AssetAddress` / `ImageOccurrenceResolver` / `recaptureReplacedImageOccurrence` / `buildReplacementPath` / `sameSource` | `ImageSource` 限定为 `asset | remote` 二元联合；分离 `raw`、`kernelPath`、`key`（大小写敏感 + `box`）、`fetchURL` 与 `box` 并保护 `%25` 字面路径；`sameSource` 比对本地 `asset` 或规范化 `remote` URL；建立与本地化替换后重捕获 `OccurrenceTarget` |
+| `services/image.ts`、`smartCompressionProbe.ts`、`imageHeaderInspector.ts` & `similarity/` | `CanvasWebpEncoder`、`probeSmartCompressionSupport`、`inspectImage` & `AdaptiveImageCompressor` | `image.ts` 提供宿主原生 `OffscreenCanvas` / `HTMLCanvasElement` WebP 编码引擎与 `computeTargetDimensions`；`smartCompressionProbe.ts` 独立探测内联 Worker 与 WebP 编码能力；`imageHeaderInspector.ts` 纯二进制解析 PNG/JPEG/WebP 帧头与动图标记；`similarity/` 提供无宿主/DOM 依赖的 5 尺度亮度 $L_4$ MS-SSIM、双向梯度抗边框 1:1 选区、体积单调早停搜索与单会话内联 Worker |
 | `services/assets.ts` & `services/ImageProcessingServices.ts` | `AssetStore` / `ImageProcessingServices` | `AssetStore.upload` 区分 `"not-sent"` / `"rejected"` 与 `UploadOutcomeUnknown`；`ImageProcessingServices` 提供 `localizeRemoteAsset`、`prepareImage`、`savePreview`、统一持久化前置闸门 `persistMappedAsset` 及结构化 `info` 日志输出 |
 | `store/ImageCompressionRecordStore.ts` | `ImageCompressionRecordStore` | 基于 Core `JsonStore` 管理 `feature-image-compressor-records.json`；支持 `assets/...` 或无凭据 `http(s)://` 作为 `originalPath`；最多保存 100 条，超限按 `updatedAt` 淘汰最旧记录；`compareAndRemove` 在串行队列中二次核对配对后移除确认缺失项 |
-| `services/SafeBlockWriter.ts` & `services/references.ts` | `SafeBlockWriter` & `ReferenceService` | 接入 Core `withBlockWriteLease`（`notebook/blockID`）；写前读回校验块归属、单块无嵌套、序号节点存在与 `oldPath` 原文一致；返回五态 `CommitResult` 与可选 `conflictReason` |
-| `ui/ImageRecordsDock.svelte` & `services/ImageReferences.ts` | Dock 记录视图与引用核验服务 | 顶部设置约 52px~56px 品牌 Hero 卡片区（`image-records__hero`，使下方操作区下移 50px 以上以避开思源右上角 32px 浮动 Snackbar `#message` / `.b3-snackbars` 遮挡）；提供三态资产核验、双向引用定位与替换/恢复、只读 SQL 外链粗召回与 `?box=` 加密笔记本范围扫描 |
+| `services/SafeBlockWriter.ts` | `SafeBlockWriter` / `ReferenceService` / `blockDOM` | 接入 Core `withBlockWriteLease`（`notebook/blockID`）；写前读回校验块归属、单块无嵌套、序号节点存在与 `oldPath` 原文一致；返回五态 `CommitResult` 与可选 `conflictReason` |
+| `ui/ImageRecordsDock.svelte`、`ImageRecordCard.svelte`、`ImageRecordReferences.svelte`、`services/ImageReferences.ts`、`assetAvailability.ts` & `boxReferenceLocator.ts` | Dock 记录视图组件组与引用核验/定位服务组 | 顶部设置约 52px~56px 品牌 Hero 卡片区（`image-records__hero`）；`assetAvailability.ts` 提供三态资产存在性核验与记录对账，`boxReferenceLocator.ts` 提供 `?box=` 加密笔记本解锁态核验与目录树扫描（含隐藏文档与 `boxDocEnabled` 根文档），`ImageReferences.ts` 提供普通资产引用（将数据库/HTML/题头图等非块级 DOM 引用归入只读 `unsupported`）与只读 SQL 外链定位 |
 | `ui/ImageSettingsBridge.svelte`、`ui/ImageSettingsPanel.svelte` & `services/allowlistPaths.ts` | 设置桥接、面板与白名单路径服务 | 透传 `registerDraft` 草稿协议；`allowlistPaths.ts` 按固定小批（32）执行只读 SQL 批量路径解析并回退 `resolveDocumentTitle`；面板通过 `pathLookupsStarted: Set<string>` 与 `resolvedHPaths` 保障单次挂载周期内同一文档至多查询一轮 |
 
 ### 1.2 上传后异步全流程时序
@@ -208,19 +210,19 @@ sequenceDiagram
 - 根据文件扩展名和 MIME 类型检查上传内容。未开启自动压缩或没有可处理图片时直接退出，不创建 `MutationObserver`，也不注册回调；
 - `before-upload-assets` 回调遇到异常时清理已创建的观察器、记录警告并退出，不向思源上传流程抛出异常。
 
-### 3.2 等待块保存并定位新图片 (`AutoUploadHandler.ts`)
+### 3.2 等待块保存并定位新图片 (`AutoUploadHandler.ts` & `ImageOccurrenceResolver.ts`)
 - 自动压缩已开启且上传内容包含支持的图片时，创建 DOM 观察器并注册 `onComplete` 回调；
-- `onComplete` 只使用本次 `MutationObserver` 观察到的新图片节点，或根据上传前 DOM 快照和内核 `succFiles` 返回路径确认的新节点；不扫描编辑器中已有的图片；
+- `onComplete` 只使用本次 `MutationObserver` 观察到且仍连接在当前编辑器 DOM 树内（`editor.contains`）的新图片节点，排除 `SpinBlockDOM` 拆块时已摘除的瞬态旧节点，不扫描编辑器中已有的图片；
 - 区分新插入节点和已有 `<img>` 属性变化。无法确认唯一新增图片时跳过处理，不调用 `updateBlock`；
-- 找到新增图片后，等待思源保存对应块，再由 `ImageOccurrenceResolver` 定位图片并创建 `OccurrenceTarget`。处理结束后向 `ImageController` 返回 `AutoUploadNotice` 数据。
+- 找到新增图片后，经渐进退避轮询（`[60, 100, 160, 250, 400, 600]` ms，命中即返）等待思源 `txQueue` 将块落盘，再由 `ImageOccurrenceResolver` 定位图片并创建 `OccurrenceTarget`。处理结束后向 `ImageController` 返回 `AutoUploadNotice` 数据。
 
 ### 3.3 单图操作和远程图片处理 (`SingleImageAction.ts`、`RemoteImageWatcher.ts`、`desktop.ts`、`download.ts`)
-- **图片节点过滤和格式检查**：`SingleImageAction` 与 `policy/dom.ts` 复用 Core 的 `PROTECTED_CONTAINER_SELECTOR`（`src/core/host/dom.ts`），跳过 `[data-type="NodeCodeBlock"]`、`[data-type="NodeBlockQueryEmbed"]`、`.protyle-wysiwyg__embed`、`pre`、`code` 中的图片。`ImageCandidateClassifier`、`CanvasWebpEncoder` 和 `AdaptiveImageCompressor` 在 `manual-dialog`、`manual-quick` 模式始终支持静态 WebP；在 `auto`、`document` 模式中，开启智能压缩（`smartEnabled === true` 且宿主支持智能压缩）时支持静态 WebP，关闭时跳过。三处均跳过路径位于 `drawing/` 或 `drawings/` 目录的绘图文件，但不跳过 `drawings_v2.png` 等普通文件名；均使用正则精确提取路径末段扩展名（去除查询参数与片段后取最后一段文件名匹配 `/\.([a-z0-9]{1,10})$/i` 并转小写，无扩展名或以点号结尾时返回 `""`）；编码器在 `inspectImage` 检查 APNG、多帧动画 WebP 并识别出 `image/webp` 后，执行 `isWebpAllowed("webp", mode, smartEnabled)` 二次校验；
+- **图片节点过滤和格式检查**：`SingleImageAction` 与 `policy/dom.ts` 复用 Core 的 `PROTECTED_CONTAINER_SELECTOR`（`src/core/host/dom.ts`），跳过代码块、查询嵌入块、数据库属性视图（`NodeAttributeView` / `.av`）、公式块、HTML 块、渲染节点与内嵌预览中的图片。`ImageCandidateClassifier`、`CanvasWebpEncoder` 和 `AdaptiveImageCompressor` 在 `manual-dialog`、`manual-quick` 模式始终支持静态 WebP；在 `auto`、`document` 模式中，开启智能压缩（`smartEnabled === true` 且宿主支持智能压缩）时支持静态 WebP，关闭时跳过。三处均跳过路径位于 `drawing/` 或 `drawings/` 目录的绘图文件，但不跳过 `drawings_v2.png` 等普通文件名；均使用正则精确提取路径末段扩展名（去除查询参数与片段后取最后一段文件名匹配 `/\.([a-z0-9]{1,10})$/i` 并转小写，无扩展名或以点号结尾时返回 `""`）；编码器在 `inspectImage` 检查 APNG、多帧动画 WebP 并识别出 `image/webp` 后，执行 `isWebpAllowed("webp", mode, smartEnabled)` 二次校验；
 - **无扩展名远程图片处理边界**：`ImageCandidateClassifier` 基于路径扩展名预过滤，保留无扩展名的远程 URL（`extension === ""`）。`RemoteImageWatcher`、`DocumentBatchAction` 与 `SingleImageAction.compressSelectedImageQuick` 会先将无扩展名远程图片下载并本地化到 `assets/`，再进入解码与压缩阶段（无扩展名的远程动图或矢量图在本地化后于格式检查或编码阶段跳过或失败）；`SingleImageAction.compressSelectedImageCustom` 则在预览阶段先行下载并解码，仅在用户确认保存后才上传本地化并更新文档引用；
-- **单图最小副作用与远程图片本地化**：编辑器图片右键触发的单图动作作用域严格限定为当前选中的单处引用。`SingleImageAction` 返回 `ImageActionOutcome`，由 `ImageController.present()` 调用 `services.ui.notify(...)` 显示结果；微调弹窗在前端内存中持有原图 Blob 缓存，切换压缩参数时复用已下载原图，预览时不上传图片或修改文档。用户点击保存后：
+- **单图最小副作用与远程图片本地化**：编辑器图片右键触发的单图动作作用域严格限定为当前选中的单处引用。`SingleImageAction` 返回携带通知级别（`type?: "info" | "error"`，目标无效或处理失败标记为 `"error"`）的 `ImageActionOutcome`，由 `ImageController.present()` 显示对应级别通知；微调弹窗在前端内存中持有原图 Blob 缓存，切换压缩参数时复用已下载原图，预览时不上传图片或修改文档。用户点击保存后：
   - 若源图片为已有本地 `assets/` 资源且 `replaceWebp === false`，仅上传 WebP 并写入持久化记录供复制路径，不修改文档（`updateBlock` 调用次数为 0）；
-  - 若目标是远程 URL，`localizeRemoteOccurrence` 先下载并调用 `/api/asset/upload` 上传原图，再通过 `SafeBlockWriter` 更新该单处引用（不调用文档级 `/api/format/netImg2LocalAssets`）；本地原图引用更新成功后，通过思源块读取 API 获取最新块内容，并创建包含 `oldPath = localOriginal` 锚点定位信息的新 `OccurrenceTarget`（若结果为 `"unknown"` 或失败则停止后续处理）；随后上传预览 WebP 并先保存 Dock 配对记录，`replaceWebp === false` 时保留本地原图引用，`replaceWebp === true` 时再通过 `SafeBlockWriter` 将该处引用更新为 WebP；
-- **远程图片监听的分批与并发控制**：`RemoteImageWatcher` 使用 `MutationObserver` 跳过嵌入块和代码块。非 `rebasing` 且观察到图片变化、首次 `sweep()` 未发现新图片时，通过一个定时器最多再检查一次。新插入的远程图片按每批最多 20 张顺序推进下一批；每批内部桌面端按 `concurrencyDesktop`（默认 3）并行下载上传与压缩（移动端并发 1），同时按 `blockID` 串行排序写入任务，保证同块多图依次改写时的顺序一致性。上传本地原图并替换引用后，调用 `blockDOM` 读取最新块 DOM 并通过 `policy/dom.ts` 的 `parseSingleLeafBlock` 验证单块无嵌套及对应序号图片路径已更新为本地原图路径，构造新的 `OccurrenceTarget` 后再传入经 `inspectImage` 与格式校准检查的 `providedFile`；
+  - 若目标是远程 URL，`localizeRemoteOccurrence` 先下载并调用 `/api/asset/upload` 上传原图，再通过 `SafeBlockWriter` 更新该单处引用（不调用文档级 `/api/format/netImg2LocalAssets`）；本地原图引用更新成功后，通过 `recaptureReplacedImageOccurrence` 获取最新块内容并创建包含 `oldPath = localOriginal` 锚点定位信息的新 `OccurrenceTarget`（若结果为 `"unknown"` 或失败则停止后续处理）；随后上传预览 WebP 并先保存 Dock 配对记录，`replaceWebp === false` 时保留本地原图引用，`replaceWebp === true` 时再通过 `SafeBlockWriter` 将该处引用更新为 WebP；
+- **远程图片监听的外链过滤、分批与并发控制**：`ImageCompressorFeature.attach` 在同一编辑器容器切换到只读文档前先销毁旧文档观察器；`RemoteImageWatcher` 的 `MutationObserver` 与快照仅针对 `kind === "remote"` 外链图片触发（本地 `assets/` 图片编辑与懒加载不触发整篇 `getBlockDOM`）。非 `rebasing` 且观察到外链图片变化、首次 `sweep()` 未发现新外链图片时，通过一个定时器最多再检查一次。新插入的远程图片按每批最多 20 张顺序推进下一批；每批内部桌面端按 `concurrencyDesktop`（默认 3）并行下载上传与压缩（移动端并发 1），同时按 `blockID` 串行排序写入任务，保证同块多图依次改写时的顺序一致性。上传本地原图并替换引用后，通过 `recaptureReplacedImageOccurrence` 验证单块无嵌套及对应序号图片路径已更新为本地原图路径，构造新的 `OccurrenceTarget` 后再传入经 `inspectImage` 与格式校准检查的 `providedFile`；
 - **不同平台的远程图片下载方式**：`services/desktop.ts` 仅提供桌面端（`desktop` / `desktop-window`）远程 HTTP(S) 下载能力（使用 Node `http` / `https` 请求并携带 Core 设置的 `general.userAgent`）；浏览器和移动端由 `services/download.ts` 使用 `fetch`，不发送 Cookie 或 Referer，并按浏览器规则跟随重定向。全平台仅支持工作区 `assets/` 本地附件与 `http(s)` 远程图片源（不支持本机文件系统路径读取）；远程下载总超时为 30 秒，最多读取 32 MiB，并检查图片格式和 XSS 内容。不拦截内网、本机或链路本地地址，因此访问风险与思源原生网络图片下载相同。
 
 ### 3.4 配置结构、能力探测、EXIF 设置和质量模式 (`ImageSettingsPanel.svelte`、`ImageCompressionDialog.svelte`、`parseImageConfig.ts`、`CanvasWebpEncoder`、`AdaptiveImageCompressor.ts`)
@@ -247,7 +249,7 @@ sequenceDiagram
 3. **进度 Dialog 用户关闭与程序关闭隔离 (`ImageTaskUI.ts`)**：`ImageController` 通过 `services.ui.progress(...)` 委托 `ImageTaskUI.ts`（`mountDialog`）管理 `ImageTaskPanel` 模态框（面板不提供独立“取消”按钮）；`ImageTaskUI.ts` 的 `mountDialog` 内部维护 `closingByController` 标记区分两种关闭来源：
    - 用户主动关闭进度弹窗（含点击关闭或按 Esc，即 `!closingByController`）：触发 `onClose()` 通知批处理中止尚未开始的后续步骤；
    - 控制器在扫描失败、零图片或任务结束时调用 `view.close()`（由 `ImageTaskUI.ts` 置 `closingByController = true`）：仅完成 Svelte 卸载与 DOM 释放，不触发 `onClose()` 取消回调，防止将完成或扫描失败态误报为 `cancelled`；
-4. **显示两个处理阶段、状态栏联动和结果统计**：准备阶段（`phase: "preparing"`）完成后进入写入阶段时，`DocumentBatchAction` 通过 `options.onProgress` 汇报 `phase: "applying"` 及当前文件名 `currentFile`，由 `ImageController` 同步更新 `ImageTaskPanel` 模态框与桌面端 Core `PluginStatusBar`（移动端短路不操作状态栏）；任务完成、取消或中止时统一销毁模态框并清除状态栏任务。`CompressionProgress` / `CompressionBatchSummary` 直接复用 `prepareImage` 返回的已知字节数统计（不二次读盘 I/O），并分别记录 `succeeded`、`skipped`、`failed`、`conflicts`、`unknown` 和 `cancelled`（`aborted` 和 `unknown` 不计入 `failed`）。每批任务结束时只发送一条汇总通知，必显总数，其余非零分项动态拼接展示；结果未知时，Dock 保留记录或将记录标记为 `"incomplete"`；
+4. **显示两个处理阶段、状态栏联动和结果统计**：准备阶段（`phase: "preparing"`）完成后进入写入阶段时，`DocumentBatchAction` 通过 `options.onProgress` 汇报 `phase: "applying"` 及当前文件名 `currentFile`，由 `ImageController` 同步更新 `ImageTaskPanel` 模态框与桌面端 Core `PluginStatusBar`（移动端短路不操作状态栏）；任务完成时模态框切换至汇总终态（`done` / `partial` / `unknown`）并清除状态栏任务，扫描失败、零图片或取消/中止时销毁模态框并清除状态栏任务。`CompressionProgress` / `CompressionBatchSummary` 直接复用 `prepareImage` 返回的已知字节数统计（不二次读盘 I/O），并分别记录 `succeeded`、`skipped`、`failed`、`conflicts`、`unknown` 和 `cancelled`（`aborted` 和 `unknown` 不计入 `failed`）。每批任务结束时只发送一条汇总通知，必显总数，其余非零分项动态拼接展示；结果未知时，Dock 保留记录或将记录标记为 `"incomplete"`；
 5. **并发数与远程图片本地化**：准备阶段桌面端通过 `concurrencyDesktop` 并行准备图片，默认并发数为 3；移动端并发数为 1。对文档内的远程图片（`source.kind === "remote"`），准备阶段按 URL 去重后调用 `localizeRemoteAsset` 下载并上传为本地原图（同步落盘 `图片链接 → 本地原图` 记录）；应用阶段逐项将原远程引用先更新为本地原图并重取块快照，随后更新外链记录操作状态再统一执行 WebP 编码与替换。块写回逐项顺序执行。
 
 ---
@@ -328,13 +330,13 @@ export interface CompressionRecord {
     - `"present"` → `image.records.assetStatus.present`
     - `"missing-confirmed"` → `image.records.assetStatus.missing`
     - `"unknown"` → `image.records.assetStatus.unknown`
-- **普通资源链接和分组更新**：
-  - 引用定位结果按 `image`、`resource-link`、`unsupported` 三类分组展示；除 `img[data-src|src]` 外，同时定位同一受保护容器过滤规则下的普通资源链接（`span[data-type~=a][data-href]` 与 `a[href]`）；
+- **普通资源链接、非块级只读引用与分组更新**：
+  - 引用定位结果按 `image`、`resource-link`、`unsupported` 三类分组展示；在按 `blockID` 去重前，凡带 `avID` 或属于非块级 DOM 类型（`av-asset`、`av-url`、`html`、`attribute`、`title-image`、`pdf-annotation`）及块内未提取到可改写节点的命中项统一归入只读跳转列表 `unsupported` 并置 `complete = false`；其余普通块同时定位受保护容器过滤规则下的图片（`img[data-src|src]`）与普通资源链接（`span[data-type~=a][data-href]` 与 `a[href]`）；
   - 将候选 `blockID` 经 `/api/block/getBlockDOMs`（按笔记本分批每批 50，整批失败时降级逐块 `/api/block/getBlockDOM`）重取实时块 DOM，按 `(notebook, rootID, blockID, kind, ordinal, attribute, raw)` 定位目标节点并附带快照；
-  - 用户选中一处或执行批量操作时，通过 `SafeBlockWriter` 的图片或资源链接更新函数只修改目标属性，不调用全局 `/api/asset/relinkAsset`；属性视图、数据库等无法对应到具体块的引用只显示、不自动更新；
+  - 用户选中一处或执行批量操作时，通过 `SafeBlockWriter` 的图片或资源链接更新函数只修改目标属性，不调用全局 `/api/asset/relinkAsset`；属性视图、数据库、HTML 块、题头图等位置只展示跳转、不自动更新；
 - **加密笔记本中的 `?box=` 路径、后台刷新防覆盖与自动收起**：
   - 思源 `/api/asset/findAssetReferences`（`kernel/model/asset_relink.go`）不接受带 query/hash 的路径，也会跳过加密笔记本。因此不去掉 `?box=` 后调用全局查找；
-  - 对 `?box=<notebookID>` 资源，在笔记本已解锁且用户有权限时，通过思源文档和块读取 API 扫描可访问文档中的图片及资源链接。不依赖 SQL 索引，每次写入前都通过实时块读取 API 检查目标。笔记本未解锁或无权限时返回 `unavailable` / `unknown`；
+  - 对 `?box=<notebookID>` 资源，`boxReferenceLocator.ts` 先核验目标笔记本未关闭且非锁定态（`!closed && !(encrypted && !unlocked)`），在已解锁且有权限时传入 `showHidden: true` 遍历目录树（并在 `boxDocEnabled === true` 且根文档 `/${boxID}.sy` 存在时纳入扫描），通过思源文档和块读取 API 扫描图片及资源链接；笔记本关闭、锁定未解锁或无权限时返回 `encryptedUnavailable: true`（不误报为 0 引用）；
   - 替换或恢复后，根据剩余引用数和扫描是否完成，调用 `store.markOperation` 保存 `"replaced"`、`"saved-only"` 或 `"incomplete"`。后台的 `post_action` 检查失败或无结果时只写日志，不覆盖刚显示的操作成功统计（仅当 `source === "user_click"` 时显示查找失败或空结果提示）；若 `post_action` 刷新发现剩余待处理引用数为 0，自动收起展开抽屉并保留统计结果；
 - **白名单持久化、只读 SQL 批量路径解析与三端菜单**：
   - **精简结构**：`parseImageConfig.ts` 与 `PageAllowlist.ts` 中 `auto.pageAllowlist` 仅读取并持久化 `{ grantedAt }`；`ImageCompressorFeature` 的 `resolveDocument` 与 `validateDocument` 使用 `/api/block/getBlockInfo` + `isDocumentRootIdentity` 区分无效 ID、API 读取失败与合法文档（`validateDocument` 仅返回 `{ id }`）；

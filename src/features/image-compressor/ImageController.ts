@@ -46,7 +46,8 @@ export class ImageController {
       this.services.ui.copyablePath(outcome.path, outcome.key);
       return;
     }
-    this.notifyFeedback(this.t(outcome.key, outcome.values));
+    const type = outcome.type ?? "info";
+    this.notifyFeedback(this.t(outcome.key, outcome.values), type, type === "error" ? 5000 : undefined);
   }
 
   reportAutoUploadNotice(notice: AutoUploadNotice): void {
