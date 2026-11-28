@@ -3,17 +3,26 @@ import assert from "node:assert/strict";
 import { FeatureScope } from "../../../src/core/framework/FeatureScope.ts";
 import { TitleCache } from "../../../src/features/titled-link/services/title-cache.ts";
 import { countBatchResults, formatBatchSummary } from "../../../src/features/titled-link/policy/batchSummary.ts";
+import { isAutomaticLinkCandidate, isHttpUrl } from "../../../src/features/titled-link/policy/paste-range.ts";
 import {
   TitledLinkController,
-  isAutomaticLinkCandidate,
-  isHttpUrl,
   mapWithConcurrency,
 } from "../../../src/features/titled-link/TitledLinkController.ts";
 import { DEFAULT_MAX_TITLE_LENGTH } from "../../../src/features/titled-link/policy/types.ts";
 
-test("automatic admission accepts only an empty or exact URL anchor", () => {
+test("automatic admission accepts empty, exact URL, and percent-decoded bare URL anchors", () => {
   assert.equal(isAutomaticLinkCandidate("", "https://example.com"), true);
   assert.equal(isAutomaticLinkCandidate("https://example.com", "https://example.com"), true);
+  assert.equal(
+    isAutomaticLinkCandidate("https://example.com/wiki/测试", "https://example.com/wiki/%E6%B5%8B%E8%AF%95"),
+    true,
+  );
+  assert.equal(
+    isAutomaticLinkCandidate("https://example.com/a/b", "https://example.com/a%2Fb"),
+    true,
+  );
+  assert.equal(isAutomaticLinkCandidate("自定义标题", "https://example.com/wiki/%E6%B5%8B%E8%AF%95"), false);
+  assert.equal(isAutomaticLinkCandidate("bad", "https://example.com/%E0%A4%A"), false);
   assert.equal(isAutomaticLinkCandidate("My title", "https://example.com"), false);
   assert.equal(isHttpUrl("https://example.com"), true);
   assert.equal(isHttpUrl("mailto:a@example.com"), false);
@@ -107,6 +116,12 @@ class BatchLink {
   getAttribute(name) { return this.attributes.get(name) ?? null; }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   removeAttribute(name) { this.attributes.delete(name); }
+  getAttributeNames() { return [...this.attributes.keys()]; }
+  cloneNode() {
+    const copy = new BatchLink(this.href, this.textContent);
+    copy.attributes = new Map(this.attributes);
+    return copy;
+  }
   closest(selector) { return selector === "[data-node-id]" ? this.block : null; }
   get outerHTML() {
     const title = this.getAttribute("data-title");
@@ -122,9 +137,14 @@ class BatchBlock {
     for (const link of links) link.block = this;
   }
   getAttribute(name) { return name === "data-node-id" ? this.id : null; }
+  setAttribute(name, value) { if (name === "data-node-id") this.id = String(value); }
   removeAttribute() {}
+  getAttributeNames() { return ["data-node-id"]; }
+  cloneNode() {
+    return new BatchBlock(this.id, this.links.map(link => link.cloneNode()));
+  }
   querySelectorAll(selector) {
-    if (selector === 'span[data-type~="a"]') return this.links;
+    if (selector === 'span[data-type~="a"]' || selector === "*") return this.links;
     if (selector === "[data-node-id]") return [];
     return [];
   }

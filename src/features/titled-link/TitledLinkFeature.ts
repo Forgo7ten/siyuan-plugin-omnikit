@@ -6,12 +6,13 @@ import type { MenuContext } from "../../core/feedback/MenuRegistry.ts";
 import type { SettingsManager } from "../../core/store/SettingsManager.ts";
 import { KernelClient } from "../../core/host/KernelClient.ts";
 import { getCurrentFrontend } from "../../core/host/Platform.ts";
-import { listEditorsSafe, resolveProtyleElement } from "../../core/host/ProtyleAdapter.ts";
+import { isProtyleReadOnly, listEditorsSafe, resolveProtyleElement } from "../../core/host/ProtyleAdapter.ts";
 import { isInsideProtectedContainer } from "../../core/host/dom.ts";
 import { translate } from "../../i18n/translate.ts";
+import { isHttpUrl } from "./policy/paste-range.ts";
 import type { TitledLinkConfig } from "./policy/types.ts";
 import { PasteLinkCapture } from "./services/PasteLinkCapture.ts";
-import { TitledLinkController, isHttpUrl } from "./TitledLinkController.ts";
+import { TitledLinkController } from "./TitledLinkController.ts";
 
 export interface TitledLinkFeatureOptions {
   now?: () => number;
@@ -123,12 +124,14 @@ export class TitledLinkFeature extends BaseFeature {
       const href = link?.getAttribute?.("data-href");
       const isHttp = isHttpUrl(href ?? "");
       const inProtected = link ? isInsideProtectedContainer(link) : false;
-      if (!link || !isLink || !protyle || !isHttp || inProtected) {
+      const readOnly = Boolean(protyle && isProtyleReadOnly(protyle, link));
+      if (!link || !isLink || !protyle || !isHttp || inProtected || readOnly) {
         context.logger?.debug("链接菜单跳过生成提取标题项", {
           hasLink: Boolean(link),
           isLink,
           isHttp,
           inProtected,
+          readOnly,
           hasProtyle: Boolean(protyle),
         });
         return [];
@@ -152,25 +155,39 @@ export class TitledLinkFeature extends BaseFeature {
       const protyle = detail?.protyle;
       const blocks = Array.isArray(detail?.blockElements) ? detail.blockElements as HTMLElement[] : [];
       registerEditor(protyle);
-      const count = new Set(blocks.flatMap(block =>
-        [...block.querySelectorAll<HTMLElement>('span[data-type~="a"]')])
-        .filter(link => isHttpUrl(link.getAttribute("data-href") ?? "") && !isInsideProtectedContainer(link))).size;
-      if (!count || !protyle) {
+      if (!protyle || isProtyleReadOnly(protyle)) {
         context.logger?.debug("块菜单跳过生成批量提取链接标题项", {
           blockCount: blocks.length,
-          httpLinkCount: count,
+          httpLinkCount: 0,
+          readOnly: Boolean(protyle),
           hasProtyle: Boolean(protyle),
         });
         return [];
       }
-      context.logger?.debug("生成块菜单项：批量提取链接标题", { blockCount: blocks.length, httpLinkCount: count });
+      const editableBlocks = blocks.filter(block => !isProtyleReadOnly(protyle, block) && !isInsideProtectedContainer(block));
+      const count = new Set(editableBlocks.flatMap(block =>
+        [...block.querySelectorAll<HTMLElement>('span[data-type~="a"]')])
+        .filter(link =>
+          isHttpUrl(link.getAttribute("data-href") ?? "") &&
+          !isInsideProtectedContainer(link) &&
+          !isProtyleReadOnly(protyle, link))).size;
+      if (!count) {
+        context.logger?.debug("块菜单跳过生成批量提取链接标题项", {
+          blockCount: blocks.length,
+          editableBlockCount: editableBlocks.length,
+          httpLinkCount: count,
+          hasProtyle: true,
+        });
+        return [];
+      }
+      context.logger?.debug("生成块菜单项：批量提取链接标题", { blockCount: editableBlocks.length, httpLinkCount: count });
       return [{
         id: "extract-block-link-titles",
         label: t("titledLink.menuBatch", { count }),
         icon: "iconLink",
         run: async () => {
-          context.logger?.debug("触发块菜单项：批量提取链接标题", { blockCount: blocks.length, httpLinkCount: count });
-          await controller.runBatch(blocks, protyle);
+          context.logger?.debug("触发块菜单项：批量提取链接标题", { blockCount: editableBlocks.length, httpLinkCount: count });
+          await controller.runBatch(editableBlocks, protyle);
         },
       }];
     };

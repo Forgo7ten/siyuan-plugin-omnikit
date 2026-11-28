@@ -7,7 +7,23 @@ import {
   captureLinkTarget,
   commitLinkTitle,
   commitLinkTitles,
+  normalizeBlockForComparison,
 } from "../../../src/features/titled-link/services/safe-writer.ts";
+
+function matchesSimpleSelector(el, selector) {
+  return selector.split(",").map(s => s.trim()).some(part => {
+    if (!part) return false;
+    if (part.startsWith(".")) {
+      const classes = (el.getAttribute?.("class") ?? "").split(/\s+/).filter(Boolean);
+      return classes.includes(part.slice(1));
+    }
+    const exactAttr = part.match(/^\[([a-zA-Z0-9_-]+)="([^"]*)"\]$/);
+    if (exactAttr) return el.getAttribute?.(exactAttr[1]) === exactAttr[2];
+    const bareAttr = part.match(/^\[([a-zA-Z0-9_-]+)\]$/);
+    if (bareAttr) return el.getAttribute?.(bareAttr[1]) !== null;
+    return false;
+  });
+}
 
 class LinkElement {
   constructor(href, text, title = null) {
@@ -20,31 +36,92 @@ class LinkElement {
   getAttribute(name) { return this.attributes.get(name) ?? null; }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   removeAttribute(name) { this.attributes.delete(name); }
-  closest(selector) { return selector === "[data-node-id]" ? this.block : null; }
+  getAttributeNames() { return [...this.attributes.keys()]; }
+  cloneNode() {
+    const copy = new LinkElement(this.getAttribute("data-href") ?? "", this.textContent, this.getAttribute("data-title"));
+    copy.attributes = new Map(this.attributes);
+    return copy;
+  }
+  closest(selector) {
+    if (matchesSimpleSelector(this, selector)) return this;
+    if (this.block && matchesSimpleSelector(this.block, selector)) return this.block;
+    return null;
+  }
   get outerHTML() {
-    const title = this.getAttribute("data-title");
-    return `<span data-type="a" data-href="${this.getAttribute("data-href")}"${title === null ? "" : ` data-title="${title}"`}>${this.textContent}</span>`;
+    const attrs = [...this.attributes.entries()].map(([k, v]) => ` ${k}="${v}"`).join("");
+    return `<span${attrs}>${this.textContent}</span>`;
   }
 }
 
 class BlockElement {
-  constructor(id, links, prefix = "", attributes = new Map()) {
+  constructor(id, links, prefix = "", attributes = new Map(), transientCount = 0) {
     this.id = id;
     this.links = links;
     this.prefix = prefix;
-    this.attributes = attributes;
+    this.attributes = new Map([["data-node-id", id], ...attributes]);
+    this.transientCount = transientCount;
     this.isConnected = true;
     for (const link of links) link.block = this;
   }
+  get classList() {
+    const self = this;
+    const readTokens = () => (self.attributes.get("class") ?? "").split(/\s+/).filter(Boolean);
+    return {
+      remove(...names) {
+        const next = readTokens().filter(t => !names.includes(t));
+        self.attributes.set("class", next.join(" "));
+      },
+      get length() {
+        return readTokens().length;
+      },
+    };
+  }
+  get style() {
+    const self = this;
+    return {
+      removeProperty(prop) {
+        if (!self.attributes.has("style")) return;
+        const escaped = prop.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const next = (self.attributes.get("style") ?? "")
+          .replace(new RegExp(`(?:^|;)\\s*${escaped}\\s*:[^;]*`, "g"), "")
+          .replace(/^;\s*/, "")
+          .trim();
+        self.attributes.set("style", next);
+      },
+    };
+  }
   getAttribute(name) {
-    if (name === "data-node-id") return this.id;
+    if (name === "data-node-id") return this.attributes.get("data-node-id") ?? this.id ?? null;
     return this.attributes.get(name) ?? null;
+  }
+  setAttribute(name, value) {
+    if (name === "data-node-id") this.id = String(value);
+    this.attributes.set(name, String(value));
   }
   removeAttribute(name) {
     this.attributes.delete(name);
   }
+  getAttributeNames() {
+    return [...this.attributes.keys()];
+  }
+  cloneNode() {
+    const clonedLinks = this.links.map(l => (typeof l.cloneNode === "function" ? l.cloneNode(true) : l));
+    const attrCopy = new Map(this.attributes);
+    attrCopy.delete("data-node-id");
+    const copy = new BlockElement(this.id, clonedLinks, this.prefix, attrCopy, this.transientCount);
+    copy.attributes = new Map(this.attributes);
+    return copy;
+  }
+  closest(selector) {
+    return matchesSimpleSelector(this, selector) ? this : null;
+  }
   querySelectorAll(selector) {
-    if (selector === 'span[data-type~="a"]') return this.links;
+    if (selector === 'span[data-type~="a"]' || selector === "*") return this.links;
+    if (selector === "wbr, .protyle-heading-number") {
+      return Array.from({ length: this.transientCount }, () => ({
+        remove: () => { this.transientCount = Math.max(0, this.transientCount - 1); },
+      }));
+    }
     if (selector === "[parent-heading]") return this.links.filter(l => l.getAttribute("parent-heading") !== null);
     if (selector === "[updated]") return this.links.filter(l => l.getAttribute("updated") !== null);
     if (selector === "[data-node-id]") return [];
@@ -52,25 +129,40 @@ class BlockElement {
   }
   querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
   get outerHTML() {
-    const extraAttrs = [...this.attributes.entries()].map(([k, v]) => ` ${k}="${v}"`).join("");
-    return `<div data-node-id="${this.id}"${extraAttrs}>${this.prefix}${this.links.map(link => link.outerHTML).join("")}</div>`;
+    const attrs = [...this.attributes.entries()].map(([k, v]) => ` ${k}="${v}"`).join("");
+    const transient = "<wbr>".repeat(this.transientCount);
+    return `<div${attrs}>${this.prefix}${this.links.map(link => link.outerHTML).join("")}${transient}</div>`;
   }
 }
 
 function parseBlock(html) {
   const tagMatch = html.match(/<div\b([^>]*)>/);
   const attrs = tagMatch?.[1] ?? "";
-  const id = attrs.match(/data-node-id="([^"]+)"/)?.[1];
   const attrMap = new Map();
-  for (const [, name, value] of attrs.matchAll(/\b(updated|parent-heading)="([^"]*)"/g)) {
+  for (const [, name, value] of attrs.matchAll(/([a-zA-Z0-9_-]+)="([^"]*)"/g)) {
     attrMap.set(name, value);
   }
-  const inner = html.match(/<div\b[^>]*>([\s\S]*?)<\/div>/)?.[1] ?? "";
+  const id = attrMap.get("data-node-id");
+  attrMap.delete("data-node-id");
+  let inner = html.match(/<div\b[^>]*>([\s\S]*?)<\/div>/)?.[1] ?? "";
+  let transientCount = 0;
+  inner = inner.replace(/<wbr\s*\/?>/gi, () => { transientCount += 1; return ""; });
+  inner = inner.replace(/<span\b[^>]*class="[^"]*\bprotyle-heading-number\b[^"]*"[^>]*>[\s\S]*?<\/span>/gi, () => {
+    transientCount += 1;
+    return "";
+  });
   const firstSpan = inner.indexOf("<span");
   const prefix = firstSpan >= 0 ? inner.slice(0, firstSpan) : inner;
-  const links = [...inner.matchAll(/<span data-type="a" data-href="([^"]+)"(?: data-title="([^"]*)")?>(.*?)<\/span>/g)]
-    .map(match => new LinkElement(match[1], match[3], match[2] ?? null));
-  return new BlockElement(id, links, prefix, attrMap);
+  const links = [...inner.matchAll(/<span\b([^>]*)>([\s\S]*?)<\/span>/g)].map(match => {
+    const spanAttrs = new Map();
+    for (const [, k, v] of match[1].matchAll(/([a-zA-Z0-9_-]+)="([^"]*)"/g)) {
+      spanAttrs.set(k, v);
+    }
+    const link = new LinkElement(spanAttrs.get("data-href") ?? "", match[2], spanAttrs.get("data-title") ?? null);
+    link.attributes = spanAttrs;
+    return link;
+  });
+  return new BlockElement(id, links, prefix, attrMap, transientCount);
 }
 
 function installDOMParser(run) {
@@ -1295,4 +1387,137 @@ test("non-active mode unwraps cause-chained KernelOutcome and AbortError via Cor
     },
   };
   assert.equal(await commitLinkTitle(target, "Resolved", { replaceTitle: false, kernel: abortCauseKernel }), "aborted");
+}));
+
+test("C-BUG-01: active read-only editor or locked block returns failed immediately without mutating DOM or falling back to updateBlock", async () => installDOMParser(async () => {
+  // 1. Active editor locked via protyle.disabled = true after target capture
+  {
+    const { links, block, protyle, transactions } = fixture(2);
+    const first = captureLinkTarget(links[0], protyle);
+    const second = captureLinkTarget(links[1], protyle);
+    protyle.disabled = true;
+    const kernel = kernelFor(block);
+
+    const results = await commitLinkTitles([
+      { target: first, title: "Blocked 1" },
+      { target: second, title: "Superseded 2", isCurrent: () => false },
+    ], { replaceTitle: true, kernel });
+
+    assert.deepEqual(results, ["failed", "superseded"]);
+    assert.equal(transactions.length, 0, "must not submit transaction on disabled editor");
+    assert.deepEqual(kernel.calls, [], "must never bypass read-only lock via background updateBlock");
+    assert.equal(links[0].textContent, "https://example.com/0");
+  }
+
+  // 2. Active editor with block contenteditable="false" or custom-sy-readonly="true"
+  {
+    const links = [new LinkElement("https://example.com/ro", "https://example.com/ro")];
+    const block = new BlockElement(
+      "20260101000000-roblock",
+      links,
+      "",
+      new Map([["contenteditable", "false"]]),
+    );
+    const transactions = [];
+    const protyle = {
+      protyle: {
+        disabled: false,
+        wysiwyg: { element: { isConnected: true, getAttribute: () => "true" } },
+        block: { rootID: "20260101000000-rootro", box: "notebook" },
+        notebookId: "notebook",
+      },
+      updateTransactionElement(el, old) { transactions.push({ el, old }); },
+    };
+    const target = captureLinkTarget(links[0], protyle);
+    const kernel = kernelFor(block, { rootID: "20260101000000-rootro" });
+
+    assert.equal(await commitLinkTitle(target, "Should Fail", { replaceTitle: false, kernel }), "failed");
+    assert.equal(transactions.length, 0);
+    assert.deepEqual(kernel.calls, []);
+    assert.equal(links[0].textContent, "https://example.com/ro");
+  }
+}));
+
+test("C-BUG-02: captureLinkTarget and inactive writer reject links inside .av and NodeAttributeView containers", async () => installDOMParser(async () => {
+  const protyle = {
+    block: { rootID: "20260101000000-rootav", box: "notebook" },
+    notebookId: "notebook",
+    updateTransactionElement() {},
+  };
+  const avLink = new LinkElement("https://example.com/av", "https://example.com/av");
+  const avBlock = new BlockElement(
+    "20260101000000-avblk",
+    [avLink],
+    "",
+    new Map([["data-type", "NodeAttributeView"], ["class", "av"]]),
+  );
+  assert.equal(captureLinkTarget(avLink, protyle), null);
+
+  // If block turned into NodeAttributeView in persisted kernel DOM before inactive write, reject as conflict
+  const normalLinks = [new LinkElement("https://example.com/av", "https://example.com/av")];
+  const normalBlock = new BlockElement("20260101000000-avblk", normalLinks);
+  const inactiveTarget = { ...captureLinkTarget(normalLinks[0], protyle), protyle: null, originalBlockHTML: undefined };
+  const kernel = kernelFor(normalBlock, { rootID: "20260101000000-rootav", dom: avBlock.outerHTML });
+  assert.equal(await commitLinkTitle(inactiveTarget, "Title", { replaceTitle: false, kernel }), "conflict");
+}));
+
+test("C-BUG-03: live snapshot with protyle-wysiwyg--select, protyle-wysiwyg--hl, data-eof, data-node-index, wbr, heading number, and reordered attributes succeeds in background updateBlock without false conflict", async () => installDOMParser(async () => {
+  const url = "https://example.com/gutter-batch";
+  const liveHTML =
+    `<div class="p protyle-wysiwyg--select protyle-wysiwyg--hl" data-eof="true" data-node-index="0" select-start="true" data-editing="1" updated="20260101000000" style="--b3-protyle-heading-number-width: 24px;" data-type="NodeParagraph" data-node-id="20260101000000-gutter">` +
+    `<span class="protyle-heading-number protyle-heading-number--active">1. </span>` +
+    `intro <span data-href="${url}" data-type="a">${url}</span><wbr></div>`;
+  const cleanKernelHTML =
+    `<div data-node-id="20260101000000-gutter" data-type="NodeParagraph" class="p" updated="20260101000005">` +
+    `intro <span data-type="a" data-href="${url}">${url}</span></div>`;
+
+  const liveBlock = parseBlock(liveHTML);
+  const protyle = {
+    destroyed: false,
+    block: { rootID: "20260101000000-rootgut", box: "notebook" },
+    notebookId: "notebook",
+    updateTransactionElement() { throw new Error("editor already closed"); },
+  };
+  const target = captureLinkTarget(liveBlock.links[0], protyle);
+  assert.ok(target);
+  assert.match(target.originalBlockHTML, /protyle-wysiwyg--select/);
+  assert.match(target.originalBlockHTML, /<wbr>/);
+
+  // Simulate closing tab mid-fetch -> switches to commitInactiveTitles
+  protyle.destroyed = true;
+  const updatePayloads = [];
+  const kernel = {
+    calls: [],
+    async post(path, body) {
+      this.calls.push(path);
+      if (path === "/api/block/getBlockInfo") {
+        return { data: { rootID: "20260101000000-rootgut", box: "notebook" }, code: 0 };
+      }
+      if (path === "/api/block/getBlockDOM") {
+        return { data: { id: "20260101000000-gutter", dom: cleanKernelHTML }, code: 0 };
+      }
+      if (path === "/api/block/updateBlock") {
+        updatePayloads.push(body);
+        return { code: 0, data: null };
+      }
+      return { code: 0, data: {} };
+    },
+  };
+
+  const result = await commitLinkTitle(target, "Gutter Background Title", { replaceTitle: true, kernel });
+  assert.equal(result, "updated");
+  assert.deepEqual(kernel.calls, ["/api/block/getBlockInfo", "/api/block/getBlockDOM", "/api/block/updateBlock"]);
+  assert.equal(updatePayloads.length, 1);
+  assert.match(updatePayloads[0].data, />Gutter Background Title<\/span>/);
+  assert.match(updatePayloads[0].data, /updated="20260101000005"/);
+  assert.doesNotMatch(updatePayloads[0].data, /protyle-wysiwyg--select|data-eof|data-node-index/);
+
+  // Also verify transient-only class="" and style="" are removed cleanly in normalizeBlockForComparison
+  const onlyTransientBlock = parseBlock(
+    `<div data-node-id="20260101000000-emptycs" class="protyle-wysiwyg--select protyle-wysiwyg--hl" style="--b3-protyle-heading-number-width: 18px;"><span data-type="a" data-href="${url}">${url}</span></div>`,
+  );
+  const bareBlock = parseBlock(
+    `<div data-node-id="20260101000000-emptycs"><span data-href="${url}" data-type="a">${url}</span></div>`,
+  );
+  assert.equal(normalizeBlockForComparison(onlyTransientBlock), normalizeBlockForComparison(bareBlock));
 }));

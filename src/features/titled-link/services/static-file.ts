@@ -26,7 +26,3 @@ export function extractStaticFileName(url: string): string | null {
   if (!extension || !STATIC_FILE_EXTENSIONS.has(extension)) return null;
   return trimmed || null;
 }
-
-export function isStaticFileUrl(url: string): boolean {
-  return extractStaticFileName(url) !== null;
-}

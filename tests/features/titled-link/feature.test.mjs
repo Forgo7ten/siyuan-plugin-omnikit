@@ -15,6 +15,7 @@ const baseFeatureUrl = new URL("../../../src/core/framework/BaseFeature.ts", imp
 const translateUrl = new URL("../../../src/i18n/translate.ts", import.meta.url).href;
 const controllerUrl = new URL("../../../src/features/titled-link/TitledLinkController.ts", import.meta.url).href;
 const pasteLinkCaptureUrl = new URL("../../../src/features/titled-link/services/PasteLinkCapture.ts", import.meta.url).href;
+const pasteRangeUrl = new URL("../../../src/features/titled-link/policy/paste-range.ts", import.meta.url).href;
 const platformUrl = new URL("../../../src/core/host/Platform.ts", import.meta.url).href;
 const protyleAdapterUrl = new URL("../../../src/core/host/ProtyleAdapter.ts", import.meta.url).href;
 const domUrl = new URL("../../../src/core/host/dom.ts", import.meta.url).href;
@@ -27,6 +28,7 @@ const runnable = stripTypeScriptTypes(source
   .replace(/from\s*["'][^"']*ProtyleAdapter\.ts["']/, `from "${protyleAdapterUrl}"`)
   .replace(/from\s*["'][^"']*dom\.ts["']/, `from "${domUrl}"`)
   .replace(/from\s*["'][^"']*translate\.ts["']/, `from "${translateUrl}"`)
+  .replace(/from\s*["'][^"']*paste-range\.ts["']/, `from "${pasteRangeUrl}"`)
   .replace(/from\s*["'][^"']*PasteLinkCapture\.ts["']/, `from "${pasteLinkCaptureUrl}"`)
   .replace(/from\s*["'][^"']*TitledLinkController\.ts["']/g, `from "${controllerUrl}"`)
 );
@@ -346,4 +348,92 @@ test("TitledLinkSettingsPanel uses Core describeError, isSettingsConflictError, 
   assert.doesNotMatch(svelte, /includes\(t\("settings\.concurrentChange"\)\)/);
   assert.match(svelte, /var\(--b3-theme-on-surface-light\)/);
   assert.match(svelte, /var\(--b3-theme-error\)/);
+});
+
+test("C-BUG-01 & C-BUG-02: link and block menus hide extraction items on read-only editors/blocks and exclude .av / NodeAttributeView containers", async () => {
+  const { mockPlugin, mockSettings, mockContext, menuContributions } = createEditorHost();
+  const feature = new TitledLinkFeature(mockPlugin, mockSettings);
+  await feature.activate(mockContext);
+
+  const linkMenu = menuContributions.find(m => m.location === "link");
+  const blockMenu = menuContributions.find(m => m.location === "blockicon");
+
+  const makeMockNode = (attrs = {}, parent = null) => {
+    const classes = new Set((attrs.class ?? "").split(/\s+/).filter(Boolean));
+    const node = {
+      parent,
+      getAttribute(name) {
+        return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null;
+      },
+      matches(selector) {
+        return selector.split(",").map(s => s.trim()).some(part => {
+          if (part.startsWith(".")) return classes.has(part.slice(1));
+          const exactAttr = part.match(/^\[([a-zA-Z0-9_-]+)="([^"]*)"\]$/);
+          if (exactAttr) return this.getAttribute(exactAttr[1]) === exactAttr[2];
+          const bareAttr = part.match(/^\[([a-zA-Z0-9_-]+)\]$/);
+          if (bareAttr) return this.getAttribute(bareAttr[1]) !== null;
+          return false;
+        });
+      },
+      closest(selector) {
+        let cur = this;
+        while (cur) {
+          if (cur.matches?.(selector)) return cur;
+          cur = cur.parent;
+        }
+        return null;
+      },
+    };
+    return node;
+  };
+
+  const makeBlock = (attrs, linkSpecs) => {
+    const block = makeMockNode(attrs);
+    const links = linkSpecs.map(spec => {
+      const container = spec.containerAttrs ? makeMockNode(spec.containerAttrs, block) : block;
+      const link = makeMockNode({ "data-type": "a", "data-href": spec.href, ...(spec.attrs ?? {}) }, container);
+      link.textContent = spec.href;
+      return link;
+    });
+    block.querySelectorAll = selector => (selector === 'span[data-type~="a"]' ? links : []);
+    block.links = links;
+    return block;
+  };
+
+  const editableProtyle = { disabled: false, wysiwyg: { element: makeMockNode({ contenteditable: "true" }) } };
+  const disabledProtyle = { disabled: true, wysiwyg: { element: makeMockNode({ contenteditable: "false", "data-readonly": "true" }) } };
+
+  const normalBlock = makeBlock({ "data-node-id": "b-edit", contenteditable: "true" }, [
+    { href: "https://example.com/editable" },
+    { href: "https://example.com/in-av", containerAttrs: { class: "av" } },
+  ]);
+  const lockedBlock = makeBlock({ "data-node-id": "b-locked", contenteditable: "false" }, [
+    { href: "https://example.com/locked" },
+  ]);
+  const avBlock = makeBlock({ "data-node-id": "b-av", "data-type": "NodeAttributeView" }, [
+    { href: "https://example.com/av-cell" },
+  ]);
+
+  // 1. Link menu: hidden on disabled editor, locked block, or inside .av
+  assert.deepEqual(linkMenu.handler({ detail: { element: normalBlock.links[0], protyle: disabledProtyle } }), []);
+  assert.deepEqual(linkMenu.handler({ detail: { element: lockedBlock.links[0], protyle: editableProtyle } }), []);
+  assert.deepEqual(linkMenu.handler({ detail: { element: normalBlock.links[1], protyle: editableProtyle } }), []);
+  assert.equal(linkMenu.handler({ detail: { element: normalBlock.links[0], protyle: editableProtyle } }).length, 1);
+
+  // 2. Block menu: completely hidden on disabled/read-only document or when only locked / .av blocks are selected
+  assert.deepEqual(blockMenu.handler({ detail: { blockElements: [normalBlock], protyle: disabledProtyle } }), []);
+  assert.deepEqual(blockMenu.handler({ detail: { blockElements: [lockedBlock, avBlock], protyle: editableProtyle } }), []);
+
+  // 3. Mixed selection counts and forwards only editable non-protected links/blocks
+  let batchReceivedBlocks = null;
+  feature.controller.runBatch = async blocks => { batchReceivedBlocks = blocks; };
+  const batchItems = blockMenu.handler({
+    detail: { blockElements: [normalBlock, lockedBlock, avBlock], protyle: editableProtyle },
+  });
+  assert.equal(batchItems.length, 1);
+  assert.equal(batchItems[0].label, "批量提取链接标题 (共 1 个)");
+  await batchItems[0].run();
+  assert.deepEqual(batchReceivedBlocks, [normalBlock]);
+
+  await feature.deactivate();
 });

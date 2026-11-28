@@ -2,10 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { FeatureScope } from "../../../src/core/framework/FeatureScope.ts";
 import {
+  alignCollapsedPasteBoundary,
   collectCandidateLinksInRange,
   collectPrePasteLinks,
   createRangeFromResolved,
   hasClipboardLinkCandidate,
+  isAutomaticLinkCandidate,
   isNodeFullyInsideRange,
   isSingleBareURL,
 } from "../../../src/features/titled-link/policy/paste-range.ts";
@@ -76,14 +78,15 @@ class MockElement extends MockNode {
       const types = (this.getAttribute("data-type") ?? "").split(/\s+/).filter(Boolean);
       return this.tagName === "SPAN" && types.includes("a");
     }
-    if (selector === "[data-node-id]") {
-      return this.attributes.has("data-node-id");
-    }
+    const classes = (this.getAttribute("class") ?? "").split(/\s+/).filter(Boolean);
     return selector.split(",").map(s => s.trim()).some(part => {
-      if (part === "pre" || part === "code") return this.tagName === part.toUpperCase();
-      if (part === '[data-type="NodeCodeBlock"]') return this.getAttribute("data-type") === "NodeCodeBlock";
-      if (part === '[data-type="NodeBlockQueryEmbed"]') return this.getAttribute("data-type") === "NodeBlockQueryEmbed";
-      return false;
+      if (!part) return false;
+      if (part.startsWith(".")) return classes.includes(part.slice(1));
+      const exactAttr = part.match(/^\[([a-zA-Z0-9_-]+)="([^"]*)"\]$/);
+      if (exactAttr) return this.getAttribute(exactAttr[1]) === exactAttr[2];
+      const bareAttr = part.match(/^\[([a-zA-Z0-9_-]+)\]$/);
+      if (bareAttr) return this.attributes.has(bareAttr[1]);
+      return this.tagName === part.toUpperCase();
     });
   }
   closest(selector) {
@@ -169,6 +172,14 @@ class MockRange {
   setEnd(node, offset) {
     this.endContainer = node;
     this.endOffset = offset;
+  }
+  setStartBefore(node) {
+    const parent = node.parentNode;
+    this.setStart(parent, parent.childNodes.indexOf(node));
+  }
+  setEndAfter(node) {
+    const parent = node.parentNode;
+    this.setEnd(parent, parent.childNodes.indexOf(node) + 1);
   }
   collapse(toStart) {
     if (toStart) {
@@ -774,6 +785,208 @@ test("PasteLinkCapture skips flush during IME composition and immediately releas
     assert.equal(tracked.size, 0, "empty-range must release trackRange handles immediately");
     assert.equal(observerDisconnected, 2, "empty-range must disconnect MutationObserver immediately");
     assert.equal(timers.size, 0, "empty-range must clear 30s deadlineTimer immediately");
+    scope.dispose();
+  } finally {
+    globalThis.getSelection = prevGetSelection;
+    globalThis.Range = prevRange;
+  }
+});
+
+test("C-BUG-01 & C-BUG-02: PasteLinkCapture skips read-only editors/blocks and .av / NodeAttributeView containers without allocating trackRange", () => {
+  const prevGetSelection = globalThis.getSelection;
+  try {
+    const doc = createMockDocument();
+    const editor = new MockElement("div", doc, { contenteditable: "true" });
+    doc.body.appendChild(editor);
+
+    const lockedBlock = new MockElement("div", doc, { "data-node-id": "b-ro", contenteditable: "false" });
+    const lockedText = new MockText("locked", doc);
+    lockedBlock.appendChild(lockedText);
+
+    const avBlock = new MockElement("div", doc, { "data-node-id": "b-av", "data-type": "NodeAttributeView", class: "av" });
+    const avText = new MockText("cell", doc);
+    avBlock.appendChild(avText);
+
+    const normalBlock = new MockElement("div", doc, { "data-node-id": "b-ok", contenteditable: "true" });
+    const normalText = new MockText("ok", doc);
+    normalBlock.appendChild(normalText);
+
+    editor.appendChild(lockedBlock);
+    editor.appendChild(avBlock);
+    editor.appendChild(normalBlock);
+
+    let activeRange = new MockRange();
+    globalThis.getSelection = () => createSelection(activeRange);
+
+    let trackRangeCalls = 0;
+    const scope = new FeatureScope();
+    const capture = new PasteLinkCapture({
+      plugin: {},
+      scope,
+      isEnabled: () => true,
+      onLinksCaptured: () => {},
+      MutationObserver: class { observe() {} disconnect() {} },
+    });
+
+    const protyle = {
+      disabled: true,
+      wysiwyg: { element: editor },
+      trackRange() { trackRangeCalls += 1; return { id: "h" }; },
+      resolveTrackedRange() { return { status: "invalid" }; },
+      releaseTrackedRange() {},
+    };
+    capture.attach(protyle);
+
+    // 1. Editor disabled -> 0 trackRange calls
+    activeRange.setStart(normalText, 0);
+    activeRange.collapse(true);
+    editor.dispatchCapture("paste", createClipboardEvent("https://example.com/1", ""));
+    assert.equal(trackRangeCalls, 0);
+
+    // 2. Editor enabled, caret inside contenteditable="false" block -> 0 trackRange calls
+    protyle.disabled = false;
+    activeRange = new MockRange();
+    activeRange.setStart(lockedText, 0);
+    activeRange.collapse(true);
+    editor.dispatchCapture("paste", createClipboardEvent("https://example.com/2", ""));
+    assert.equal(trackRangeCalls, 0);
+
+    // 3. Caret inside .av / NodeAttributeView -> 0 trackRange calls
+    activeRange = new MockRange();
+    activeRange.setStart(avText, 0);
+    activeRange.collapse(true);
+    editor.dispatchCapture("paste", createClipboardEvent("https://example.com/3", ""));
+    assert.equal(trackRangeCalls, 0);
+
+    scope.dispose();
+  } finally {
+    globalThis.getSelection = prevGetSelection;
+  }
+});
+
+test("C-BUG-04 & C-BUG-05: consecutive paste at inline SPAN[data-type] boundary aligns cloned range without touching live Selection, and percent-encoded bare URLs are captured", async () => {
+  const prevGetSelection = globalThis.getSelection;
+  const prevRange = globalThis.Range;
+  try {
+    globalThis.Range = { START_TO_START: 0, START_TO_END: 1, END_TO_END: 2 };
+    const doc = createMockDocument();
+    const editor = new MockElement("div", doc, { contenteditable: "true" });
+    doc.body.appendChild(editor);
+    const block = new MockElement("div", doc, { "data-node-id": "b-seq", contenteditable: "true" });
+    editor.appendChild(block);
+
+    const firstLink = new MockElement("span", doc, { "data-type": "a", "data-href": "https://example.com/first" });
+    firstLink.textContent = "First Title";
+    block.appendChild(firstLink);
+
+    // Unit check: alignCollapsedPasteBoundary handles start/end of inline SPAN for both Text child and SPAN element without mutating original
+    const firstText = firstLink.childNodes[0];
+    const atEndText = new MockRange();
+    atEndText.setStart(firstText, firstText.length);
+    atEndText.collapse(true);
+    const alignedEnd = alignCollapsedPasteBoundary(atEndText);
+    assert.equal(atEndText.startContainer, firstText, "must not mutate original range");
+    assert.equal(alignedEnd.startContainer, block);
+    assert.equal(alignedEnd.startOffset, 1);
+    assert.equal(alignedEnd.collapsed, true);
+
+    const atStartSpan = new MockRange();
+    atStartSpan.setStart(firstLink, 0);
+    atStartSpan.collapse(true);
+    const alignedStart = alignCollapsedPasteBoundary(atStartSpan);
+    assert.equal(alignedStart.startContainer, block);
+    assert.equal(alignedStart.startOffset, 0);
+    assert.equal(alignedStart.collapsed, true);
+
+    const atMiddle = new MockRange();
+    atMiddle.setStart(firstText, 3);
+    atMiddle.collapse(true);
+    const alignedMid = alignCollapsedPasteBoundary(atMiddle);
+    assert.equal(alignedMid.startContainer, firstText);
+    assert.equal(alignedMid.startOffset, 3);
+
+    // End-to-end PasteLinkCapture: caret stays collapsed at end of firstLink while pasting 2nd percent-encoded URL
+    let liveSelectionMutated = false;
+    const liveSelectionRange = atEndText;
+    globalThis.getSelection = () => ({
+      rangeCount: 1,
+      isCollapsed: true,
+      getRangeAt: () => liveSelectionRange,
+      removeAllRanges() { liveSelectionMutated = true; },
+      addRange() { liveSelectionMutated = true; },
+    });
+
+    const tracked = new Map();
+    const timers = new Map();
+    let nextTimerId = 1;
+    let observerCallback;
+    let seq = 0;
+    const captured = [];
+    const scope = new FeatureScope();
+    const capture = new PasteLinkCapture({
+      plugin: {},
+      scope,
+      isEnabled: () => true,
+      onLinksCaptured: links => { captured.push(links); },
+      setTimer: (fn, ms) => {
+        const id = nextTimerId++;
+        timers.set(id, { fn, ms });
+        return id;
+      },
+      clearTimer: id => { timers.delete(id); },
+      MutationObserver: class {
+        constructor(cb) { observerCallback = cb; }
+        observe() {}
+        disconnect() {}
+      },
+    });
+
+    const protyle = {
+      wysiwyg: { element: editor },
+      async flushPendingTransactions() {},
+      trackRange(range) {
+        const handle = { id: ++seq };
+        tracked.set(handle, range.cloneRange());
+        return handle;
+      },
+      resolveTrackedRange: handle => ({ status: "resolved", range: tracked.get(handle) }),
+      releaseTrackedRange: handle => { tracked.delete(handle); },
+    };
+    capture.attach(protyle);
+
+    const encodedHref = "https://example.com/docs/%E6%B5%8B%E8%AF%95%E6%89%8B%E5%86%8C.pdf";
+    const decodedText = "https://example.com/docs/测试手册.pdf";
+    assert.equal(isAutomaticLinkCandidate(decodedText, encodedHref), true);
+
+    editor.dispatchCapture("paste", createClipboardEvent(encodedHref, ""));
+    assert.equal(liveSelectionMutated, false, "PasteLinkCapture must never mutate live Selection");
+    assert.equal(liveSelectionRange.startContainer, firstText, "live Selection range must remain inside SPAN for SiYuan beforePaste");
+    assert.equal(tracked.size, 2);
+
+    // Simulate real SiYuan SpinBlockDOM replacing the whole block with new DOM nodes AND invalidating collapsed
+    // trackRange handles (due to overlapping `close:span` boundary tokens), including a pre-existing identical URL!
+    const replacementBlock = new MockElement("div", doc, { "data-node-id": "b-seq", contenteditable: "true" });
+    const spunFirstLink = new MockElement("span", doc, { "data-type": "a", "data-href": "https://example.com/first" });
+    spunFirstLink.textContent = "First Title";
+    const spaceNode = new MockText(" ", doc);
+    const secondLink = new MockElement("span", doc, { "data-type": "a", "data-href": encodedHref });
+    secondLink.textContent = decodedText;
+    replacementBlock.appendChild(spunFirstLink);
+    replacementBlock.appendChild(spaceNode);
+    replacementBlock.appendChild(secondLink);
+    editor.childNodes = [replacementBlock];
+    replacementBlock.parentNode = editor;
+    block.parentNode = null;
+    protyle.resolveTrackedRange = () => ({ status: "invalid" });
+
+    observerCallback();
+    const quietEntry = [...timers.entries()].find(([, t]) => t.ms < 30_000);
+    assert.ok(quietEntry);
+    await quietEntry[1].fn();
+
+    assert.equal(captured.length, 1);
+    assert.deepEqual(captured[0], [secondLink]);
+    assert.equal(tracked.size, 0);
     scope.dispose();
   } finally {
     globalThis.getSelection = prevGetSelection;

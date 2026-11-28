@@ -3,8 +3,15 @@ import type { FeatureContext } from "../../../core/framework/FeatureContext.ts";
 import type { FeatureScope } from "../../../core/framework/FeatureScope.ts";
 import type { Logger } from "../../../core/host/Logger.ts";
 import { isInsideProtectedContainer } from "../../../core/host/dom.ts";
-import { resolveWysiwygElement } from "../../../core/host/ProtyleAdapter.ts";
 import {
+  flushProtyleTransactions,
+  isProtyleReadOnly,
+  resolveWysiwygElement,
+} from "../../../core/host/ProtyleAdapter.ts";
+import {
+  alignCollapsedPasteBoundary,
+  capturePrePasteBlockAnchor,
+  collectCandidateLinksFromBlockAnchor,
   collectCandidateLinksInRange,
   collectPrePasteLinks,
   createRangeFromResolved,
@@ -64,21 +71,6 @@ function resolveTrackableProtyle(protyle: unknown): TrackableProtyle | undefined
   return undefined;
 }
 
-async function flushProtyleTransactions(protyle: unknown): Promise<void> {
-  const host = protyle as TrackableProtyle | undefined;
-  if (!host) return;
-  if (typeof host.flushPendingTransactions === "function") {
-    await host.flushPendingTransactions();
-    return;
-  }
-  if (typeof host.getInstance === "function") {
-    const instance = host.getInstance();
-    if (typeof instance?.flushPendingTransactions === "function") {
-      await instance.flushPendingTransactions();
-    }
-  }
-}
-
 function isProtyleUploading(protyle: unknown): boolean {
   const host = protyle as TrackableProtyle | undefined;
   if (!host) return false;
@@ -92,17 +84,26 @@ function isProtyleUploading(protyle: unknown): boolean {
   return false;
 }
 
+function elementForNode(node: Node | null | undefined): Element | null {
+  if (!node) return null;
+  return node.nodeType === 1 ? (node as Element) : node.parentElement;
+}
+
 function isSelectionProtected(original: Range): boolean {
-  const elementFor = (node: Node): Element | null =>
-    node.nodeType === 1 ? (node as Element) : node.parentElement;
-  const startEl = elementFor(original.startContainer);
-  const endEl = elementFor(original.endContainer);
+  const startEl = elementForNode(original.startContainer);
+  const endEl = elementForNode(original.endContainer);
   return Boolean(startEl && isInsideProtectedContainer(startEl) && endEl && isInsideProtectedContainer(endEl));
+}
+
+function isSelectionReadOnly(protyle: unknown, original: Range): boolean {
+  const startEl = elementForNode(original.startContainer);
+  const endEl = elementForNode(original.endContainer);
+  return isProtyleReadOnly(protyle, startEl) || (endEl !== startEl && isProtyleReadOnly(protyle, endEl));
 }
 
 /**
  * Captures pasted link ranges using native capture-phase `paste` events, SiYuan `trackRange`
- * boundary handles, `MutationObserver`, and `flushPendingTransactions()`.
+ * boundary handles, `MutationObserver`, and Core `flushProtyleTransactions`.
  */
 export class PasteLinkCapture {
   private readonly attachedEditors = new WeakMap<HTMLElement, EditorBinding>();
@@ -154,7 +155,8 @@ export class PasteLinkCapture {
 
   detach(protyleOrEditor: unknown): void {
     const editor =
-      protyleOrEditor && typeof (protyleOrEditor as HTMLElement).addEventListener === "function" &&
+      protyleOrEditor &&
+      typeof (protyleOrEditor as HTMLElement).addEventListener === "function" &&
       this.attachedEditors.has(protyleOrEditor as HTMLElement)
         ? (protyleOrEditor as HTMLElement)
         : resolveWysiwygElement(protyleOrEditor);
@@ -181,6 +183,10 @@ export class PasteLinkCapture {
         disposed: this.disposed,
         enabled: this.options.isEnabled(),
       });
+      return;
+    }
+    if (isProtyleReadOnly(protyle, editor)) {
+      this.options.logger?.debug?.("编辑器处于只读状态，跳过粘贴捕获");
       return;
     }
 
@@ -212,6 +218,10 @@ export class PasteLinkCapture {
       this.options.logger?.debug?.("选区超出当前编辑器范围，跳过粘贴捕获");
       return;
     }
+    if (isSelectionReadOnly(protyle, original)) {
+      this.options.logger?.debug?.("选区所在块处于只读状态，跳过粘贴捕获");
+      return;
+    }
     if (isSelectionProtected(original)) {
       this.options.logger?.debug?.("选区位于受保护容器内，跳过粘贴捕获");
       return;
@@ -224,9 +234,11 @@ export class PasteLinkCapture {
     }
 
     const beforeElements = collectPrePasteLinks(original);
-    const startBoundary = original.cloneRange();
+    const boundary = alignCollapsedPasteBoundary(original);
+    const blockAnchor = capturePrePasteBlockAnchor(editor, boundary);
+    const startBoundary = boundary.cloneRange();
     startBoundary.collapse(true);
-    const endBoundary = original.cloneRange();
+    const endBoundary = boundary.cloneRange();
     endBoundary.collapse(false);
 
     let startHandle: ITrackedRangeHandle | undefined;
@@ -236,7 +248,7 @@ export class PasteLinkCapture {
       endHandle = host.trackRange(endBoundary, { owner: this.options.plugin, affinity: "after" });
     } catch {
       if (startHandle) {
-        try { host.releaseTrackedRange(startHandle); } catch {}
+        host.releaseTrackedRange(startHandle);
       }
       return;
     }
@@ -263,11 +275,11 @@ export class PasteLinkCapture {
       observer?.disconnect();
       observer = undefined;
       if (startHandle) {
-        try { host.releaseTrackedRange(startHandle); } catch {}
+        host.releaseTrackedRange(startHandle);
         startHandle = undefined;
       }
       if (endHandle) {
-        try { host.releaseTrackedRange(endHandle); } catch {}
+        host.releaseTrackedRange(endHandle);
         endHandle = undefined;
       }
       editorCaptures.delete(finishCapture);
@@ -294,12 +306,20 @@ export class PasteLinkCapture {
       const startResolved = host.resolveTrackedRange(startHandle!);
       const endResolved = host.resolveTrackedRange(endHandle!);
       if (startResolved.status !== "resolved" || endResolved.status !== "resolved") {
-        this.options.logger?.debug?.("trackRange 边界解析未就绪", {
-          startStatus: startResolved.status,
-          endStatus: endResolved.status,
-        });
-        finishCapture("invalid-range");
-        return undefined;
+        const fallbackLinks = collectCandidateLinksFromBlockAnchor(editor, blockAnchor, beforeElements);
+        if (fallbackLinks === null) {
+          this.options.logger?.debug?.("trackRange 边界解析未就绪", {
+            startStatus: startResolved.status,
+            endStatus: endResolved.status,
+          });
+          finishCapture("invalid-range");
+          return undefined;
+        }
+        if (fallbackLinks.length === 0) {
+          finishCapture("no-candidate");
+          return undefined;
+        }
+        return fallbackLinks;
       }
       const range = createRangeFromResolved(editor, startResolved.range, endResolved.range);
       if (!range) {
@@ -367,15 +387,10 @@ export class PasteLinkCapture {
       return;
     }
 
-    try {
-      observer = new ObserverCtor(() => {
-        scheduleQuietCheck();
-      });
-      observer.observe(editor, { childList: true, subtree: true, characterData: true });
-    } catch {
-      finishCapture("observer-failed");
-      return;
-    }
+    observer = new ObserverCtor(() => {
+      scheduleQuietCheck();
+    });
+    observer.observe(editor, { childList: true, subtree: true, characterData: true });
 
     deadlineTimer = this.setTimer(() => {
       deadlineTimer = undefined;

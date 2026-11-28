@@ -1,10 +1,5 @@
 export type TitleSource = "title" | "og:title" | "twitter:title" | "hostname";
 
-export interface NormalizedTitle {
-  readonly title: string;
-  readonly source: TitleSource;
-}
-
 export type TitleExtractionResult =
   | { readonly ok: true; readonly title: string; readonly source: TitleSource }
   | { readonly ok: false; readonly reason: "challenge" | "missing-title" };
@@ -18,15 +13,6 @@ export interface NormalizeTitleOptions {
 const CHALLENGE_TITLE_PATTERN = /^just\s+a\s+moment(?:\.{3}|…)?$/i;
 // Strip bidi overrides/isolates, zero-width space, and C0/C1 control chars while preserving ZWNJ (\u200C) and ZWJ (\u200D).
 const DANGEROUS_CHARS = /[\u0000-\u001F\u007F-\u009F\u200B\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
-
-export function extractNormalizedTitle(
-  html: string,
-  url: string,
-  options: NormalizeTitleOptions,
-): NormalizedTitle | null {
-  const result = resolveNormalizedTitle(html, url, options);
-  return result.ok ? { title: result.title, source: result.source } : null;
-}
 
 export function resolveNormalizedTitle(
   html: string,
@@ -151,7 +137,10 @@ function cleanWhitespace(value: string): string {
   return value.replace(/\s+/gu, " ").trim();
 }
 
-function hostnameFallback(url: string, options: NormalizeTitleOptions): NormalizedTitle | null {
+function hostnameFallback(
+  url: string,
+  options: NormalizeTitleOptions,
+): { readonly title: string; readonly source: "hostname" } | null {
   if (!options.fallbackToHostname) return null;
   try {
     const title = finalizeTitle(new URL(url).hostname, options.maxTitleLength);

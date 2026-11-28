@@ -3,30 +3,22 @@ import type { FeatureScope } from "../../core/framework/FeatureScope.ts";
 import type { KernelClient } from "../../core/host/KernelClient.ts";
 import { combineSignals, resolveEditorRootID, resolveNotebookID, resolveProtyleRunner } from "../../core/host/ProtyleAdapter.ts";
 import { isInsideProtectedContainer } from "../../core/host/dom.ts";
-import { extractStaticFileName } from "./services/static-file.ts";
-import { fetchTitleResource } from "./services/dual-track-fetcher.ts";
-import { readAndDecodeTitleResource } from "./services/stream-parser.ts";
-import { finalizeTitle, resolveNormalizedTitle } from "./services/title-normalizer.ts";
-import { TitleCache } from "./services/title-cache.ts";
+import { countBatchResults, formatBatchSummary } from "./policy/batchSummary.ts";
+import { isAutomaticLinkCandidate, isHttpUrl } from "./policy/paste-range.ts";
+import type {
+  LinkActionResult,
+  LinkOccurrenceTarget,
+  TitleFetchResult,
+  TitledLinkConfig,
+} from "./policy/types.ts";
 import {
   captureLinkTarget,
   commitLinkTitle,
   commitLinkTitles,
+  type GroupedLinkTitleUpdate,
 } from "./services/safe-writer.ts";
-import type { GroupedLinkTitleUpdate } from "./services/safe-writer.ts";
-import { countBatchResults, formatBatchSummary } from "./policy/batchSummary.ts";
-import { isAutomaticLinkCandidate, isHttpUrl } from "./policy/paste-range.ts";
-import {
-  DEFAULT_MAX_TITLE_LENGTH,
-  type LinkActionResult,
-  type LinkOccurrenceTarget,
-  type TitleFetchFailureReason,
-  type TitleFetchResult,
-  type TitledLinkConfig,
-} from "./policy/types.ts";
-
-export type { LinkActionResult } from "./policy/types.ts";
-export { isAutomaticLinkCandidate, isHttpUrl } from "./policy/paste-range.ts";
+import { TitleCache } from "./services/title-cache.ts";
+import { TitleResolver, type TitleResolveMode } from "./services/title-resolver.ts";
 
 export interface TitledLinkControllerOptions {
   notify?: (message: string) => void;
@@ -42,7 +34,6 @@ export interface TitledLinkControllerOptions {
 
 interface BatchCandidate extends GroupedLinkTitleUpdate {
   token: number;
-  fallback: boolean;
 }
 
 interface PreparedBatchItem {
@@ -73,13 +64,12 @@ export async function mapWithConcurrency<T, R>(items: readonly T[], limit: numbe
 
 export class TitledLinkController {
   private readonly tokens = new WeakMap<HTMLElement, number>();
-  private readonly pending = new Map<string, Promise<TitleFetchResult>>();
   private readonly inFlight = new Map<HTMLElement, AbortController>();
   private readonly inFlightBatches = new Set<string | HTMLElement>();
   private readonly kernel: KernelClient;
   private readonly cache: TitleCache;
+  private readonly resolver: TitleResolver;
   private readonly notify: (message: string) => void;
-  private readonly frontend: () => string;
   private readonly t: (key: string, values?: Record<string, string | number>) => string;
 
   constructor(
@@ -90,11 +80,18 @@ export class TitledLinkController {
     this.kernel = options.kernel;
     this.cache = options.cache ?? new TitleCache();
     this.notify = options.notify ?? (() => undefined);
-    this.frontend = options.frontend ?? (() => "unknown");
     this.t = options.translate ?? ((key) => key);
+    this.resolver = new TitleResolver({
+      scope,
+      kernel: this.kernel,
+      cache: this.cache,
+      frontend: options.frontend ?? (() => "unknown"),
+      getUserAgent: () => this.context.settings.getUserAgent(),
+      fetchImpl: options.fetchImpl,
+      logger: context.logger,
+    });
     scope.own(() => {
-      this.cache.clear();
-      this.pending.clear();
+      this.resolver.clear();
       this.inFlightBatches.clear();
       for (const controller of this.inFlight.values()) controller.abort("scope disposed");
       this.inFlight.clear();
@@ -164,7 +161,9 @@ export class TitledLinkController {
     }
   }
 
-  clear(): void { this.cache.clear(); this.pending.clear(); }
+  clear(): void {
+    this.resolver.clear();
+  }
 
   private async runBatchCandidates(
     links: readonly HTMLElement[],
@@ -367,10 +366,12 @@ export class TitledLinkController {
         title: fetched.title,
       });
       if (!this.current(target, token)) return this.scope.active ? "superseded" : "aborted";
-      if (fetched.source !== "static-file" &&
-          !fetched.fallback &&
-          (result === "updated" || result === "unchanged")) {
-        this.cache.refresh(cacheKey(target.originalHref), fetched.title);
+      if (
+        fetched.source !== "static-file" &&
+        !fetched.fallback &&
+        (result === "updated" || result === "unchanged")
+      ) {
+        this.resolver.refreshCache(target.originalHref, fetched.title);
       }
       this.notify(this.t(singleResultNoticeKey(result, fetched.fallback)));
       return result;
@@ -412,7 +413,6 @@ export class TitledLinkController {
           target,
           title: fetched.title,
           token,
-          fallback: fetched.fallback,
         },
       };
     } catch (error) {
@@ -426,116 +426,12 @@ export class TitledLinkController {
     return this.scope.active && this.tokens.get(target.linkElement) === token;
   }
 
-  private async titleFor(
+  private titleFor(
     target: LinkOccurrenceTarget,
-    mode: "auto" | "manual" | "batch",
+    mode: TitleResolveMode,
     signal?: AbortSignal,
   ): Promise<TitleFetchResult> {
-    const config = this.config();
-    const result = await this.resolveTitle(target, mode, config, signal);
-    if (result.status !== "success") return result;
-    const title = finalizeTitle(result.title, DEFAULT_MAX_TITLE_LENGTH);
-    return title ? { ...result, title } : { status: "failure", url: result.url, reason: "missing-title" };
-  }
-
-  private async resolveTitle(
-    target: LinkOccurrenceTarget,
-    mode: "auto" | "manual" | "batch",
-    config: TitledLinkConfig,
-    signal?: AbortSignal,
-  ): Promise<TitleFetchResult> {
-    const url = target.originalHref;
-    const key = cacheKey(url);
-    const staticName = extractStaticFileName(url);
-    if (staticName) {
-      this.context.logger?.debug?.("命中静态文件链接，跳过网页抓取", { url, title: staticName, mode });
-      return { status: "success", url, title: staticName, source: "static-file", fallback: false };
-    }
-    if (mode === "auto") {
-      const cached = this.cache.get(key);
-      if (cached) {
-        this.context.logger?.debug?.("命中链接标题缓存", { url, title: cached, mode });
-        return { status: "success", url, title: cached, source: "title", fallback: false };
-      }
-    }
-    if (mode !== "manual") {
-      const inFlight = this.pending.get(key);
-      if (inFlight) {
-        this.context.logger?.debug?.("复用进行中的同链接抓取请求", { url, mode });
-        return inFlight;
-      }
-    }
-    const generation = this.cache.captureGeneration(key);
-    const request = this.fetchAndNormalize(url, config, signal).then(result => {
-      if (mode === "auto" && result.status === "success" && !result.fallback && this.scope.active) {
-        this.cache.set(key, result.title, generation);
-      }
-      return result;
-    });
-    if (mode !== "manual") this.pending.set(key, request);
-    try { return await request; }
-    finally { if (this.pending.get(key) === request) this.pending.delete(key); }
-  }
-
-  private async fetchAndNormalize(url: string, config: TitledLinkConfig, signal?: AbortSignal): Promise<TitleFetchResult> {
-    const effective = signal ?? this.scope.signal;
-    const normalizeOptions = {
-      fallbackToHostname: config.fallbackToHostname,
-      maxTitleLength: DEFAULT_MAX_TITLE_LENGTH,
-    };
-    try {
-      const resource = await fetchTitleResource({
-        url, frontend: this.frontend(), userAgent: this.context.settings.getUserAgent(),
-        kernelClient: this.kernel, signal: effective, fetchImpl: this.options.fetchImpl,
-        logger: this.context.logger,
-      });
-      if (!resource.ok) {
-        if (resource.body instanceof ReadableStream) await resource.body.cancel();
-        const fallback = resolveNormalizedTitle("", url, normalizeOptions);
-        this.context.logger?.debug?.("网页请求返回非成功状态码", {
-          url,
-          transport: resource.transport,
-          status: resource.status,
-          fallbackUsed: fallback.ok,
-        });
-        if (fallback.ok) return { status: "success", url, title: fallback.title, source: fallback.source, fallback: true };
-        return { status: "failure", url, reason: "http", httpStatus: resource.status };
-      }
-      const decoded = await readAndDecodeTitleResource(resource, { signal: effective, logger: this.context.logger });
-      if (effective.aborted) return { status: "failure", url, reason: "aborted" };
-      const extracted = resolveNormalizedTitle(decoded.html, url, normalizeOptions);
-      this.context.logger?.debug?.("网页解码与标题提取完成", {
-        url,
-        transport: resource.transport,
-        charset: decoded.charset,
-        bytesRead: decoded.bytesRead,
-        truncated: decoded.truncated,
-        ok: extracted.ok,
-        ...(extracted.ok ? { source: extracted.source } : { reason: extracted.reason }),
-      });
-      if (extracted.ok) {
-        return {
-          status: "success",
-          url,
-          title: extracted.title,
-          source: extracted.source,
-          fallback: extracted.source === "hostname",
-        };
-      }
-      return { status: "failure", url, reason: extracted.reason };
-    } catch (error) {
-      if (effective.aborted) return { status: "failure", url, reason: "aborted" };
-      const fallback = resolveNormalizedTitle("", url, normalizeOptions);
-      const reason: TitleFetchFailureReason = isTimeoutError(error) ? "timeout" : "network";
-      this.context.logger?.debug?.("抓取或解析链接标题异常", {
-        url,
-        reason,
-        fallbackUsed: fallback.ok,
-        error,
-      });
-      if (fallback.ok) return { status: "success", url, title: fallback.title, source: fallback.source, fallback: true };
-      return { status: "failure", url, reason, error };
-    }
+    return this.resolver.resolve(target.originalHref, mode, this.config(), signal);
   }
 }
 
@@ -556,22 +452,8 @@ function singleResultNoticeKey(result: LinkActionResult, fallback: boolean): str
   }
 }
 
-function cacheKey(href: string): string {
-  try { return new URL(href).href; } catch { return href; }
-}
-
 function batchBlockKey(block: HTMLElement, protyle: any): string | HTMLElement {
   const notebook = resolveNotebookID(protyle) ?? "";
   const blockID = block.getAttribute?.("data-node-id") ?? "";
   return notebook && blockID ? `${notebook}/${blockID}` : block;
-}
-
-function isTimeoutError(error: unknown): boolean {
-  let current: unknown = error;
-  for (let depth = 0; depth < 4 && current && typeof current === "object"; depth++) {
-    const err = current as { name?: unknown; code?: unknown; cause?: unknown };
-    if (err.name === "TimeoutError" || err.code === "ETIMEDOUT") return true;
-    current = err.cause;
-  }
-  return false;
 }
